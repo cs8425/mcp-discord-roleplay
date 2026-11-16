@@ -1,0 +1,17 @@
+# secrets and operator-local configuration — never commit these
+.env
+/.env.*
+!.env.example
+/routing.json
+
+# build output
+/mcp-discord-roleplay
+/mcp-discord-roleplay.exe
+/bin/
+/dist/
+
+# editor / OS noise
+.DS_Store
+*.swp
+.idea/
+.vscode/

@@ -1,0 +1,29 @@
+{
+  "agents": [
+    {
+      "id": "default",
+      "targets": ["boss", "dm:ami", "log"]
+    }
+  ],
+  "targets": [
+    {
+      "alias": "boss",
+      "id": "channel:111222333444555666",
+      "name": "#rp-main",
+      "read": true,
+      "write": true
+    },
+    {
+      "alias": "dm:ami",
+      "id": "user:222333444555666777",
+      "name": "Ami"
+    },
+    {
+      "alias": "log",
+      "id": "channel:333444555666777888",
+      "read": true,
+      "write": false
+    }
+  ],
+  "unknown_dm": "ignore"
+}
