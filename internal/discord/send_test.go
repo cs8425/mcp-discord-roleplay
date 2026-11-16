@@ -131,12 +131,11 @@ func (r *recorder) size(i int) int {
 
 func newTestClient(t *testing.T, cfg *config.Config) (*Client, *recorder, *clock) {
 	t.Helper()
-	b := bus.New(cfg.BusCapacity)
 	rt, err := router.New(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := New(cfg, nil, b, rt)
+	c := New(cfg, nil, bus.NewHub(cfg.BusCapacity, rt.AgentIDs(), nil), rt)
 	cl := &clock{t: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
 	r := &recorder{}
 	c.post = r.post
@@ -464,7 +463,8 @@ func TestNoSessionMeansNotConnected(t *testing.T) {
 	// A client that never started has no session and no seams: this is the real
 	// production answer when the gateway is down.
 	cfg := testCfg(t)
-	c := New(cfg, nil, bus.New(cfg.BusCapacity), mustRouter(t, cfg))
+	rt := mustRouter(t, cfg)
+	c := New(cfg, nil, bus.NewHub(cfg.BusCapacity, rt.AgentIDs(), nil), rt)
 	c.lim = newSendLimiter(cfg)
 	if _, err := c.Send(context.Background(), SendRequest{ChannelID: "a", Text: "hi"}); code(t, err) != CodeNotConnected {
 		t.Fatalf("want not_connected, got %v", err)
@@ -599,7 +599,8 @@ func TestDMChannelIsCreatedOnceAndCached(t *testing.T) {
 
 func TestDMChannelDryRunNeedsNoSession(t *testing.T) {
 	cfg := testCfg(t, "-dry-run")
-	c := New(cfg, nil, bus.New(cfg.BusCapacity), mustRouter(t, cfg))
+	rt := mustRouter(t, cfg)
+	c := New(cfg, nil, bus.NewHub(cfg.BusCapacity, rt.AgentIDs(), nil), rt)
 	id, err := c.DMChannel(context.Background(), "u9")
 	if err != nil {
 		t.Fatal(err)

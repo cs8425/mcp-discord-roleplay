@@ -53,7 +53,11 @@ func routingCfg(t *testing.T, extra ...string) *config.Config {
 	if err := os.WriteFile(path, []byte(routingJSON), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	return toolCfg(t, append([]string{"-config=" + path}, extra...)...)
+	// The poll tests in poll_test.go block on max_wait, so the fixture lowers the
+	// operator floor to 1 s; the real default (5) is still what TestPollBadMaxWait
+	// asserts, because that test re-states both bounds explicitly and a later flag
+	// wins. Nothing else in this package waits on a poll.
+	return toolCfg(t, append([]string{"-config=" + path, "-poll-min-wait=1"}, extra...)...)
 }
 
 func newDeps(t *testing.T, cfg *config.Config) *Deps {
@@ -62,12 +66,12 @@ func newDeps(t *testing.T, cfg *config.Config) *Deps {
 	if err != nil {
 		t.Fatal(err)
 	}
-	b := bus.New(cfg.BusCapacity)
+	hub := bus.NewHub(cfg.BusCapacity, rt.AgentIDs(), nil)
 	return &Deps{
 		Cfg:       cfg,
 		Router:    rt,
-		Bus:       b,
-		DC:        discord.New(cfg, nil, b, rt),
+		Hub:       hub,
+		DC:        discord.New(cfg, nil, hub, rt),
 		Files:     files.New(cfg, nil),
 		StartedAt: time.Now(),
 		Version:   "test",
@@ -294,7 +298,7 @@ func TestNoClientMeansNotConnected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	d := &Deps{Cfg: cfg, Router: rt, Bus: bus.New(cfg.BusCapacity), Files: files.New(cfg, nil)}
+	d := &Deps{Cfg: cfg, Router: rt, Hub: bus.NewHub(cfg.BusCapacity, rt.AgentIDs(), nil), Files: files.New(cfg, nil)}
 	out := sendErr(t, d, `{"to":"channel:111222333444555666","text":"hi"}`)
 	wantCode(t, out, discord.CodeNotConnected)
 }

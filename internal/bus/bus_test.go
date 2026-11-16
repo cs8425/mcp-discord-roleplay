@@ -1,121 +1,222 @@
 package bus
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 )
 
 func ev(target, text string) *Event {
-	return &Event{Kind: "message", Target: target, Text: text, DM: false}
+	return &Event{Kind: "message", Target: target, Text: text}
 }
 
-func TestPublishAssignsSeq(t *testing.T) {
-	b := New(10)
-	for i := 0; i < 3; i++ {
-		b.Publish(ev("boss", "hi"))
+func texts(evs []*Event) []string {
+	out := make([]string, 0, len(evs))
+	for _, e := range evs {
+		out = append(out, e.Text)
 	}
-	st := b.Stats()
-	if st.MaxSeq != 3 || st.Size != 3 || st.Dropped != 0 {
-		t.Fatalf("stats = %+v", st)
+	return out
+}
+
+func eq(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
 	}
-	got, last := b.After(0, nil, 10)
-	if last != 3 || len(got) != 3 {
-		t.Fatalf("After(0) = %d events, last %d", len(got), last)
-	}
-	for i, e := range got {
-		if e.Seq != uint64(i+1) {
-			t.Fatalf("event %d has seq %d", i, e.Seq)
+	for i := range got {
+		if got[i] != want[i] {
+			return false
 		}
 	}
+	return true
 }
 
-func TestRingOverwritesOldest(t *testing.T) {
-	b := New(3)
-	for i := 1; i <= 5; i++ {
-		b.Publish(ev("boss", string(rune('a'+i))))
+func fill(q *Queue, names ...string) {
+	for _, n := range names {
+		q.Push(ev("boss", n))
 	}
-	st := b.Stats()
-	if st.Size != 3 || st.Dropped != 2 || st.MaxSeq != 5 || st.Total != 5 {
+}
+
+func TestPushCounts(t *testing.T) {
+	q := NewQueue(10)
+	fill(q, "a", "b", "c")
+	st := q.Stats()
+	if st.Size != 3 || st.Pushed != 3 || st.Dropped != 0 || st.Capacity != 10 {
 		t.Fatalf("stats = %+v", st)
 	}
-	got, last := b.After(0, nil, 10)
-	if last != 5 {
-		t.Fatalf("cursor must follow the head even after overwrites, got %d", last)
+	got, rem := q.Drain(nil)
+	if !eq(texts(got), []string{"a", "b", "c"}) {
+		t.Fatalf("drain order = %v, want oldest first", texts(got))
 	}
-	if len(got) != 3 || got[0].Seq != 3 || got[2].Seq != 5 {
-		t.Fatalf("ring should hold seq 3,4,5 got %v", seqs(got))
+	if rem != 0 {
+		t.Fatalf("remaining = %d, want 0", rem)
+	}
+	if again, _ := q.Drain(nil); len(again) != 0 {
+		t.Fatal("drained events must not reappear")
 	}
 }
 
-func TestAfterLimitAndCursorRoundTrip(t *testing.T) {
-	b := New(100)
+func TestDrainSkipLeavesInPlace(t *testing.T) {
+	q := NewQueue(10)
+	fill(q, "a1", "b1", "a2", "b2")
+
+	got, rem := q.Drain(func(e *Event) Verdict {
+		if e.Text[0] == 'a' {
+			return Take
+		}
+		return Skip
+	})
+	if !eq(texts(got), []string{"a1", "a2"}) {
+		t.Fatalf("take = %v", texts(got))
+	}
+	if rem != 2 {
+		t.Fatalf("remaining = %d, want 2", rem)
+	}
+	// the skipped ones are untouched, in order, and a different filter gets them
+	rest, rem2 := q.Drain(func(e *Event) Verdict {
+		if e.Text[0] == 'b' {
+			return Take
+		}
+		return Skip
+	})
+	if !eq(texts(rest), []string{"b1", "b2"}) || rem2 != 0 {
+		t.Fatalf("second drain = %v rem %d", texts(rest), rem2)
+	}
+}
+
+func TestDrainStopKeepsOrderAndTail(t *testing.T) {
+	q := NewQueue(10)
+	fill(q, "a", "b", "c", "d", "e")
+
+	n := 0
+	got, rem := q.Drain(func(e *Event) Verdict {
+		if n >= 2 {
+			return Stop
+		}
+		n++
+		return Take
+	})
+	if !eq(texts(got), []string{"a", "b"}) {
+		t.Fatalf("take = %v, want exactly the two oldest", texts(got))
+	}
+	if rem != 3 {
+		t.Fatalf("remaining = %d, want 3", rem)
+	}
+	// nothing was skipped or reordered: the next drain returns c,d,e in order
+	again, _ := q.Drain(nil)
+	if !eq(texts(again), []string{"c", "d", "e"}) {
+		t.Fatalf("tail = %v, want c,d,e untouched and in order", texts(again))
+	}
+}
+
+func TestDrainStopDoesNotPeekAhead(t *testing.T) {
+	// A Stop must not evaluate want() for the rest of the queue: the caller's
+	// budget counter would be consulted for events it has no room for.
+	q := NewQueue(10)
+	fill(q, "a", "b", "c", "d")
+	seen := 0
+	q.Drain(func(e *Event) Verdict {
+		seen++
+		return Stop
+	})
+	if seen != 1 {
+		t.Fatalf("want() called %d times after Stop, want 1", seen)
+	}
+	if st := q.Stats(); st.Size != 4 {
+		t.Fatalf("Stop must not remove anything, size = %d", st.Size)
+	}
+}
+
+func TestDrainOnEmpty(t *testing.T) {
+	q := NewQueue(4)
+	got, rem := q.Drain(nil)
+	if len(got) != 0 || rem != 0 {
+		t.Fatalf("empty drain = %v/%d", got, rem)
+	}
+}
+
+func TestRingDropsNewestSideAndWraps(t *testing.T) {
+	q := NewQueue(3)
+	fill(q, "1", "2", "3", "4", "5")
+	st := q.Stats()
+	if st.Size != 3 || st.Dropped != 2 || st.Pushed != 5 {
+		t.Fatalf("stats = %+v", st)
+	}
+	// wrap-around: the surviving entries are the newest three, oldest first
+	got, _ := q.Drain(nil)
+	if !eq(texts(got), []string{"3", "4", "5"}) {
+		t.Fatalf("after wrap = %v, want 3,4,5 (no duplicates, no holes)", texts(got))
+	}
+	// push again past the wrap boundary and drain once more
+	fill(q, "6", "7", "8", "9")
+	got, _ = q.Drain(nil)
+	if !eq(texts(got), []string{"7", "8", "9"}) {
+		t.Fatalf("second wrap = %v, want 7,8,9", texts(got))
+	}
+}
+
+func TestRequeueFrontRestoresOrder(t *testing.T) {
+	q := NewQueue(10)
+	fill(q, "a", "b", "c")
+	got, _ := q.Drain(func(e *Event) Verdict {
+		if e.Text == "b" {
+			return Skip
+		}
+		return Take
+	})
+	if !eq(texts(got), []string{"a", "c"}) {
+		t.Fatalf("take = %v", texts(got))
+	}
+	q.RequeueFront(got)
+	// restored batch is older than what stayed, and keeps its own order
+	again, rem := q.Drain(nil)
+	if !eq(texts(again), []string{"a", "c", "b"}) {
+		t.Fatalf("after requeue = %v, want a,c,b", texts(again))
+	}
+	if rem != 0 {
+		t.Fatalf("remaining = %d", rem)
+	}
+}
+
+func TestRequeueFrontOverflowDropsAndCounts(t *testing.T) {
+	q := NewQueue(3)
+	batch := []*Event{ev("boss", "1"), ev("boss", "2"), ev("boss", "3"), ev("boss", "4")}
+	q.RequeueFront(batch)
+	st := q.Stats()
+	if st.Size != 3 || st.Dropped != 1 {
+		t.Fatalf("stats = %+v, want the newest 3 kept and 1 dropped", st)
+	}
+	got, _ := q.Drain(nil)
+	if !eq(texts(got), []string{"2", "3", "4"}) {
+		t.Fatalf("kept = %v", texts(got))
+	}
+}
+
+func TestLatestDoesNotConsume(t *testing.T) {
+	q := NewQueue(10)
 	for i := 1; i <= 10; i++ {
-		b.Publish(ev("boss", "m"))
+		q.Push(ev("boss", string(rune('a'+i))))
 	}
-	got, last := b.After(0, nil, 4)
-	if len(got) != 4 || got[0].Seq != 1 || last != 4 {
-		t.Fatalf("first page = %v last=%d", seqs(got), last)
+	got := q.Latest(nil, 3)
+	if len(got) != 3 {
+		t.Fatalf("Latest(3) = %d", len(got))
 	}
-	cur := Cursor(last)
-	nextSeq, ok := ParseCursor(cur)
-	if !ok || nextSeq != 4 {
-		t.Fatalf("cursor round trip: %q -> %d,%v", cur, nextSeq, ok)
+	if got[0].Text != "k" || got[2].Text != "i" {
+		t.Fatalf("Latest must return newest first, got %v", texts(got))
 	}
-	rest, last2 := b.After(nextSeq, nil, 100)
-	if len(rest) != 6 || rest[0].Seq != 5 || last2 != 10 {
-		t.Fatalf("second page = %v last=%d (cursor %q)", seqs(rest), last2, cur)
+	if st := q.Stats(); st.Size != 10 {
+		t.Fatalf("Latest consumed events: size = %d", st.Size)
 	}
-	if v, ok := ParseCursor(""); v != 0 || ok {
-		t.Fatalf("empty cursor must decode to 0,false, got %d,%v", v, ok)
+	if got := q.Latest(func(e *Event) bool { return false }, 5); len(got) != 0 {
+		t.Fatal("filter must be honoured")
 	}
-	if v, ok := ParseCursor("nonsense"); v != 0 || ok {
-		t.Fatalf("garbage cursor must degrade to 0,false, got %d,%v", v, ok)
-	}
-	if Cursor(0) != "" {
-		t.Fatal("seq 0 must serialize as the empty cursor")
-	}
-	// reading past the head is not an error, it is "nothing new"; the caller
-	// keeps its own cursor when the returned high-water mark is 0.
-	none, last3 := b.After(10, nil, 10)
-	if len(none) != 0 || last3 != 0 {
-		t.Fatalf("After(head) = %v/%d, want no events and cursor 0", seqs(none), last3)
+	if got := q.Latest(nil, 0); len(got) != 0 {
+		t.Fatal("limit 0 means nothing")
 	}
 }
 
-func TestAfterFilter(t *testing.T) {
-	b := New(100)
-	b.Publish(ev("boss", "a"))
-	b.Publish(ev("side", "b"))
-	b.Publish(ev("boss", "c"))
-
-	got, _ := b.After(0, func(e *Event) bool { return e.Target == "boss" }, 10)
-	if len(got) != 2 || got[0].Text != "a" || got[1].Text != "c" {
-		t.Fatalf("filter returned %d events", len(got))
-	}
-	// the cursor must still advance past skipped events
-	_, last := b.After(1, func(e *Event) bool { return e.Target == "boss" }, 10)
-	if last != 3 {
-		t.Fatalf("cursor should be 3, got %d", last)
-	}
-}
-
-func TestLatestKeepsNewest(t *testing.T) {
-	b := New(100)
-	for i := 1; i <= 10; i++ {
-		b.Publish(ev("boss", "m"))
-	}
-	got := b.Latest(nil, 3)
-	if len(got) != 3 || got[0].Seq != 8 || got[2].Seq != 10 {
-		t.Fatalf("Latest(3) = %v, want the newest three", seqs(got))
-	}
-	if got := b.Latest(nil, 0); len(got) != 1 {
-		t.Fatalf("Latest(0) should still return one event, got %d", len(got))
-	}
-}
-
-func TestNotifyWakesWaiters(t *testing.T) {
-	b := New(10)
-	ch := b.Notify()
+func TestNotifyWakesWaiter(t *testing.T) {
+	q := NewQueue(10)
+	ch := q.Notify()
 	done := make(chan struct{})
 	go func() {
 		select {
@@ -125,48 +226,101 @@ func TestNotifyWakesWaiters(t *testing.T) {
 			panic("notify never fired")
 		}
 	}()
-	b.Publish(ev("boss", "wake"))
+	q.Push(ev("boss", "wake"))
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("waiter not woken")
 	}
-	// a fresh Notify must hand out a live channel, never the closed one
-	if b.Notify() == nil {
-		t.Fatal("Notify returned nil")
+	// a fresh Notify hands out a live channel, never the closed one
+	select {
+	case <-q.Notify():
+		t.Fatal("fresh Notify must not be closed already")
+	default:
 	}
 }
 
-func TestUnreadCountsOnlyMatches(t *testing.T) {
-	b := New(100)
-	b.Publish(ev("boss", "a"))
-	b.Publish(ev("side", "b"))
-	b.Publish(ev("boss", "c"))
-	if n := b.Unread(0, func(e *Event) bool { return e.Target == "boss" }, 10); n != 2 {
-		t.Fatalf("unread = %d, want 2", n)
-	}
-	if n := b.Unread(3, func(e *Event) bool { return e.Target == "boss" }, 10); n != 0 {
-		t.Fatalf("no unread expected at head, got %d", n)
+// The pre-read order that poll relies on: read Notify, then drain. A push that
+// lands between the two still wakes the waiter.
+func TestNotifyNoMissedWakeup(t *testing.T) {
+	q := NewQueue(10)
+	for i := 0; i < 50; i++ {
+		ch := q.Notify()
+		if got, _ := q.Drain(nil); len(got) > 0 {
+			continue // drained the race winner
+		}
+		go q.Push(ev("boss", "x"))
+		select {
+		case <-ch:
+		case <-time.After(2 * time.Second):
+			t.Fatal("missed a wakeup")
+		}
+		if got, _ := q.Drain(nil); len(got) == 0 {
+			t.Fatal("woken but queue empty")
+		}
 	}
 }
 
-func TestPublishNeverBlocks(t *testing.T) {
-	// capacity 1 with no reader: publishes must return immediately.
-	b := New(1)
+func TestPushNeverBlocks(t *testing.T) {
+	q := NewQueue(1)
 	done := make(chan struct{})
 	go func() {
 		for i := 0; i < 100; i++ {
-			b.Publish(ev("boss", "x"))
+			q.Push(ev("boss", "x"))
 		}
 		close(done)
 	}()
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
-		t.Fatal("Publish blocked")
+		t.Fatal("Push blocked")
 	}
-	if st := b.Stats(); st.Size != 1 || st.Dropped != 99 {
+	if st := q.Stats(); st.Size != 1 || st.Dropped != 99 {
 		t.Fatalf("stats = %+v", st)
+	}
+}
+
+func TestZeroCapacityQueueIsUsable(t *testing.T) {
+	q := NewQueue(0)
+	q.Push(ev("boss", "a"))
+	if got, _ := q.Drain(nil); len(got) != 1 {
+		t.Fatalf("NewQueue(0) should behave as capacity 1, got %v", texts(got))
+	}
+}
+
+func TestEventJSONShape(t *testing.T) {
+	// The keys the poll renderer and the LLM prompt depend on must stay stable.
+	q := NewQueue(4)
+	q.Push(&Event{
+		Kind: "message", Ts: time.Now(), Time: "2026-01-01T00:00:00+00:00",
+		ChannelID: "42", MessageID: "99", Author: Author{ID: "7", Name: "amy"},
+		Text: "hi", Attachments: []Attachment{{ID: "1", Kind: KindImage, URL: "https://x/y.png"}},
+	})
+	got, _ := q.Drain(nil)
+	b, err := json.Marshal(got[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"kind", "time", "channel_id", "message_id", "author", "attachments"} {
+		if _, ok := m[k]; !ok {
+			t.Errorf("event JSON lost key %q: %s", k, b)
+		}
+	}
+	// ts is internal only
+	if _, ok := m["ts"]; ok {
+		t.Error("Ts must stay out of the wire format")
+	}
+	// rendering decisions are NOT part of the shared event (they belong to the
+	// caller's output struct; a shared pointer must never carry them)
+	if _, ok := m["media"]; ok {
+		t.Error("bus.Attachment must not carry a media rendering verdict")
+	}
+	if _, ok := m["local_path"]; ok {
+		t.Error("bus.Attachment must not carry a local path")
 	}
 }
 
@@ -181,6 +335,7 @@ func TestClassifyMedia(t *testing.T) {
 		{"movie.mp4", "", KindVideo},
 		{"data.bin", "image/webp", KindImage},
 		{"x.txt", "audio/mpeg", KindAudio},
+		{"note", "application/ogg", KindAudio},
 		{"", "", KindOther},
 	}
 	for _, c := range cases {
@@ -188,23 +343,4 @@ func TestClassifyMedia(t *testing.T) {
 			t.Errorf("ClassifyMedia(%q,%q) = %s want %s", c.name, c.mime, got, c.want)
 		}
 	}
-}
-
-func TestAttachmentJSONShape(t *testing.T) {
-	// M2 depends on these keys being stable; assert the contract early.
-	a := Attachment{URL: "https://x/y.png", Kind: KindImage, Media: "inline"}
-	b := New(4)
-	b.Publish(&Event{Kind: "message", Attachments: []Attachment{a}, Ts: time.Now()})
-	got, _ := b.After(0, nil, 1)
-	if len(got) != 1 || len(got[0].Attachments) != 1 {
-		t.Fatal("attachment lost")
-	}
-}
-
-func seqs(evs []*Event) []uint64 {
-	out := make([]uint64, 0, len(evs))
-	for _, e := range evs {
-		out = append(out, e.Seq)
-	}
-	return out
 }

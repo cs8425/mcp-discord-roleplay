@@ -192,6 +192,30 @@ func (rt *Router) DeclaresAgent(id string) bool {
 	return ok
 }
 
+// AgentIDs lists every agent id that needs its own queue: the agents declared
+// in routing.json (both the agents[] entries and any target that names one)
+// plus the process default, so a poll without _meta.agentId still reads from
+// somewhere. Sorted, always contains at least one entry.
+func (rt *Router) AgentIDs() []string {
+	set := map[string]bool{rt.defaultID(): true}
+	for a := range rt.agentRules {
+		if a != "" {
+			set[a] = true
+		}
+	}
+	for _, ru := range rt.ordered {
+		if ru.Agent != "" {
+			set[ru.Agent] = true
+		}
+	}
+	out := make([]string, 0, len(set))
+	for a := range set {
+		out = append(out, a)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // Resolve turns a caller-supplied target reference into a Rule.
 // Accepted forms: alias, channel:<id>, user:<id>, dm:<id>, #name, @name,
 // "me", or a bare snowflake (treated as a channel id).
@@ -270,9 +294,12 @@ const (
 	AdmitReadDenied  = "read_denied"
 )
 
-// AdmitInbound decides whether an observed event enters the bus. Note this is
-// agent-independent: the ring is shared, and per-agent scoping happens when a
-// poll filters (see Targets).
+// AdmitInbound decides whether an observed event may enter a queue at all, and
+// which rule owns it. Audience is what the bus actually calls: it answers the
+// same policy per agent. AdmitInbound is kept as the single readable statement
+// of the policy order and of its reason codes (the vocabulary DESIGN.md uses).
+// They duplicate the same rules, so if you change one, change the other; M3
+// folds them into one pass.
 func (rt *Router) AdmitInbound(guildID, channelID string, isDM bool, recipients []string) (*Rule, string) {
 	if isDM && !rt.allowDM {
 		return nil, AdmitDMDisabled
@@ -309,6 +336,161 @@ func (rt *Router) AliasFor(channelID string, isDM bool, recipients []string) str
 		return ru.Alias
 	}
 	return "channel:" + channelID
+}
+
+// ---------------------------------------------------------------------------
+// Inbound audience (M2): who is allowed to read an event
+// ---------------------------------------------------------------------------
+
+// AudienceEntry is one agent that may read an observed inbound event.
+type AudienceEntry struct {
+	Agent  string `json:"agent"`
+	Alias  string `json:"alias,omitempty"` // "" = admitted by policy, no rule owns it
+	Name   string `json:"name,omitempty"`
+	Target string `json:"target"`
+}
+
+// Audience returns every agent allowed to read an inbound event, sorted by
+// agent id. It is the fan-out key for the per-agent queues: an event is pushed
+// only into these queues.
+//
+// It walks ALL rules rather than the byChan/byUser single-value indexes, and
+// that is the whole point: those indexes keep one rule per id (last declaration
+// wins), so a channel listed twice under two aliases for two agents would only
+// ever reach one of them.
+//
+// Events that no rule owns but policy admits (a guild channel passing the
+// allow-lists, a stranger DM with unknown_dm="ring") go to the DEFAULT agent
+// only. They are never broadcast: an unknown DM is nobody's business until an
+// agent claims that user.
+//
+// An empty result means "nobody may read this", and the event is dropped.
+func (rt *Router) Audience(guildID, channelID string, isDM bool, recipients []string) []AudienceEntry {
+	if isDM && !rt.allowDM {
+		return nil
+	}
+	if rt.denyChannels[channelID] {
+		return nil
+	}
+
+	var matched []*Rule
+	for _, ru := range rt.ordered {
+		switch ru.Kind {
+		case KindChannel:
+			if ru.ID == channelID {
+				matched = append(matched, ru)
+			}
+		case KindUser:
+			if !isDM {
+				continue
+			}
+			for _, u := range recipients {
+				if u != "" && ru.ID == u {
+					matched = append(matched, ru)
+					break
+				}
+			}
+		}
+	}
+
+	seen := map[string]AudienceEntry{}
+	for _, ru := range matched {
+		if !ru.Read {
+			continue
+		}
+		for _, a := range rt.agentsSeeing(ru) {
+			seen[a] = AudienceEntry{Agent: a, Alias: ru.Alias, Name: ru.Name, Target: ru.Target}
+		}
+	}
+	if len(matched) > 0 {
+		// A rule owns this channel/user: read_denied and foreign_agent are final,
+		// they must not fall through to the stray handler below.
+		return sortAudience(seen)
+	}
+
+	if !rt.admitStray(guildID, channelID, isDM) {
+		return nil
+	}
+	def := rt.defaultID()
+	seen[def] = AudienceEntry{Agent: def, Target: "channel:" + channelID}
+	return sortAudience(seen)
+}
+
+// admitStray applies the no-rule branch of the inbound policy.
+func (rt *Router) admitStray(guildID, channelID string, isDM bool) bool {
+	if isDM {
+		return rt.unknownDM == "ring"
+	}
+	if len(rt.allowChannels) > 0 && !rt.allowChannels[channelID] {
+		return false
+	}
+	if len(rt.allowGuilds) > 0 && !rt.allowGuilds[guildID] {
+		return false
+	}
+	return true
+}
+
+// agentsSeeing lists the principals for which visible() accepts ru.
+//
+// An explicit owner wins even when the file has no agents[] block: otherwise a
+// target marked "agent":"a9" would be read by "default" here while SendTarget
+// still refused it as foreign_agent, and no config author expects that split.
+func (rt *Router) agentsSeeing(ru *Rule) []string {
+	if ru.Agent != "" {
+		return []string{ru.Agent}
+	}
+	if !rt.hasAgents {
+		return []string{rt.defaultID()}
+	}
+	out := []string{}
+	for a := range rt.agentRules {
+		if rt.visible(Principal{AgentID: a}, ru) {
+			out = append(out, a)
+		}
+	}
+	if def := rt.defaultID(); !rt.hasAgent(def) && rt.visible(Principal{AgentID: def}, ru) {
+		out = append(out, def)
+	}
+	return out
+}
+
+func (rt *Router) hasAgent(id string) bool {
+	_, ok := rt.agentRules[id]
+	return ok
+}
+
+func (rt *Router) defaultID() string {
+	if rt.defaultAgent != "" {
+		return rt.defaultAgent
+	}
+	return "default"
+}
+
+func sortAudience(seen map[string]AudienceEntry) []AudienceEntry {
+	if len(seen) == 0 {
+		return nil
+	}
+	out := make([]AudienceEntry, 0, len(seen))
+	for _, e := range seen {
+		out = append(out, e)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Agent < out[j].Agent })
+	return out
+}
+
+// AliasForTarget returns the alias this principal knows a canonical target
+// ("channel:123" / "user:456") by, or "" when it has no rule for it. Used to
+// label polled messages with the name the caller would send to.
+func (rt *Router) AliasForTarget(p Principal, targets ...string) string {
+	for _, t := range targets {
+		if t == "" {
+			continue
+		}
+		if ru, ok := rt.byTarget[t]; ok && ru.Read && rt.visible(p, ru) {
+			return ru.Alias
+		}
+	}
+	return ""
 }
 
 // SendTarget resolves a target reference for a send, applying ACL. It returns

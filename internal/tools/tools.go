@@ -25,7 +25,7 @@ import (
 type Deps struct {
 	Cfg       *config.Config
 	Router    *router.Router
-	Bus       *bus.Bus
+	Hub       *bus.Hub // one queue per agent; the inbound fan-out target
 	DC        *discord.Client
 	Files     *files.Store  // sandbox for send's file paths; nil-safe, reports files_disabled
 	Stopping  chan struct{} // closed as soon as shutdown begins
@@ -39,6 +39,12 @@ type Deps struct {
 	// personas sharing one server must not inherit each other's conversation.
 	// Deps is only ever used through a pointer, so this lock is never copied.
 	last sync.Map
+
+	// pollAt records when each agent last drained its queue, so discord_status
+	// can show which persona stopped polling (and is therefore dropping events
+	// at the queue cap).
+	pollMu sync.Mutex
+	pollAt map[string]time.Time
 }
 
 // RegisterAll registers the tools available in this build onto reg (which is
@@ -51,7 +57,7 @@ func RegisterAll(reg *mcp.Registry, d *Deps) error {
 	}{
 		{statusTool(), d.handleStatus},
 		{sendTool(), d.handleSend},
-		// M2: {pollTool(), d.handlePoll}
+		{pollTool(), d.handlePoll},
 		// M3: {historyTool(), d.handleHistory}, {channelsTool(), d.handleChannels}
 	}
 	for _, p := range plan {

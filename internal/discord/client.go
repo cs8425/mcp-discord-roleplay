@@ -59,7 +59,6 @@ type Snapshot struct {
 	SelfID        string    `json:"self_id,omitempty"`
 	SelfName      string    `json:"self_name,omitempty"`
 	SelfTag       string    `json:"self_tag,omitempty"`
-	BaselineSeq   uint64    `json:"baseline_seq"`
 	HeartbeatAgoS float64   `json:"heartbeat_age_s,omitempty"`
 }
 
@@ -67,7 +66,7 @@ type Snapshot struct {
 type Client struct {
 	cfg *config.Config
 	log *slog.Logger
-	b   *bus.Bus
+	hub *bus.Hub
 	rt  *router.Router
 
 	mu   sync.RWMutex
@@ -89,12 +88,13 @@ type Client struct {
 	sleep    func(ctx context.Context, d time.Duration) error // nil = real timer, ctx-aware
 }
 
-// New builds a client; nothing is connected until Start.
-func New(cfg *config.Config, log *slog.Logger, b *bus.Bus, rt *router.Router) *Client {
+// New builds a client; nothing is connected until Start. Inbound events are
+// fanned out through hub to the per-agent queues router.Audience selects.
+func New(cfg *config.Config, log *slog.Logger, hub *bus.Hub, rt *router.Router) *Client {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Client{cfg: cfg, log: log, b: b, rt: rt, lim: newSendLimiter(cfg)}
+	return &Client{cfg: cfg, log: log, hub: hub, rt: rt, lim: newSendLimiter(cfg)}
 }
 
 // Start creates the session, installs handlers and opens the gateway.
@@ -255,11 +255,6 @@ func (c *Client) onReady(_ *discordgo.Session, r *discordgo.Ready) {
 	}
 	c.snap.SelfID, c.snap.SelfName, c.snap.SelfTag = self, name, tag
 	first := c.snap.ReadyCount == 1
-	if first {
-		// Never replay messages from before this process started: the baseline
-		// cursor is the bus head at Ready time.
-		c.snap.BaselineSeq = c.b.Stats().MaxSeq
-	}
 	guilds, privs := 0, 0
 	if r != nil {
 		guilds, privs = len(r.Guilds), len(r.PrivateChannels)
@@ -325,25 +320,33 @@ func (c *Client) onMessageCreate(s *discordgo.Session, m *discordgo.MessageCreat
 
 	ev := c.normalize(s, m.Message)
 
-	ru, reason := c.rt.AdmitInbound(ev.GuildID, ev.ChannelID, ev.DM, recipientIDs(ev))
-	if reason != router.AdmitOK {
-		c.log.Debug("event not admitted",
-			"reason", reason, "channel", ev.ChannelID, "dm", ev.DM, "author", ev.Author.ID)
+	// Who is allowed to read this? The event is then stored by reference in each
+	// of those agents' queues, so nothing may touch ev below this line.
+	aud := c.rt.Audience(ev.GuildID, ev.ChannelID, ev.DM, recipientIDs(ev))
+	if len(aud) == 0 {
+		c.log.Debug("event has no audience, dropped",
+			"channel", ev.ChannelID, "dm", ev.DM, "author", ev.Author.ID)
+		if c.hub != nil {
+			c.hub.NoteSkipped()
+		}
 		return
 	}
-	if ru != nil {
-		ev.Target = ru.Alias
-		if ev.ChannelName == "" {
-			ev.ChannelName = ru.Name
-		}
-	} else if ev.Target == "" {
-		ev.Target = "channel:" + ev.ChannelID
+	if ev.ChannelName == "" {
+		ev.ChannelName = aud[0].Name
 	}
 
-	seq := c.b.Publish(ev)
-	c.log.Debug("event stored",
-		"seq", seq, "target", ev.Target, "author", ev.Author.Name,
+	c.hub.Fanout(ev, agentIDsOf(aud))
+	c.log.Debug("event queued",
+		"agents", len(aud), "target", ev.Target, "author", ev.Author.Name,
 		"runes", len([]rune(ev.Text)), "attachments", len(ev.Attachments))
+}
+
+func agentIDsOf(aud []router.AudienceEntry) []string {
+	out := make([]string, 0, len(aud))
+	for _, a := range aud {
+		out = append(out, a.Agent)
+	}
+	return out
 }
 
 // normalize converts a discordgo message into a bus.Event. Only the in-memory
@@ -360,6 +363,10 @@ func (c *Client) normalize(s *discordgo.Session, m *discordgo.Message) *bus.Even
 		GuildID:   m.GuildID,
 		DM:        m.GuildID == "",
 		Text:      m.Content,
+		// Canonical, agent-independent label: aliases differ per agent, so the
+		// shared event carries only the id form and poll resolves the alias for
+		// whoever is asking.
+		Target: "channel:" + m.ChannelID,
 	}
 	ev.Time = tz.Format(ev.Ts)
 
@@ -415,8 +422,10 @@ func (c *Client) normalize(s *discordgo.Session, m *discordgo.Message) *bus.Even
 			ID: a.ID, Filename: a.Filename, ContentType: a.ContentType, Kind: kind,
 			Size: a.Size, Width: a.Width, Height: a.Height, DurationSecs: a.DurationSecs,
 			URL: a.URL, ProxyURL: a.ProxyURL,
-			Media: string(c.cfg.MediaFor(kind)), // policy; fetch happens in poll (M2)
 		})
+		// The media policy verdict (inline/save/skip) is NOT recorded here: this
+		// event is shared between agents, and how one poll renders an attachment
+		// says nothing about another. poll computes it per call.
 	}
 
 	for _, e := range m.Embeds {
@@ -450,8 +459,13 @@ func dmPeer(ch *discordgo.Channel, selfID string) *discordgo.User {
 }
 
 func (c *Client) publishSystem(text string) {
+	if c.hub == nil {
+		return
+	}
 	now := time.Now()
-	c.b.Publish(&bus.Event{
+	// System notices go to every queue but are never delivered to a caller: a
+	// poll consumes and discards them so they cannot hold a slot forever.
+	c.hub.PublishAll(&bus.Event{
 		Kind: bus.KindSystem,
 		Ts:   now,
 		Time: tz.Format(now),
@@ -542,7 +556,7 @@ func dgoLogLevel(level string) int {
 
 func recipientIDs(ev *bus.Event) []string {
 	var ids []string
-	if v, ok := ev.Extra["peer"].(string); ok && v != "" {
+	if v := ev.Extra["peer"]; v != "" {
 		ids = append(ids, v)
 	}
 	if ev.Author.ID != "" {
@@ -561,9 +575,9 @@ func messageTime(m *discordgo.Message) time.Time {
 	return time.Now()
 }
 
-func setExtra(m map[string]any, k string, v any) map[string]any {
+func setExtra(m map[string]string, k, v string) map[string]string {
 	if m == nil {
-		m = map[string]any{}
+		m = map[string]string{}
 	}
 	m[k] = v
 	return m

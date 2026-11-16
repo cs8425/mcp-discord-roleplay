@@ -188,44 +188,77 @@ func TestFileRootDefaultsToCwd(t *testing.T) {
 	}
 }
 
-// The two paths this server *writes* must stay plain and cwd-local: no $HOME,
-// no XDG cache dir, no /tmp, and no rewriting of what the operator typed.
+// The paths this server *writes* must stay plain and cwd-local: no $HOME, no
+// XDG cache dir, no /tmp, and no rewriting of what the operator typed.
 func TestWrittenPathsStayRelativeToCwd(t *testing.T) {
 	cfg, err := Load([]string{"-selftest"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.StateFile != DefaultStateFile || cfg.MediaOut != DefaultMediaOut {
-		t.Fatalf("defaults moved: state=%q media=%q", cfg.StateFile, cfg.MediaOut)
+	if cfg.MediaOut != DefaultMediaOut {
+		t.Fatalf("defaults moved: media=%q", cfg.MediaOut)
 	}
-	for _, p := range []string{cfg.StateFile, cfg.MediaOut} {
+	for _, p := range []string{cfg.MediaOut} {
 		if filepath.IsAbs(p) || filepath.Dir(p) != "." || strings.ContainsAny(p, "~$") {
 			t.Fatalf("%q must be a plain name inside the cwd", p)
 		}
 	}
 
 	// What is passed is stored verbatim: not Abs'd, not Clean'd, no ~ expansion.
-	cfg, err = Load([]string{"-selftest", "-state-file=run/state.json", "-media-out=./media/"})
+	cfg, err = Load([]string{"-selftest", "-media-out=./media/"})
 	if err != nil {
 		t.Fatal(err)
-	}
-	if cfg.StateFile != "run/state.json" {
-		t.Fatalf("state file was rewritten: %q", cfg.StateFile)
 	}
 	if cfg.MediaOut != "./media/" {
 		t.Fatalf("media out was rewritten: %q", cfg.MediaOut)
 	}
 
 	// '' and --no-media-out still mean disabled.
-	cfg, err = Load([]string{"-selftest", "-state-file=", "-no-media-out"})
+	cfg, err = Load([]string{"-selftest", "-no-media-out"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.StateFile != "" {
-		t.Fatalf("-state-file= should disable, got %q", cfg.StateFile)
-	}
 	if cfg.MediaOut != "" || cfg.SaveEnabled() {
 		t.Fatalf("--no-media-out should disable save, got %q", cfg.MediaOut)
+	}
+}
+
+// The poll reply budget: default 16 KiB, 0 means uncapped, and nonsense values
+// are refused at startup rather than silently truncating every answer.
+func TestPollMaxBytes(t *testing.T) {
+	cfg, err := Load([]string{"-selftest"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PollMaxBytes != DefaultPollMaxBytes {
+		t.Fatalf("default poll budget moved: %d", cfg.PollMaxBytes)
+	}
+	cfg, err = Load([]string{"-selftest", "-poll-max-bytes=40000"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PollMaxBytes != 40000 {
+		t.Fatalf("budget not applied: %d", cfg.PollMaxBytes)
+	}
+	cfg, err = Load([]string{"-selftest", "-poll-max-bytes=0"})
+	if err != nil {
+		t.Fatalf("0 must mean uncapped and load, got %v", err)
+	}
+	if cfg.PollMaxBytes != 0 {
+		t.Fatalf("0 lost: %d", cfg.PollMaxBytes)
+	}
+	for _, bad := range []string{"100", "2000000"} {
+		if _, err := Load([]string{"-selftest", "-poll-max-bytes=" + bad}); err == nil {
+			t.Fatalf("--poll-max-bytes=%s should be rejected", bad)
+		}
+	}
+	t.Setenv("MCPDR_POLL_MAX_BYTES", "20000")
+	cfg, err = Load([]string{"-selftest", "-env-file=/nonexistent"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PollMaxBytes != 20000 {
+		t.Fatalf("MCPDR_POLL_MAX_BYTES ignored: %d", cfg.PollMaxBytes)
 	}
 }
 

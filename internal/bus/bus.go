@@ -1,14 +1,27 @@
-// Package bus is the in-memory event store the poll tool reads from.
+// Package bus is the in-memory event queue between the Discord gateway
+// handlers and the MCP tool callers.
 //
-// It is a fixed-size ring of normalized Discord events plus a broadcast
-// channel. The gateway handler only ever calls Publish, which never blocks and
-// never performs I/O — that is a hard requirement, because a slow handler in
-// the Discord websocket read loop stalls heartbeats.
+// There is one Queue per agent (see Hub). The gateway handler only ever calls
+// Hub.Fanout / Queue.Push, which never block and never perform I/O — that is a
+// hard requirement, because a slow handler in the Discord websocket read loop
+// stalls heartbeats.
+//
+// QUEUES ARE NOT A BACKLOG. A Queue is a fixed-size ring: when it fills, the
+// oldest event is dropped and counted in Stats.Dropped. Dropped events are gone
+// for good. This process deliberately never replays history on startup, so
+// everything in here was produced while it was running: a restart empties every
+// queue by design. Catching up on missed messages is a REST feature
+// (discord_history), not something a queue can or should do.
+//
+// EVENTS ARE READ-ONLY ONCE PUSHED. Hub.Fanout hands the *same* pointer to
+// several queues, so no code may mutate an Event (or its Attachment/Embed
+// slices) after Push: a write done while rendering one agent's poll would be
+// visible to every other agent and to later polls. Anything a caller computes
+// about an event (for example how a media attachment was rendered) belongs in
+// the caller's own output struct, never back on the event.
 package bus
 
 import (
-	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -38,8 +51,10 @@ type Author struct {
 	Self bool   `json:"self,omitempty"`
 }
 
-// Attachment is a normalized file attached to a message. The Media field
-// records what the poll tool decided to do with it.
+// Attachment is a normalized file attached to a message. It carries metadata
+// only: how an attachment is rendered (inlined, saved to disk, skipped) is a
+// per-caller decision and lives in the caller's output struct, because this
+// value is shared between agents and polls (see the package doc).
 type Attachment struct {
 	ID           string  `json:"id"`
 	Filename     string  `json:"filename,omitempty"`
@@ -51,9 +66,6 @@ type Attachment struct {
 	DurationSecs float64 `json:"duration_secs,omitempty"`
 	URL          string  `json:"url"`
 	ProxyURL     string  `json:"proxy_url,omitempty"`
-	Media        string  `json:"media"` // inline|save|skip|skipped:<reason>
-	LocalPath    string  `json:"local_path,omitempty"`
-	ContentIndex int     `json:"content_index,omitempty"` // index into result content[]
 }
 
 // Embed is a minimal view of a Discord embed (rich cards are flattened).
@@ -64,10 +76,10 @@ type Embed struct {
 	URL         string `json:"url,omitempty"`
 }
 
-// Event is one stored item. Seq is monotonically increasing and is what
-// cursors refer to.
+// Event is one stored item. It has no identity field on purpose: seq numbers
+// are per-queue bookkeeping and are not exposed, so nothing can be built that
+// depends on them surviving a restart.
 type Event struct {
-	Seq  uint64    `json:"seq"`
 	Kind string    `json:"kind"`
 	Ts   time.Time `json:"-"`
 	Time string    `json:"time"`
@@ -81,218 +93,261 @@ type Event struct {
 
 	MessageID string `json:"message_id,omitempty"`
 	Author    Author `json:"author"`
+	Text      string `json:"text,omitempty"`
 
-	Text         string `json:"text"`
-	Truncated    bool   `json:"truncated,omitempty"`
-	MentionsSelf bool   `json:"mentions_self,omitempty"`
+	// Truncated means Text is not the whole original message.
+	Truncated bool `json:"truncated,omitempty"`
 
-	Attachments []Attachment   `json:"attachments,omitempty"`
-	Embeds      []Embed        `json:"embeds,omitempty"`
-	Extra       map[string]any `json:"extra,omitempty"`
+	MentionsSelf bool         `json:"mentions_self,omitempty"`
+	Attachments  []Attachment `json:"attachments,omitempty"`
+	Embeds       []Embed      `json:"embeds,omitempty"`
+
+	// Extra holds kind-specific fields (e.g. peer) so future event types do
+	// not need to change this struct.
+	Extra map[string]string `json:"extra,omitempty"`
 }
 
-// Stats is a snapshot for the status tool.
+// Stats is a snapshot of one Queue.
 type Stats struct {
 	Size     int    `json:"size"`
 	Capacity int    `json:"capacity"`
-	Total    uint64 `json:"total"`
+	Pushed   uint64 `json:"pushed"`
 	Dropped  uint64 `json:"dropped"`
-	MaxSeq   uint64 `json:"max_seq"`
-	LastSeq  uint64 `json:"last_seq"`
 }
 
-// Bus holds the ring and broadcasts arrivals.
-type Bus struct {
-	mu   sync.Mutex
-	cap  int
-	ring []*Event
-	next int // write cursor (index of the oldest slot when full)
-	size int
+// Verdict is Queue.Drain's answer for one event.
+type Verdict int
 
+const (
+	// Take delivers this event and removes it from the queue.
+	Take Verdict = iota
+	// Skip leaves the event in place, untouched, and keeps scanning.
+	Skip
+	// Stop ends the scan: this event and everything behind it stay in the
+	// queue, in order. It is the "out of budget" answer — because Drain keeps
+	// strict order, anything left behind is exactly what the next poll sees
+	// first.
+	Stop
+)
+
+// Queue is a fixed-capacity FIFO of events with a wake-up signal. The zero
+// value is not usable; call NewQueue.
+type Queue struct {
+	mu      sync.Mutex
+	cap     int
+	ring    []*Event
+	next    int // index of the next write
+	size    int
 	total   uint64
 	dropped uint64
-	maxSeq  uint64
 
 	notify chan struct{}
 }
 
-// New returns a Bus that keeps the last cap events.
-func New(cap int) *Bus {
-	if cap < 1 {
-		cap = 1
+// NewQueue returns a queue holding at most capacity events. capacity <= 0 means
+// "keep the newest default" (1) so a misconfiguration cannot create a queue
+// that silently holds nothing.
+func NewQueue(capacity int) *Queue {
+	if capacity <= 0 {
+		capacity = 1
 	}
-	return &Bus{
-		cap:    cap,
-		ring:   make([]*Event, cap),
+	return &Queue{
+		cap:    capacity,
+		ring:   make([]*Event, capacity),
 		notify: make(chan struct{}),
 	}
 }
 
-// Publish assigns the next sequence number, stores e (overwriting the oldest
-// entry when full) and wakes every waiting poll. It never blocks.
-func (b *Bus) Publish(e *Event) uint64 {
+// Push appends an event, evicting the oldest one when full. It never blocks.
+func (q *Queue) Push(e *Event) {
 	if e == nil {
-		return 0
+		return
 	}
-	b.mu.Lock()
-	b.maxSeq++
-	e.Seq = b.maxSeq
-	b.total++
-	b.ring[b.next] = e
-	b.next = (b.next + 1) % b.cap
-	if b.size < b.cap {
-		b.size++
-	} else {
-		b.dropped++
+	q.mu.Lock()
+	q.total++
+	if q.ring[q.next] != nil {
+		// overwriting the oldest live slot
+		q.dropped++
 	}
-	close(b.notify)
-	b.notify = make(chan struct{})
-	b.mu.Unlock()
-	return e.Seq
+	q.ring[q.next] = e
+	q.next = (q.next + 1) % q.cap
+	if q.size < q.cap {
+		q.size++
+	}
+	q.signalLocked()
+	q.mu.Unlock()
 }
 
-// Notify returns a channel closed on the next published event. Re-read it after
-// each wake (the previous channel is already closed).
-func (b *Bus) Notify() <-chan struct{} {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.notify
+// Notify returns a channel closed when an event arrives. Callers must read this
+// channel BEFORE draining, then wait on it: a Push closes whatever channel
+// existed at the time of the push, so a pre-read channel can never be missed.
+func (q *Queue) Notify() <-chan struct{} {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.notify
 }
 
-// After returns up to limit events with Seq > seq that pass filter, oldest
-// first, plus the highest Seq among the returned events (0 when none). The
-// caller uses that as its next cursor, so events beyond limit stay unread.
-func (b *Bus) After(seq uint64, filter func(*Event) bool, limit int) ([]*Event, uint64) {
-	if limit <= 0 {
-		limit = 1
+// Drain walks the queue oldest first, asks want() about each event, removes
+// everything answered Take, and returns those events plus how many are still
+// queued. Answers are strictly in queue order: Skip leaves an event in place,
+// Stop stops the walk and leaves that event and the whole tail untouched.
+//
+// want may be nil, which means "take everything". It runs with the queue
+// locked, so it must be pure computation: no I/O, no waiting, no calling back
+// into the Hub (Push would deadlock on the same mutex).
+func (q *Queue) Drain(want func(*Event) Verdict) (out []*Event, remaining int) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.size == 0 {
+		return nil, 0
 	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	all := make([]*Event, 0, q.size)
+	for i := 0; i < q.size; i++ {
+		if e := q.atLocked(i); e != nil {
+			all = append(all, e)
+		}
+	}
 
-	start := 0
-	if b.size == b.cap {
-		start = b.next // oldest entry when the ring has wrapped
-	}
-	out := make([]*Event, 0, minInt(limit, b.size))
-	last := uint64(0)
-	for i := 0; i < b.size; i++ {
-		e := b.ring[(start+i)%b.cap]
-		if e == nil || e.Seq <= seq {
-			continue
+	var outEv, keep []*Event
+	i := 0
+	for ; i < len(all); i++ {
+		v := Take
+		if want != nil {
+			v = want(all[i])
 		}
-		if filter != nil && !filter(e) {
-			continue
-		}
-		out = append(out, e)
-		last = e.Seq
-		if len(out) >= limit {
+		if v == Stop {
 			break
 		}
+		if v == Skip {
+			keep = append(keep, all[i])
+			continue
+		}
+		outEv = append(outEv, all[i])
 	}
-	return out, last
+	keep = append(keep, all[i:]...) // untouched tail (also covers Stop)
+
+	q.rewriteLocked(keep)
+	return outEv, len(keep)
 }
 
-// Latest returns up to limit stored events that pass filter, oldest first,
-// keeping the NEWEST ones when more than limit match (ignores cursors).
-func (b *Bus) Latest(filter func(*Event) bool, limit int) []*Event {
-	if limit <= 0 {
-		limit = 1
+// RequeueFront puts already-drained events back at the OLDEST end, preserving
+// their order, so the next Drain sees them first — as if they were never taken.
+// It exists for one case: a client cancelled the request after we drained, so
+// the batch was never delivered. If the queue overflows, the newest events are
+// dropped and counted.
+func (q *Queue) RequeueFront(evs []*Event) {
+	if len(evs) == 0 {
+		return
 	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	q.mu.Lock()
+	defer q.mu.Unlock()
 
-	start := 0
-	if b.size == b.cap {
-		start = b.next
+	have := make([]*Event, 0, q.size)
+	for i := 0; i < q.size; i++ {
+		if e := q.atLocked(i); e != nil {
+			have = append(have, e)
+		}
 	}
-	out := make([]*Event, 0, minInt(limit, b.size))
-	for i := 0; i < b.size; i++ {
-		e := b.ring[(start+i)%b.cap]
-		if e == nil || (filter != nil && !filter(e)) {
+	all := append(append([]*Event{}, evs...), have...)
+	if len(all) > q.cap {
+		// keep the newest cap entries: drop from the oldest end of what we are
+		// re-adding, which is the least useful part of a batch nobody read.
+		drop := len(all) - q.cap
+		q.dropped += uint64(drop)
+		all = all[drop:]
+	}
+	q.rewriteLocked(all)
+}
+
+// Latest returns up to limit events passing f (nil f = all), newest first. It
+// does not remove anything; it exists for discord_status previews.
+func (q *Queue) Latest(f func(*Event) bool, limit int) []*Event {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if limit <= 0 || q.size == 0 {
+		return nil
+	}
+	var out []*Event
+	for i := q.size - 1; i >= 0; i-- {
+		e := q.atLocked(i)
+		if e == nil {
+			continue
+		}
+		if f != nil && !f(e) {
 			continue
 		}
 		out = append(out, e)
-		if len(out) > limit {
-			out = out[len(out)-limit:]
+		if len(out) >= limit {
+			break
 		}
 	}
 	return out
 }
 
-// Stats returns the current counters.
-func (b *Bus) Stats() Stats {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	last := uint64(0)
-	if b.size > 0 {
-		i := (b.next - 1 + b.cap) % b.cap
-		if e := b.ring[i]; e != nil {
-			last = e.Seq
-		}
-	}
-	return Stats{
-		Size: b.size, Capacity: b.cap, Total: b.total,
-		Dropped: b.dropped, MaxSeq: b.maxSeq, LastSeq: last,
-	}
+// Stats reports current queue state.
+func (q *Queue) Stats() Stats {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return Stats{Size: q.size, Capacity: q.cap, Pushed: q.total, Dropped: q.dropped}
 }
 
-// Unread counts stored events with Seq > seq that pass filter (capped at limit
-// so it stays cheap).
-func (b *Bus) Unread(seq uint64, filter func(*Event) bool, limit int) int {
-	evs, _ := b.After(seq, filter, limit)
-	return len(evs)
+// --- internals (all called with q.mu held) ---
+
+// atLocked returns the i-th oldest live entry.
+func (q *Queue) atLocked(i int) *Event {
+	start := (q.next - q.size + q.cap) % q.cap
+	return q.ring[(start+i)%q.cap]
 }
 
-// Cursor renders a sequence number as an opaque cursor string. Seq 0 means
-// "nothing consumed yet" and is written as the empty string, so a caller can
-// simply echo back whatever it was given.
-func Cursor(seq uint64) string {
-	if seq == 0 {
-		return ""
+// rewriteLocked replaces the whole contents with events, oldest first.
+func (q *Queue) rewriteLocked(events []*Event) {
+	n := len(events)
+	if n > q.cap {
+		n = q.cap
 	}
-	return "s" + strconv.FormatUint(seq, 10)
+	// the caller may hand us more than cap only from RequeueFront, which trims
+	// first; keep this defensive so slots are never left dangling
+	copy(q.ring[:n], events[:n])
+	for i := n; i < q.cap; i++ {
+		q.ring[i] = nil
+	}
+	q.size = n
+	q.next = n % q.cap
 }
 
-// ParseCursor is the inverse of Cursor. ok is false for empty/garbage input.
-func ParseCursor(s string) (uint64, bool) {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return 0, false
+// signalLocked wakes every current waiter.
+func (q *Queue) signalLocked() {
+	if q.notify != nil {
+		close(q.notify)
 	}
-	s = strings.TrimPrefix(s, "s")
-	n, err := strconv.ParseUint(s, 10, 64)
-	if err != nil {
-		return 0, false
-	}
-	return n, true
+	q.notify = make(chan struct{})
 }
 
-// ClassifyMedia guesses the media kind of an attachment from its content type,
-// falling back to the filename extension.
+// ClassifyMedia maps a filename/content-type to image|audio|video|other.
 func ClassifyMedia(filename, contentType string) string {
 	ct := strings.ToLower(strings.TrimSpace(contentType))
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = strings.TrimSpace(ct[:i])
+	}
 	switch {
 	case strings.HasPrefix(ct, "image/"):
 		return KindImage
-	case strings.HasPrefix(ct, "audio/"):
+	case strings.HasPrefix(ct, "audio/"), ct == "application/ogg":
 		return KindAudio
 	case strings.HasPrefix(ct, "video/"):
 		return KindVideo
 	}
-	switch strings.ToLower(filepath.Ext(filename)) {
-	case ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".avif", ".tif", ".tiff", ".heic", ".svg":
-		return KindImage
-	case ".mp3", ".ogg", ".oga", ".wav", ".m4a", ".aac", ".flac", ".opus", ".amr":
-		return KindAudio
-	case ".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v", ".3gp", ".ts":
-		return KindVideo
+	// fall back on the extension (Discord voice messages arrive as .ogg/.opus)
+	ext := strings.ToLower(filename)
+	if i := strings.LastIndexByte(ext, '.'); i >= 0 {
+		switch ext[i:] {
+		case ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".heic", ".avif":
+			return KindImage
+		case ".mp3", ".ogg", ".oga", ".opus", ".wav", ".m4a", ".aac", ".flac":
+			return KindAudio
+		case ".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v", ".3gp":
+			return KindVideo
+		}
 	}
 	return KindOther
-}
-
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

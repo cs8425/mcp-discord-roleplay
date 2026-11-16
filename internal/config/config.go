@@ -28,8 +28,13 @@ const Module = "mcp-discord-roleplay"
 // here consults $HOME, $XDG_CACHE_HOME or $TMPDIR, and the values are never
 // rewritten (no ~ expansion, no Abs, no Clean) — what you pass is what lands.
 const (
-	DefaultStateFile = "mcpdr-state.json"
-	DefaultMediaOut  = "mcpdr-media"
+	DefaultMediaOut = "mcpdr-media"
+
+	// DefaultPollMaxBytes caps how much discord_poll returns in one call. The
+	// queue can hold far more than a model context window likes, so a poll stops
+	// taking events once its answer would be big and the rest wait for the next
+	// poll (in order).
+	DefaultPollMaxBytes = 16384
 )
 
 // MediaMode decides what happens to an inbound attachment.
@@ -82,7 +87,7 @@ type Config struct {
 
 	// --- bus / state ----------------------------------------------------------
 	BusCapacity  int
-	StateFile    string // "" = disabled; otherwise used exactly as typed (relative = cwd)
+	PollMaxBytes int // reply budget for one discord_poll call; 0 = unlimited
 	TextMaxRunes int
 
 	// --- inbound media policy -------------------------------------------------
@@ -167,7 +172,7 @@ func Load(args []string) (*Config, error) {
 	fs.SetOutput(os.Stderr)
 
 	fs.StringVar(&c.TokenEnv, "token-env", "DISCORD_TOKEN", "environment variable holding the bot token (never a literal value)")
-	fs.StringVar(&c.AgentID, "agent", "default", "agent id this process serves (cursor + ACL namespace)")
+	fs.StringVar(&c.AgentID, "agent", "default", "agent id this process serves (queue + ACL namespace)")
 	fs.StringVar(&c.Transport, "transport", "stdio", "transport: stdio (http reserved for a later milestone)")
 	fs.StringVar(&c.HTTPAddr, "http-addr", "127.0.0.1:8787", "reserved: listen address for the future http transport")
 	fs.Var(&origins, "origin", "allowed CORS Origin for http transport (repeatable)")
@@ -177,8 +182,8 @@ func Load(args []string) (*Config, error) {
 	fs.IntVar(&c.PollDefaultWait, "poll-default-wait", 45, "max_wait used when the caller omits it")
 	fs.IntVar(&c.PollJitterPct, "poll-jitter-pct", 15, "percent jitter added to the poll deadline only")
 
-	fs.IntVar(&c.BusCapacity, "bus-capacity", 2000, "in-memory ring buffer size (messages)")
-	fs.StringVar(&c.StateFile, "state-file", DefaultStateFile, "cursor persistence file, relative to the working directory ('' disables)")
+	fs.IntVar(&c.BusCapacity, "bus-capacity", 2000, "per-agent in-memory queue size (messages); the oldest is dropped when full")
+	fs.IntVar(&c.PollMaxBytes, "poll-max-bytes", DefaultPollMaxBytes, "largest reply discord_poll builds (bytes); 0 removes the cap")
 	fs.IntVar(&c.TextMaxRunes, "text-max-runes", 4000, "truncate stored message text beyond this many runes")
 
 	fs.StringVar(&c.mImage, "media-image", "inline", "policy for inbound images: inline|save|skip")
@@ -355,12 +360,11 @@ func (c *Config) finalize() error {
 
 	// 4. write-side paths
 	var err error
-	// --state-file / --media-out stay exactly as typed: relative means "inside the
-	// cwd", which is the documented default. No ~ expansion, no Abs, no Clean —
-	// these are the paths the server *writes*, so they must be predictable. The
-	// read-side paths (--config, --env-file) are likewise used as typed; only
-	// --file-root goes through filepath.Abs, for the chroot containment checks.
-	c.StateFile = strings.TrimSpace(c.StateFile)
+	// --media-out stays exactly as typed: relative means "inside the cwd", which
+	// is the documented default. No ~ expansion, no Abs, no Clean — this is a
+	// path the server *writes*, so it must be predictable. The read-side paths
+	// (--config, --env-file) are likewise used as typed; only --file-root goes
+	// through filepath.Abs, for the chroot containment checks.
 	c.MediaOut = strings.TrimSpace(c.MediaOut)
 	if c.NoMediaOut {
 		c.MediaOut = ""
@@ -418,6 +422,9 @@ func (c *Config) finalize() error {
 	}
 	if c.BusCapacity < 10 {
 		return fmt.Errorf("--bus-capacity must be >= 10, got %d", c.BusCapacity)
+	}
+	if c.PollMaxBytes != 0 && (c.PollMaxBytes < 4096 || c.PollMaxBytes > 1<<20) {
+		return fmt.Errorf("--poll-max-bytes must be 0 (no cap) or within [4096,1048576], got %d", c.PollMaxBytes)
 	}
 	if c.TextMaxRunes < 200 {
 		return fmt.Errorf("--text-max-runes must be >= 200, got %d", c.TextMaxRunes)
@@ -523,7 +530,7 @@ func (c *Config) Audit() map[string]any {
 			"default_wait_s": c.PollDefaultWait, "jitter_pct": c.PollJitterPct,
 		},
 		"bus_capacity":   c.BusCapacity,
-		"state_file":     c.StateFile,
+		"poll_max_bytes": c.PollMaxBytes,
 		"text_max_runes": c.TextMaxRunes,
 		"media": map[string]any{
 			"image": c.MediaFor(KindImage), "audio": c.MediaFor(KindAudio),
@@ -615,7 +622,7 @@ func resolveRoots(raw []string, none bool) ([]string, error) {
 }
 
 // Path policy, and the reason there is no expandPath / cacheDir helper any more:
-// every path argument (--state-file, --media-out, --log-file, --env-file,
+// every path argument (--media-out, --log-file, --env-file,
 // --config, --file-root) is taken as typed — absolute, or relative to the
 // process cwd. We never expand ~ (the operator's shell does that, and a second
 // private path language would only surprise people), we never consult $HOME,

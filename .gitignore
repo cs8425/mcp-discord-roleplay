@@ -16,6 +16,5 @@
 .idea/
 .vscode/
 
-# runtime artifacts — default --state-file / --media-out are cwd-relative
-/mcpdr-state.json
+# runtime artifacts — the default --media-out is a cwd-relative name
 /mcpdr-media/

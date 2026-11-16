@@ -1,9 +1,9 @@
 # mcp-discord-roleplay — 設計 **v3（定稿候選）**
 
 - 2026-11-16　v0→v1→v2→**v3**。v3：C1/C3/C4 拍定；**C2 我原先的說法是錯的，已改正**（4 MiB 是「入口」限制，出口 streaming 無上限）
-- 狀態：**設計定案（v3.1），已依此動工**。本檔是實作的依據，與 `_state/` 的討論稿同步。
-- 實作進度：**M0 完成**（config / router / bus / discord gateway client / `discord_status` / `--selftest`）、**M1 寫完待編譯**（`internal/files` 沙箱 + `discord_send` + 預算/間隔/斷路器 + 單測）；M2 = `discord_poll` + media，M3 = history/channels，M4 = README。
-- ⚠ M1 的碼**尚未經過編譯**（sandbox 無 go）；驗證指令見 `_state/build-notes.md` 與 `_state/plan-M1.md`。
+- 狀態：**設計定案（v3.1）＋ M2a 已寫完待編譯**。本檔是實作的依據，與 `_state/` 的討論稿同步。
+- 實作進度：**M0 ✅**（config / router / bus / discord gateway client / `discord_status` / `--selftest`）、**M1 ✅**（`internal/files` 沙箱 + `discord_send` + 預算/間隔/斷路器 + 單測）、**M2a 寫完待編譯**（per-agent Queue/Hub + `router.Audience` + `discord_poll`）；M2b = media 三段式、M3 = history/channels，M4 = README。
+- ⚠ 碼**尚未經過編譯**（sandbox 無 go）；`-race` 從未跑過。驗證指令見 `_state/build-notes.md`。
 - 建置驗證由 user 執行（sandbox 內無 shell / 無 go）：見 `_state/build-notes.md`。
 - 環境：**Go 1.27.4**（已確認）、單一 bot token、client = 自研 agent、測試由 user 直接把 token/指令接進 session
 - 依賴：`github.com/bwmarrin/discordgo v0.29.0`（API 簽名已逐條對過原始碼）
@@ -50,9 +50,9 @@ LLM(自研 agent) ⇄ mcptransport(stdio｜未來 HTTP+token)
       │                    │
       ▼                    ▼
  internal/router    internal/bus  ←── internal/discord
-  alias⇄channelID    ring+seq 游標     gateway handler → Event 正規化
-  ACL(收/發)         broadcast         REST 發送 / history / 附件下載
-  unknown 政策        filter            附件落 fs(save 模式)
+  alias⇄channelID    per-agent Queue   gateway handler → Event 正規化
+  ACL(收/發)         Audience fan-out  REST 發送 / history / 附件下載
+  unknown 政策        Drain＝取走即 ack  附件落 fs(save 模式)
                                   └──► discordgo.Session（全進程唯一 gateway）
 ```
 ```
@@ -62,10 +62,10 @@ mcp-discord-roleplay/
 ├── internal/
 │   ├── config/             # Config + 驗證 + redact + routing.json
 │   ├── router/             # Rule/Alias/Principal/ACL/unknown-dm 政策
-│   ├── bus/                # Event Ring 游標 broadcast Filter
+│   ├── bus/                # Event + 每 agent 一條 Queue（ring）+ Hub 派發/統計
 │   ├── discord/            # client.go events.go send.go target.go media.go
-│   ├── media/              # 三段式附件處理：inline / save / skip；縮放；dedupe；os.Root 寫入
-│   ├── files/              # 出口附件：os.Root 讀本機 / url 下載(SSRF 擋) / base64
+│   ├── media/              # 三段式附件處理：inline / save / skip；dedupe；os.Root 寫入（**不縮放**，超大就 skip）
+│   ├── files/              # 出口附件：os.Root 讀本機上傳 / url 只貼不抓 / 無 base64 入參
 │   └── tools/              # poll.go send.go history.go channels.go status.go
 ├── docs/DESIGN.md          # 本檔定稿後搬入
 └── README.md
@@ -73,84 +73,88 @@ mcp-discord-roleplay/
 
 ---
 
-## 2. bus
+## 2. bus（M2a：per-agent queue，取走即消失）
 ```go
-type Kind string // MVP: "message"、"system"(connected/reconnecting/disconnected)
 type Event struct {
-    Seq int64; Kind Kind; Ts time.Time
-    Target string        // routing alias（agent 認得的「地方」）；未匹配時為 ""
+    Kind string; Ts time.Time; Time string  // "message" | "system"；Time = Discord 原樣 ISO8601（帶時區偏移）
+    Target string        // 內部座標 "channel:<id>"；normalize() 一律填 channel 座標，poll 時再換成 agent 認的 alias
     GuildID, ChannelID, ChannelName string; DM bool
     MessageID string; Author Author{ID,Name,Tag string; Bot,Self bool}
-    Text string; MentionsSelf bool
-    Attachments []Attachment{ID,Name,MIME string; Size int64; Width,Height int; URL,ProxyURL string; Local string}
-    Embeds []EmbedSummary; Extra string
+    Text string; Truncated bool; MentionsSelf bool
+    Attachments []Attachment{ID,Filename,ContentType,Kind string; Size,Width,Height int; DurationSecs float64; URL,ProxyURL string}
+    Embeds []Embed{Type,Title,Description,URL string}; Extra map[string]string   // "peer"=DM 對方 ID 等雜項
 }
 ```
-- Ring 容量 2000（`--bus-capacity`），覆蓋最舊並計數 → `dropped`
-- 廣播用 `close(notify); notify = make(chan struct{})`（`sync.Cond` 無法配合 ctx/timer select）
+- **沒有 Seq、沒有游標**：取走就是 ack（LLM 端零狀態）。重啟丟 queue 是**設計上就決定這樣的**，補舊訊是 M3 `discord_history` 的工作
+- 每個在 routing.json 聲明的 agent 一條 `Queue`（`--bus-capacity`，預設 2000/**agent**，環形覆蓋最舊並累計 `dropped`）；`Hub.Fanout(ev, agents)` 把**同一個指標**塞進多條 queue
+- ⚠️ **共用指標紅線**：`Push` 之後 Event 唯讀。任何 per-queue 的處理結果（M2b 的 `Media/LocalPath/ContentIndex`）只能放在 `tools` 的輸出結構（`pollAttachment`）；放進 `bus.Attachment` 會讓第二條 queue 讀到別的 agent 的值（例如 local_path 指向別人的檔）。已照此拆開，用型別讓編譯器擋死
+- 醒來機制 `close(notify); notify = make(chan struct{})`（`sync.Cond` 無法配合 ctx/timer select）；`Push` 非阻塞
 - gateway handler 內只做正規化＋**非阻塞** append，絕不在 handler 呼叫 REST
-- 游標 `"s<seq>"`；`cursor_key` 預設 = Principal.AgentID → 多 agent 游標天然隔離；poll 回傳時自動 ack（`no_ack` 除外）；寫 `--state-file`（重啟不重播）
-- **啟動基線**：無游標 ⇒ 游標 = 當下 max seq（不回放舊訊），回 `reason:"baseline"`；要舊訊用 `backfill`/`history`
-- Filter：`targets/channels`、`from`、`mentions_only`、`ignore_bots`(預設 true)、**`include_self`(預設 false)** ← 防回音循環
+- `Drain(want)` 在鎖內跑 filter（`want` 必須是純計算，不得 I/O）；被 filter 掉／超出 limit／超出 byte 預算的，用 `RequeueFront` 原序放回，不丟
 - Intents（MVP）：`IntentsGuilds|IntentsGuildMessages|IntentsDirectMessages|IntentsMessageContent`；Handlers：`MessageCreate/Ready/Disconnected/Resumed`
 
 ---
 
-## 3. `discord_poll`
-**語義（v2 修正）**：進場先查一次游標後面的既有緩衝 → 有就**立即**回；沒有就掛住，**任何一則符合條件的新訊息抵達的瞬間立刻回傳**（不累積、不等安靜期），最長等 `max_wait(±jitter)` 秒。
-（同一瞬間連發的多則，因為是「一次讀光游標後全部」，自然會包在同一包裡回。）
+## 3. `discord_poll`（M2a 定稿）
+**語義**：從**呼叫者自己的 queue** 一次取走最多 `limit` 則、且不超過 `--poll-max-bytes` 的訊息，**取走就從 queue 消失**（drain 語意 = ack，不需要游標）；queue 空就掛住，**任何一則符合條件的新訊息抵達的瞬間立刻回傳**（不累積、不等安靜期），最長等 `max_wait(+jitter)` 秒。
+（同一瞬間連發的多則，因為是「一次讀光 queue 頭」，自然會包在同一包裡回。）
 
 ```json
 {"type":"object","properties":{
- "max_wait":{"type":"integer","description":"等待秒數，合法範圍 5..600，預設 45。期間一有新訊息就立刻回傳；超過時間則回傳空結果(reason=timeout)。實際值會加 ±15% 隨機抖動"},
- "targets":{"type":"array","items":{"type":"string"},"description":"只收這些路由 alias；省略=本 agent 全部可收的 target"},
+ "max_wait":{"type":"number","description":"等待秒數，合法範圍 5..600，預設 45。期間一有新訊息就立刻回傳；超過時間則回傳空結果(reason=timeout)。實際值會加 +0..15% 隨機抖動（只往後，不會縮到 client timeout 以下）"},
+ "targets":{"type":"array","items":{"type":"string"},"description":"只收這些路由 alias 或 channel:<ID> / user:<ID>；省略=本 agent 全部可讀 target。命中 filter 但沒送出去的訊息會留在 queue 裡下次再取"},
  "channels":{"type":"array","items":{"type":"string"},"description":"進階：直接指定頻道/DM/使用者 ID（仍需過 ACL）"},
- "limit":{"type":"integer","description":"單次回傳事件上限，預設 20，hard cap 100（其餘留著下次讀，計入 dropped/unread）"},
+ "limit":{"type":"integer","description":"單次回傳事件上限，預設 20，hard cap 100（其餘留 queue 下次讀）"},
  "mentions_only":{"type":"boolean","description":"true=只回 @我 或直接 DM"},
  "from":{"type":"array","items":{"type":"string"},"description":"作者過濾：user ID 或名稱"},
- "include_self":{"type":"boolean","description":"預設 false（true 會看到自己發的，小心回音循環）"},
+ "include_self":{"type":"boolean","description":"預設 false（true 會看到自己發的，小心回音循環；會順帶放行 bot）"},
  "ignore_bots":{"type":"boolean","description":"預設 true"},
- "media":{"type":"string","description":"本包附件處理覆蓋：inline | save | skip；省略=依 config（預設只有圖片 inline）"},
- "typing":{"type":"boolean","description":"等待期間在最近一個 target 顯示『正在輸入…』，預設 false"},
- "backfill":{"type":"integer","description":"僅在『尚無游標』時生效：向後抓 0..50 則，預設 0"},
- "no_ack":{"type":"boolean","description":"true=不推進游標（除錯用，會重複讀同一批）"}
+ "media":{"type":"string","description":"本包附件處理覆蓋：inline | save | skip；省略=依 config。M2a 一律回報 media:\"url_only\"，M2b 才真的抓"}
 }}
 ```
-`max_wait` 校驗：`<5` 或 `>600` → `isError`：`{"ok":false,"error":"bad_max_wait","valid_range":[5,600],"default":45,"hint":"要立刻拿既有緩衝請用 discord_history"}`（**不提供 `max_wait=0`**；非阻塞需求由 `discord_history` 走 REST 承擔 — 見 C1）
+（`mcptransport.Schema` 沒有 min/max/default 欄位 ⇒ 範圍與預設只能寫進 description，並由 handler 驗證。）
+
+`max_wait` 校驗：`<5` 或 `>600` → `isError`：`{"ok":false,"error":"bad_max_wait","min":5,"max":600,"default":45,"hint":"..."}`（**不提供 `max_wait=0`**；補舊訊走 M3 的 `discord_history` — 見 C1）
 
 偽碼：
 ```
 poll(args):
-  f := filter(args, principal)
-  lo,hi := cfg.pollMin, cfg.pollMax                     // 5, 600
-  if !between(args.max_wait, lo, hi) → isError(bad_max_wait)
-  w := args.max_wait * (1 + rand(-jitterPct, +jitterPct))   // 預設 ±15%
-  deadline := now + w
-  cur := args.since or cursor.get(key) or baseline()
-  evs := bus.After(cur, f, limit)
-  if empty:
-      select:
-        <-notify    : evs = bus.After(cur,f,limit)      // 醒來看一眼就回（不湊數）
-        <-timer     : return {reason:"timeout", waited_ms, cursor:cur}
-        <-ctx.Done(): return {reason:"cancelled"}        // 不 ack
-        <-shutdown  : return {reason:"shutdown"}         // 不 ack
-  ack(evs.last.Seq) unless no_ack
-  return envelope(evs)     // media 依 §5 處理
+  f := filter(args, principal)                        // 解析 targets 時就要求 Read 權限
+  w := validate(args.max_wait, 5..600) else isError(bad_max_wait)
+  deadline := now + w*(1 + rand(0..jitterPct))        // 只往後
+  for {
+    msgs, kept, remaining := q.Drain(want=f, limit, byteBudget)   // 鎖內取走
+    if len(msgs)>0 || now >= deadline { break }
+    select {
+      <-q.Notify() : continue                          // 有新東西，重試 Drain
+      <-timer      : continue                          // 到點，跑最後一次 Drain 後 break
+      <-ctx.Done() : q.RequeueFront(kept); return {reason:"cancelled"}
+      <-shutdown   : q.RequeueFront(kept); return {reason:"shutdown"}
+    }
+  }
+  return envelope(msgs, remaining)     // media 依 §5 處理（M2b）
 ```
-envelope：
+envelope（`omitempty` 的欄位只在有意義時出現；下面把常見的都列齊）：
 ```json
-{"ok":true,"reason":"messages","waited_ms":3842,"max_wait_applied":44.1,
- "cursor":"s1042","next_cursor":"s1063","count":3,"dropped":0,"unread":7,
- "self":{"id":"...","name":"..."},"connected":true,"agent":"default",
- "messages":[{"seq":"s1043","id":"1234","target":"boss","dm":false,"guild":"222","channel":"111",
-   "from":{"id":"333","name":"阿明","tag":"ahming","bot":false},
-   "ts":"2026-11-16T19:20:31+08:00","age_s":12,"text":"晚安","truncated":false,"mentions_self":true,
-   "attachments":[{"id":"a1","name":"night.png","mime":"image/png","size":182341,"width":940,"height":924,
-      "url":"https://cdn.discordapp.com/...","media":"inline","content_index":1}]}]}
+{"ok":true,"reason":"messages","agent":"default","waited_ms":3842,"max_wait_applied":44.1,"connected":true,
+ "count":3,"remaining":7,"partial":true,"bytes":13980,
+ "self":"ahming#0001","dropped":1,"notes":["..."],
+ "messages":[{"id":"1234","target":"boss","channel_id":"111","channel_name":"rp-main","dm":false,
+   "from":{"id":"333","name":"阿明","tag":"ahming#0001","bot":false},
+   "ts":"2026-11-16T19:20:31+08:00","age_s":12,"text":"晚安","mentions_self":true,
+   "attachments":[{"id":"a1","filename":"night.png","mime":"image/png","kind":"image","size":182341,
+      "width":940,"height":924,"url":"https://cdn.discordapp.com/...","media":"url_only","policy":"image:inline"}],
+   "attachments_total":1,"attachments_omitted":0,"embeds":[{"type":"rich","title":"..."}]}],
+ "result_bytes":14213}
 ```
-- 空結果要極短：`{"ok":true,"reason":"timeout","waited_ms":44213,"count":0,"cursor":"s1063","connected":true}`
-- `reason` ∈ `messages|timeout|cancelled|baseline|shutdown|error`；**timeout 是 ok:true**
-- inline 時 content = [text(JSON), image|audio...]，JSON 內用 `media:"inline"` + `content_index` 對照；`media:"skipped:too_big"` 等降級原因要寫明
+- 空結果要極短（**恰好 6 個 key**）：`{"ok":true,"reason":"timeout","waited_ms":44213,"agent":"default","max_wait_applied":45,"connected":true}`
+- `bytes` = messages 陣列計入**預算**的位元組（含附件/embed 估價）；`result_bytes` = 整個回應 JSON 的實際寬度（含 envelope 自身，給 client 排 context 用）
+- `reason` ∈ `messages|timeout|cancelled|shutdown|error`；**timeout 是 ok:true**
+- **byte 預算**（`--poll-max-bytes`，預設 16 KiB，0=不設限）：只算 messages 陣列的 JSON；每則成本 = 實際位元組 +（inline 附件 1000 / url_only 附件 300 / embed 200 的估價）。裝不下的整則留 queue。單條就超預算 → 先按 **rune 邊界**裁 `text`（標 `text_truncated:true` + `text_full_bytes`），再丟附件（`attachments_omitted`），最後丟 embeds；估價**跟著留下的附件走**（丟掉的不再佔位，否則多圖訊息會一個都列不出來）；裁完還是超 → 不送空殼，整則留著
+- `partial:true` = 因 limit 或預算而斷，**請立刻再 poll**（被 filter 掉而留下的不算 partial，免得模型無限 poll）
+- `dropped` 只在 >0 時出現：那是「沒人 poll 把 queue 擠爆、被覆蓋掉的舊訊息」，要直接告訴模型
+- `target` 標的是**這個 agent 認得的 alias**（`router.AliasForTarget` 在組裝時現算）；沒有 rule 收養它就留內部座標 `channel:<id>`。同一個 Event 在兩條 queue 裡可以標不同名字，所以這個欄位只能長在 `pollMessage` 上
+- inline 時 content = [text(JSON), image|audio...]，JSON 內用 `media:"inline"` + `content_index` 對照；`media:"skipped:too_big"` 等降級原因要寫明（M2b）
 
 ---
 
@@ -237,7 +241,7 @@ user 裁示：「直接回 429 rate limit 跟時間讓 LLM 知道，然後 mcp s
 
 **預設（定案）**：`image=inline`、`audio=skip`、`video=skip`、`other=skip`。（音訊依 C3 決定 skip，需要 STT 時你自己改 mode 即可）
 **降級規則**：`inline` 超過 §6 上限 → 自動退 `save`（若 `--media-out` 有開）→ 再退 `skip`，並在 result 標 `media:"skipped:too_big"`（讓模型知道有東西但太大）。
-**dedupe**：`state.json` 記 attachment id → 已 inline/save 過的再次出現只給 URL（防 `no_ack`/重試重複燒 token）。
+**dedupe**（M2b）：在 `tools` 層記一個有上限的 attachment id 集合 → 已 inline/save 過的再次出現只給 URL（不寫回 Event，也不寫盤）。
 `save` 的清理：`--media-keep` 天數 + `--media-max-mb` LRU（避免吃滿磁碟）。
 
 ---
@@ -265,8 +269,8 @@ user 裁示：「直接回 429 rate limit 跟時間讓 LLM 知道，然後 mcp s
 ---
 
 ## 7. 其他工具
-- MVP：`discord_status`（身分/gateway/重連/最近錯誤/ring 用量/各 cursor/路由與 ACL 摘要/版本）、`discord_channels`（可見 guild/頻道/DM + alias⇄ID 對照；模型靠它拿到能貼的 ID）、`discord_history`（REST ≤100 則、before/after，輸出格式同 poll 的 message；也是「立刻拿既有內容」的替代路徑）
-- P2：`typing`、`react`、`edit`、`delete`、`poll_ack`、`ignore`、threads、progress 心跳（多 agent 遠端時才有意義）
+- MVP：`discord_status`（身分/gateway/重連/最近錯誤/**每 agent queue 深度與 dropped**/路由與 ACL 摘要/版本/下一步建議）、`discord_channels`（可見 guild/頻道/DM + alias⇄ID 對照；模型靠它拿到能貼的 ID）、`discord_history`（REST ≤100 則、before/after，輸出格式同 poll 的 message；也是「補舊訊」的唯一路徑）
+- P2：`discord_typing`（**M2a 決定 poll 不做 typing**：掛住語意與它衝突）、`react`、`edit`、`delete`、threads、progress 心跳（多 agent 遠端時才有意義）
 - 註：bot 無「標已讀」API（只有 thread read-state）→ 不做
 
 ---
@@ -280,8 +284,8 @@ user 裁示：「直接回 429 rate limit 跟時間讓 LLM 知道，然後 mcp s
 | `--config` | routing.json（見下） |
 | `--transport` | `stdio`（`--http-addr` 127.0.0.1:8787、`--origin`、未來 `--auth` per-agent token） |
 | `--poll-min-wait / --poll-max-wait / --poll-default-wait / --poll-jitter-pct` | 5 / 600 / 45 / 15 |
-| `--bus-capacity` | 2000 |
-| `--state-file` | `mcpdr-state.json`（**cwd 底下**，空字串停用）|
+| `--bus-capacity` | 2000（**每個 agent 各一條**）|
+| `--poll-max-bytes` | `16384`（16 KiB；0=不設上限。只算 messages 的 JSON，附件按 §3 估價計入）|
 | `--media-image / --media-audio / --media-video / --media-other` | `inline / skip / skip / skip` |
 | `--media-out` | `mcpdr-media`（**cwd 底下**）；`--no-media-out` 停用 save |
 | `--media-keep / --media-max-mb` | 7 天 / 512 MiB |
@@ -289,14 +293,14 @@ user 裁示：「直接回 429 rate limit 跟時間讓 LLM 知道，然後 mcp s
 | `--max-arg-base64-bytes` | **不需要**（LLM 不送 base64；見 §6 入口/出口分工）|
 | `--env-file` | `.env`（存在才載；自己寫 loader，不引依賴）|
 | `--allow-guilds / --allow-channels / --deny-channels / --allow-dm` | 空=不限制 / true（沒 routing.json 時的簡化 allowlist，建議一律填） |
-| `--unknown-dm` | `ignore`（定案；不進 ring） |
+| `--unknown-dm` | `ignore`（定案；不進入任何 queue；`ring` 給預設 agent）|
 | `--max-sends-per-min / --send-gap-ms / --breaker-errors` | 20 / 250 / 3（斷路 60s） |
 | `--file-root`（可重複）/ `--no-file-root` | cwd / off |
 | `--max-upload-bytes / --max-files-per-msg` | 8 MiB / 10 |
 | `--dry-run` | false |
 | `--log-level / --log-file` | info / stderr（slog；**stdout 只能是 MCP 訊息**） |
 
- **路徑政策**（user 定案）：所有路徑參數（`--state-file` / `--media-out` / `--log-file` / `--env-file` / `--config` / `--file-root`）一律**照原樣使用**——絕對路徑，或相對 process cwd。我們**不解析 `~`**（那是 shell 的事）、不查 `$HOME` / `$XDG_CACHE_HOME` / `$TMPDIR`、不把值改寫到別的地方；預設值也都是純檔名，所以沒設定就落在 cwd。唯一例外：`--file-root` 內部走 `filepath.Abs`，因為 chroot containment 要比對一致的目錄字串（這也正是「相對 = cwd」的實作）。附件的 `path` 是另一回事，見 §4.2：在 root 之內，開頭 `/` 等於那個 root。
+ **路徑政策**（user 定案）：所有路徑參數（`--media-out` / `--log-file` / `--env-file` / `--config` / `--file-root`）一律**照原樣使用**——絕對路徑，或相對 process cwd。我們**不解析 `~`**（那是 shell 的事）、不查 `$HOME` / `$XDG_CACHE_HOME` / `$TMPDIR`、不把值改寫到別的地方；預設值也都是純檔名，所以沒設定就落在 cwd。唯一例外：`--file-root` 內部走 `filepath.Abs`，因為 chroot containment 要比對一致的目錄字串（這也正是「相對 = cwd」的實作）。附件的 `path` 是另一回事，見 §4.2：在 root 之內，開頭 `/` 等於那個 root。
 
 routing.json（未來多 agent 直接長在這裡）：
 ```json
@@ -328,12 +332,13 @@ MVP 零修改（除非選 §6 的 (B)，改兩行常數 + 一個 config）。P2 
 |---|---|---|
 | M0 | go.mod + config + router 骨架 + discord/client（狀態機）+ main（`--selftest`、shutdown：在飛 poll 全部 `reason:"shutdown"` 再 Close）+ `discord_status` | `go mod tidy && go build ./...`；`go run . --selftest` 印身分/guild/target 表 |
 | M1 | target 解析 + `internal/files`（os.Root 沙箱；url 只貼不抓；無 base64）+ 預算/同頻道間隔/斷路器 + `discord_send`（切段、附件掛末段）+ 三個 `_test.go` | `go build ./... && go vet ./... && go test ./...`；`go run . --selftest --file-root . --file-root ./docs`；`--dry-run` 下對測試頻道：純文字、純圖、文+圖、超長切段、壞路徑 hint 可讀、429/斷路器回 `retry_after_ms` |
-| M2 | bus + MessageCreate 正規化 + `discord_poll`（下限/jitter/cursor/持久化）+ media 三段式 | 發訊→瞬間回；不發→timeout；Esc→cancelled；重啟不重播；大圖降級正確 |
+| M2a | bus（per-agent Queue/Hub）+ router.Audience + MessageCreate 正規化 + `discord_poll`（下限/抖動/drain/byte 預算/裁切） | `go build ./... && go vet ./... && go test -race ./...`；發訊→瞬間回；不發→timeout；Esc→cancelled 且訊息還在；兩 agent 互不干擾 |
+| M2b | media 三段式（inline/save/skip）接到 poll 輸出（**只寫 pollAttachment，不寫回 Event**） | 大圖降級正確；save 檔名去重；`local_path` 在 `--media-out` 內 |
 | M3 | `discord_history`、`discord_channels` | alias⇄ID 可用、history 補舊訊 |
 | M4 | README（Portal/intents/routing/接入）、拔網線 30s 重連不漏不炸、多 agent 檔預演 | e2e |
 
 ## 12. 測試計畫（不需要 token 的部分都寫成單測）
-bus（游標/ring 覆蓋 dropped/broadcast 不丟/ctx cancel/jitter 區間/filter 組合）、router（規則優先序、ACL 拒發、unknown-dm）、target（`user:`/`channel:`/alias/`#名`/`@名`/`me`/`last`；模糊名回候選不瞎猜）、files（路徑政策：先 `path.Clean` 再把開頭 `/` 當根（`./a/../b` == `b`）、`..` 倖存者/`~`/volume name 拒；symlink 逃出 root 被 `os.Root` 擋、根內可用；多 root 優先序；目錄/超大/數量上限；mime 四層優先序與 sniff 後 offset 歸零；`ValidateURL`）、send（seam 注入假 poster + 假時鐘：AllowedMentions.Parse 為空 slice、gap/預算/斷路器狀態機、小 `retry_after` 本地重試且**重試前有 Rewind**、 breaker open 時完全不碰 REST、half-open 只放 1、DryRun 不碰 REST 不佔額度、classify 全碼）、tools（`-dry-run` 端到端 envelope、各 `to` 拒因與 `targets` 候選、切段邊界 1999/2000/2001/CJK/附件僅末段、`text_too_long`、`last` per-agent 隔離、部分送達）、poll（假事件序列 → envelope 斷言）、`--selftest`（真連煙霧測試）
+bus（ring 覆蓋 dropped/Notify 不漏/Drain-RequeueFront 原序/nil-Hub 防呆/唯讀契約）、audience（規則優先序、一 event 多 agent、stray、deny、DM 政策）、router（規則優先序、ACL 拒發、unknown-dm）、target（`user:`/`channel:`/alias/`#名`/`@名`/`me`/`last`；模糊名回候選不瞎猜）、files（路徑政策：先 `path.Clean` 再把開頭 `/` 當根（`./a/../b` == `b`）、`..` 倖存者/`~`/volume name 拒；symlink 逃出 root 被 `os.Root` 擋、根內可用；多 root 優先序；目錄/超大/數量上限；mime 四層優先序與 sniff 後 offset 歸零；`ValidateURL`）、send（seam 注入假 poster + 假時鐘：AllowedMentions.Parse 為空 slice、gap/預算/斷路器狀態機、小 `retry_after` 本地重試且**重試前有 Rewind**、 breaker open 時完全不碰 REST、half-open 只放 1、DryRun 不碰 REST 不佔額度、classify 全碼）、tools（`-dry-run` 端到端 envelope、各 `to` 拒因與 `targets` 候選、切段邊界 1999/2000/2001/CJK/附件僅末段、`text_too_long`、`last` per-agent 隔離、部分送達）、poll（假事件序列 → envelope 斷言、byte 預算截斷、裁切不切壞 UTF-8、queue 隔離、cancel 後訊息仍在、timeout 只有 6 個 key）、`--selftest`（真連煙霧測試）
 
 ---
 

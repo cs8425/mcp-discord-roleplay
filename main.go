@@ -33,7 +33,7 @@ import (
 )
 
 // version is stamped per milestone; keep it in sync with tools.BuildMilestone.
-const version = "0.1.0-M1"
+const version = "0.1.0-M2"
 
 func main() {
 	os.Exit(run(os.Args[1:]))
@@ -73,8 +73,10 @@ func run(args []string) int {
 	ctx, stopSignal := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignal()
 
-	b := bus.New(cfg.BusCapacity)
-	cl := discord.New(cfg, logger, b, rt)
+	// One inbound queue per agent (docs/DESIGN.md §2): an event is fanned out to
+	// the agents routing says may read it, and taking it out is the ack.
+	hub := bus.NewHub(cfg.BusCapacity, rt.AgentIDs(), logger)
+	cl := discord.New(cfg, logger, hub, rt)
 	store := files.New(cfg, logger)
 
 	if err := cl.Start(ctx); err != nil {
@@ -91,7 +93,7 @@ func run(args []string) int {
 	deps := &tools.Deps{
 		Cfg:       cfg,
 		Router:    rt,
-		Bus:       b,
+		Hub:       hub,
 		DC:        cl,
 		Files:     store,
 		Stopping:  shutting,
@@ -195,7 +197,7 @@ func selftest(cfg *config.Config, rt *router.Router, logger *slog.Logger) int {
 	report(true, "transport=%s agent=%s tz=%s (%s)", cfg.Transport, cfg.AgentID, cfg.TZ, tz.Now().Format("-07:00"))
 	// Everything we write defaults to a plain name in the cwd; say which cwd that is.
 	if wd, err := os.Getwd(); err == nil {
-		report(true, "working directory: %s (relative --state-file / --media-out / --log-file land here)", wd)
+		report(true, "working directory: %s (relative --media-out / --log-file land here)", wd)
 	}
 	report(true, "intents: %s (MessageContent is privileged — enable it in the Developer Portal)",
 		strings.Join(discord.IntentsList(), "|"))
@@ -241,6 +243,11 @@ func selftest(cfg *config.Config, rt *router.Router, logger *slog.Logger) int {
 	}
 	report(true, "unknown DM policy=%s allow_dm=%v", cfg.UnknownDM, cfg.AllowDM)
 
+	// Built here rather than at the bottom so the queue list can be reported next
+	// to the poll settings an operator is tuning. nil logger: the report itself
+	// prints the same information.
+	hub := bus.NewHub(cfg.BusCapacity, rt.AgentIDs(), nil)
+
 	fmt.Fprintf(out, "\nfiles & media:\n")
 	if len(cfg.FileRoots) == 0 {
 		report(false, "no --file-root: send cannot read local files")
@@ -271,7 +278,21 @@ func selftest(cfg *config.Config, rt *router.Router, logger *slog.Logger) int {
 	fmt.Fprintf(out, "\npoll & limits:\n")
 	report(true, "poll window: %d..%d s (default %d, timeout jitter +%d%%)",
 		cfg.PollMinWait, cfg.PollMaxWait, cfg.PollDefaultWait, cfg.PollJitterPct)
-	report(true, "ring: %d events, text truncated at %d runes", cfg.BusCapacity, cfg.TextMaxRunes)
+	if len(hub.Agents()) == 0 {
+		fail("no message queues were built: discord_poll has nothing to read (check routing.json's agents)")
+	} else {
+		report(true, "queues: %d agent(s) x %d events each, text truncated at %d runes",
+			len(hub.Agents()), cfg.BusCapacity, cfg.TextMaxRunes)
+		for _, a := range hub.Agents() {
+			fmt.Fprintf(out, "  queue %s\n", a)
+		}
+	}
+	if cfg.PollMaxBytes == 0 {
+		report(false, "poll reply budget is uncapped: one poll can hand back the whole queue in one answer")
+	} else {
+		report(true, "poll reply budget: %d bytes per discord_poll answer; the rest stays queued for the next call",
+			cfg.PollMaxBytes)
+	}
 	report(true, "send budget: %d/min, %d ms gap per channel, breaker after %d rate-limit errors",
 		cfg.MaxSendsPerMin, cfg.SendGapMS, cfg.BreakerErrors)
 	report(true, "429 handling: discordgo's own retry is OFF; we absorb retry_after<=%dms once, then answer "+
@@ -279,17 +300,15 @@ func selftest(cfg *config.Config, rt *router.Router, logger *slog.Logger) int {
 		cfg.SendRetryWaitMS, cfg.BreakerErrors)
 	report(true, "long messages: split at %d characters, sent in order, attachments on the last part",
 		discord.MaxContentRunes)
-	report(true, "state file: %s (relative = under the cwd)", orNone(cfg.StateFile))
 	if cfg.DryRun {
 		report(false, "dry-run is ON: sends will be logged, not delivered")
 	}
 
 	fmt.Fprintf(out, "\ntools:\n")
 	reg := mcp.NewRegistry("discord_")
-	b := bus.New(cfg.BusCapacity)
 	deps := &tools.Deps{
-		Cfg: cfg, Router: rt, Bus: b,
-		DC:        discord.New(cfg, logger, b, rt), // never started in selftest
+		Cfg: cfg, Router: rt, Hub: hub,
+		DC:        discord.New(cfg, logger, hub, rt), // never started in selftest
 		Files:     files.New(cfg, logger),
 		Stopping:  make(chan struct{}),
 		StartedAt: time.Now(),
@@ -317,13 +336,6 @@ func selftest(cfg *config.Config, rt *router.Router, logger *slog.Logger) int {
 	}
 	fmt.Fprintf(out, "\nselftest PASS (configuration is valid; no gateway connection was attempted)\n")
 	return 0
-}
-
-func orNone(s string) string {
-	if s == "" {
-		return "(none)"
-	}
-	return s
 }
 
 func firstLine(s string) string {
@@ -356,6 +368,10 @@ func instructions(cfg *config.Config, names []string) string {
 		"You never send binary data: reference local files by a path under the server's --file-root (a leading '/' means that root), " +
 		"and put links in files[].url - they are pasted, not fetched. " +
 		"Text over 2000 characters is split for you. " +
+		"discord_poll holds the call open until something arrives or max_wait passes; an empty answer is ok:true, not a failure. " +
+		"Messages you have taken are gone from your queue - there is nothing to acknowledge and nothing to remember. " +
+		"If an answer says partial:true, call discord_poll again immediately: more messages are already waiting. " +
+		"Set your client's request timeout to at least max_wait, or the call is cancelled while waiting and the answer is lost. " +
 		"This process serves agent '" + cfg.AgentID + "'."
 }
 
