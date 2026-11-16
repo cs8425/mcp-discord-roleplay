@@ -162,21 +162,30 @@ func selftest(cfg *config.Config, rt *router.Router, logger *slog.Logger) int {
 		}
 		fmt.Fprintf(out, "%s %s\n", tag, fmt.Sprintf(format, args...))
 	}
+	failures := 0
 	fail := func(format string, args ...any) {
+		failures++
 		fmt.Fprintf(out, "FAIL %s\n", fmt.Sprintf(format, args...))
 	}
 
 	fmt.Fprintf(out, "%s %s selftest (milestone %s)\n", config.Module, version, tools.BuildMilestone)
 	fmt.Fprintf(out, "time now: %s\n\n", tz.Format(tz.Now()))
 
-	report(cfg.Token != "", "token: %s", cfg.RedactedToken())
 	if cfg.Token == "" {
-		fail("no token in %s — the server will refuse to start", cfg.TokenEnv)
-	}
-	if cfg.EnvFile != "" {
-		report(true, "env file: %s (%d keys applied, real environment wins)", cfg.EnvFile, len(cfg.LoadedEnvKeys))
+		// The question a selftest answers is "would this start?", and without a
+		// token it would not - so this flips the exit code instead of being a WARN
+		// that contradicts the PASS line at the bottom.
+		fail("token: (unset) — nothing in %s; the server would refuse to start", cfg.TokenEnv)
 	} else {
-		report(false, "no .env file loaded (looked for the --env-file path)")
+		report(true, "token: %s", cfg.RedactedToken())
+	}
+	switch {
+	case cfg.EnvLoaded:
+		report(true, "env file: %s (%d keys applied, real environment wins)", cfg.EnvFile, len(cfg.LoadedEnvKeys))
+	case cfg.EnvFile != "":
+		report(false, "no .env file at %q (skipped; the token must then come from the real environment)", cfg.EnvFile)
+	default:
+		report(false, "env file disabled (--env-file='')")
 	}
 
 	report(true, "transport=%s agent=%s tz=%s (%s)", cfg.Transport, cfg.AgentID, cfg.TZ, tz.Now().Format("-07:00"))
@@ -187,7 +196,14 @@ func selftest(cfg *config.Config, rt *router.Router, logger *slog.Logger) int {
 	report(true, "intents: %s (MessageContent is privileged — enable it in the Developer Portal)",
 		strings.Join(discord.IntentsList(), "|"))
 
-	fmt.Fprintf(out, "\nrouting (%s):\n", orNone(cfg.RoutingFile))
+	routingLabel := cfg.RoutingFile
+	switch {
+	case routingLabel == "":
+		routingLabel = "disabled (--config='')"
+	case !cfg.RoutingLoaded:
+		routingLabel += " (absent)"
+	}
+	fmt.Fprintf(out, "\nrouting (%s):\n", routingLabel)
 	targets := rt.Targets(router.Principal{AgentID: cfg.AgentID})
 	if len(targets) == 0 {
 		// These lists used to be silently dropped by the loader; print all three so
@@ -216,8 +232,8 @@ func selftest(cfg *config.Config, rt *router.Router, logger *slog.Logger) int {
 		fmt.Fprintf(out, "  %s %s %-10s %s agent=%s\n", mode, t.Alias, t.Target, name, agent)
 	}
 	if !rt.DeclaresAgent(cfg.AgentID) {
+		// No early return: the rest of the report is still worth reading.
 		fail("agent %q is not declared in routing.json: it would see zero targets and every send would be refused as foreign_agent", cfg.AgentID)
-		return 1
 	}
 	report(true, "unknown DM policy=%s allow_dm=%v", cfg.UnknownDM, cfg.AllowDM)
 
@@ -262,6 +278,7 @@ func selftest(cfg *config.Config, rt *router.Router, logger *slog.Logger) int {
 	}
 	if err := tools.RegisterAll(reg, deps); err != nil {
 		fail("tool registration: %v", err)
+		fmt.Fprintf(out, "\nselftest FAILED (%d problem(s); the tool list below is not trustworthy)\n", failures)
 		return 1
 	}
 	for _, t := range reg.List() {
@@ -269,9 +286,16 @@ func selftest(cfg *config.Config, rt *router.Router, logger *slog.Logger) int {
 	}
 	if len(reg.List()) == 0 {
 		fail("no tools registered")
-		return 1
 	}
 
+	if failures > 0 {
+		plural := "s"
+		if failures == 1 {
+			plural = ""
+		}
+		fmt.Fprintf(out, "\nselftest FAILED (%d problem%s; no gateway connection was attempted)\n", failures, plural)
+		return 1
+	}
 	fmt.Fprintf(out, "\nselftest PASS (configuration is valid; no gateway connection was attempted)\n")
 	return 0
 }

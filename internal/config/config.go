@@ -112,8 +112,13 @@ type Config struct {
 	UnknownDM     string // ignore | ring
 
 	// --- files that feed the config -------------------------------------------
-	EnvFile       string // used exactly as typed; "" = nothing loaded
-	RoutingFile   string // used exactly as typed; "" = none found/loaded
+	// Both paths are kept exactly as typed, even when the file turns out to be
+	// absent, so the operator can see which path was searched; the *Loaded flags
+	// say what actually happened.
+	EnvFile       string // "" = env file disabled
+	EnvLoaded     bool
+	RoutingFile   string // "" = routing disabled
+	RoutingLoaded bool
 	LoadedEnvKeys []string
 
 	// --- runtime --------------------------------------------------------------
@@ -261,13 +266,13 @@ func (c *Config) loadEnvFile(fs *flag.FlagSet) error {
 	// Used as typed: absolute, or relative to the cwd. No ~ expansion, no Abs.
 	st, err := os.Stat(c.EnvFile)
 	if err != nil || st.IsDir() {
-		c.EnvFile = "" // silently ignored when absent
-		return nil
+		return nil // absent: silently skipped, EnvLoaded stays false
 	}
 	keys, err := LoadDotEnv(c.EnvFile)
 	if err != nil {
 		return fmt.Errorf("env file: %w", err)
 	}
+	c.EnvLoaded = true
 	c.LoadedEnvKeys = keys
 	return nil
 }
@@ -318,18 +323,22 @@ func (c *Config) finalize() error {
 		c.Token = NormalizeToken(tok)
 	} else if !c.SelfTest && !c.PrintVersion {
 		src := ""
-		if c.EnvFile != "" {
-			src = " (nor from " + c.EnvFile + ")"
+		switch {
+		case c.EnvFile == "":
+		case c.EnvLoaded:
+			src = " (nor from the loaded " + c.EnvFile + ")"
+		default:
+			src = " (or write it into " + c.EnvFile + ")"
 		}
 		return fmt.Errorf("no bot token: set %s%s, or name another variable with --token-env", c.TokenEnv, src)
 	}
 
-	// 3. timezone
+	// 2. timezone
 	if err := tz.Set(c.TZ); err != nil {
 		return err
 	}
 
-	// 4. media modes
+	// 3. media modes
 	c.Media = map[string]MediaMode{}
 	for kind, raw := range map[string]string{
 		KindImage: c.mImage, KindAudio: c.mAudio, KindVideo: c.mVideo, KindOther: c.mOther,
@@ -341,7 +350,7 @@ func (c *Config) finalize() error {
 		c.Media[kind] = m
 	}
 
-	// 5. paths
+	// 4. write-side paths
 	var err error
 	// --state-file / --media-out stay exactly as typed: relative means "inside the
 	// cwd", which is the documented default. No ~ expansion, no Abs, no Clean —
@@ -358,7 +367,7 @@ func (c *Config) finalize() error {
 		return err
 	}
 
-	// 6. routing (path used as typed: absolute, or relative to the cwd)
+	// 5. routing (path used as typed: absolute, or relative to the cwd)
 	if c.RoutingFile != "" {
 		if st, e := os.Stat(c.RoutingFile); e == nil && !st.IsDir() {
 			r, e := LoadRouting(c.RoutingFile)
@@ -366,18 +375,18 @@ func (c *Config) finalize() error {
 				return e
 			}
 			c.Routing = r
+			c.RoutingLoaded = true
 			if r.UnknownDM != "" {
 				c.UnknownDM = strings.ToLower(r.UnknownDM)
 			}
 		} else {
 			c.Routing = &Routing{}
-			c.RoutingFile = ""
 		}
 	} else {
 		c.Routing = &Routing{}
 	}
 
-	// 7. validate the rest
+	// 6. validate the rest
 	switch strings.ToLower(c.UnknownDM) {
 	case "ignore", "ring":
 		c.UnknownDM = strings.ToLower(c.UnknownDM)
@@ -526,14 +535,16 @@ func (c *Config) Audit() map[string]any {
 			"allow_guilds": c.AllowGuilds, "allow_channels": c.AllowChannels,
 			"deny_channels": c.DenyChannels, "allow_dm": c.AllowDM, "unknown_dm": c.UnknownDM,
 		},
-		"routing_file": c.RoutingFile,
-		"env_file":     c.EnvFile,
-		"loaded_env":   c.LoadedEnvKeys,
-		"dry_run":      c.DryRun,
-		"log_level":    c.LogLevel,
-		"log_file":     c.LogFile,
-		"tz":           c.TZ,
-		"tz_offset":    tz.Now().Format("-07:00"),
+		"routing_file":   c.RoutingFile,
+		"routing_loaded": c.RoutingLoaded,
+		"env_file":       c.EnvFile,
+		"env_loaded":     c.EnvLoaded,
+		"loaded_env":     c.LoadedEnvKeys,
+		"dry_run":        c.DryRun,
+		"log_level":      c.LogLevel,
+		"log_file":       c.LogFile,
+		"tz":             c.TZ,
+		"tz_offset":      tz.Now().Format("-07:00"),
 	}
 }
 
