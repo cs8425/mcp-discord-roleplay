@@ -186,8 +186,10 @@ func selftest(cfg *config.Config, rt *router.Router, logger *slog.Logger) int {
 	fmt.Fprintf(out, "\nrouting (%s):\n", orNone(cfg.RoutingFile))
 	targets := rt.Targets(router.Principal{AgentID: cfg.AgentID})
 	if len(targets) == 0 {
-		report(false, "no routing rules: falling back to allow-lists (%d channels / %d guilds listed)",
-			len(cfg.AllowChannels), len(cfg.AllowGuilds))
+		// These lists used to be silently dropped by the loader; print all three so
+		// an operator can see which safety switches are actually live.
+		report(false, "no routing rules: falling back to allow-lists (%d channels / %d guilds listed, %d denied)",
+			len(cfg.AllowChannels), len(cfg.AllowGuilds), len(cfg.DenyChannels))
 	}
 	for _, t := range targets {
 		mode := "rw"

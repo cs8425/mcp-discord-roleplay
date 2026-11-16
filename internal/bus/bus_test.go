@@ -65,8 +65,11 @@ func TestAfterLimitAndCursorRoundTrip(t *testing.T) {
 	if len(rest) != 6 || rest[0].Seq != 5 || last2 != 10 {
 		t.Fatalf("second page = %v last=%d (cursor %q)", seqs(rest), last2, cur)
 	}
-	if ParseCursor("") != 0 || ParseCursor("nonsense") != 0 {
-		t.Fatal("bad cursors must degrade to 0, never error")
+	if v, ok := ParseCursor(""); v != 0 || ok {
+		t.Fatalf("empty cursor must decode to 0,false, got %d,%v", v, ok)
+	}
+	if v, ok := ParseCursor("nonsense"); v != 0 || ok {
+		t.Fatalf("garbage cursor must degrade to 0,false, got %d,%v", v, ok)
 	}
 	if Cursor(0) != "" {
 		t.Fatal("seq 0 must serialize as the empty cursor")
@@ -191,7 +194,7 @@ func TestAttachmentJSONShape(t *testing.T) {
 	// M2 depends on these keys being stable; assert the contract early.
 	a := Attachment{URL: "https://x/y.png", Kind: KindImage, Media: "inline"}
 	b := New(4)
-	b.Publish(&Event{Kind: "message", Attachments: []Attachment{a}, Time: time.Now()})
+	b.Publish(&Event{Kind: "message", Attachments: []Attachment{a}, Ts: time.Now()})
 	got, _ := b.After(0, nil, 1)
 	if len(got) != 1 || len(got[0].Attachments) != 1 {
 		t.Fatal("attachment lost")

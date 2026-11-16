@@ -211,7 +211,6 @@ func Load(args []string) (*Config, error) {
 		return nil, err
 	}
 	c.PrintVersion = showVersion
-	c.rawRoots = roots.v
 
 	// Order matters for precedence: the dotenv file may add MCPDR_* values, but
 	// it must never override a variable the operator really exported.
@@ -221,6 +220,18 @@ func Load(args []string) (*Config, error) {
 	if err := c.applyEnv(fs); err != nil {
 		return nil, err
 	}
+
+	// The repeatable flags (--file-root, --allow-*, --deny-channels, --origin) live
+	// in flag.Value collectors, not in the struct, and applyEnv writes through the
+	// same collector - so copy only now, or MCPDR_DENY_CHANNELS & friends parsed
+	// from the environment would be thrown away. Missing this copy made every
+	// allow/deny list silently inert.
+	c.rawRoots = roots.v
+	c.AllowGuilds = allowGuilds.v
+	c.AllowChannels = allowChannels.v
+	c.DenyChannels = denyChannels.v
+	c.Origins = origins.v
+
 	if err := c.finalize(); err != nil {
 		return nil, err
 	}

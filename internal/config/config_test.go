@@ -159,7 +159,6 @@ func TestLoadRejectsUnknownRoutingKeys(t *testing.T) {
 }
 
 func TestMediaForAndSaveGuard(t *testing.T) {
-	dir := t.TempDir()
 	if _, err := Load([]string{"-selftest", "-no-file-root", "-media-image=save", "-no-media-out", "-media-out="}); err == nil {
 		t.Fatal("media-image=save with no --media-out must fail validation")
 	}
@@ -186,6 +185,44 @@ func TestFileRootDefaultsToCwd(t *testing.T) {
 	cwd, _ := os.Getwd()
 	if len(cfg.FileRoots) != 1 || cfg.FileRoots[0] != filepath.Clean(cwd) {
 		t.Fatalf("file roots = %v, want [%s]", cfg.FileRoots, cwd)
+	}
+}
+
+// Regression: the repeatable ACL flags are collected in flag.Value structs, and
+// an earlier build never copied them into Config — so --allow-channels /
+// --deny-channels / --allow-guilds silently did nothing. Both the command line
+// and the MCPDR_* env path must land in the struct.
+func TestACLListsReachTheStruct(t *testing.T) {
+	cfg, err := Load([]string{"-selftest", "-no-file-root",
+		"-allow-guilds=1112223334445556,2223334445556667",
+		"-allow-channels=3334445556667778",
+		"-allow-channels=4445556667778889",
+		"-deny-channels=5556667778889990"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(cfg.AllowGuilds, ","); got != "1112223334445556,2223334445556667" {
+		t.Fatalf("comma split broken: %v", cfg.AllowGuilds)
+	}
+	if got := strings.Join(cfg.AllowChannels, ","); got != "3334445556667778,4445556667778889" {
+		t.Fatalf("repeated flag broken: %v", cfg.AllowChannels)
+	}
+	if len(cfg.DenyChannels) != 1 || cfg.DenyChannels[0] != "5556667778889990" {
+		t.Fatalf("deny list lost: %v", cfg.DenyChannels)
+	}
+
+	t.Setenv("MCPDR_DENY_CHANNELS", "6667778889990001")
+	t.Setenv("MCPDR_ALLOW_GUILDS", "7778889990001112")
+	defer os.Unsetenv("MCPDR_ALLOW_GUILDS")
+	viaEnv, err := Load([]string{"-selftest", "-no-file-root", "-env-file=/nonexistent"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(viaEnv.DenyChannels) != 1 || viaEnv.DenyChannels[0] != "6667778889990001" {
+		t.Fatalf("MCPDR_DENY_CHANNELS lost (copy must happen after applyEnv): %v", viaEnv.DenyChannels)
+	}
+	if len(viaEnv.AllowGuilds) != 1 || viaEnv.AllowGuilds[0] != "7778889990001112" {
+		t.Fatalf("MCPDR_ALLOW_GUILDS lost: %v", viaEnv.AllowGuilds)
 	}
 }
 

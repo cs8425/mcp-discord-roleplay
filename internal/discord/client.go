@@ -103,19 +103,23 @@ func (c *Client) Start(ctx context.Context) error {
 	sess.ShardID = 0
 	sess.ShardCount = 1
 
-	for name, h := range map[string]any{
-		"*discordgo.Ready":         c.onReady,
-		"*discordgo.Resumed":       c.onResumed,
-		"*discordgo.Disconnect":    c.onDisconnect,
-		"*discordgo.MessageCreate": c.onMessageCreate,
-		"*discordgo.ChannelCreate": c.onChannelCreate,
-	} {
-		if _, err := sess.AddHandler(h); err != nil {
-			return fmt.Errorf("add handler %s: %w", name, err)
-		}
-	}
+	// discordgo v0.29.0: AddHandler returns an *unregister* func, not an error.
+	// A handler with the wrong shape is dropped with one LogError line and then
+	// silently never fires, so the shape is pinned to typed vars and verified by
+	// the compiler instead of at runtime.
+	var (
+		onReady         func(*discordgo.Session, *discordgo.Ready)         = c.onReady
+		onResumed       func(*discordgo.Session, *discordgo.Resumed)       = c.onResumed
+		onDisconnect    func(*discordgo.Session, *discordgo.Disconnect)    = c.onDisconnect
+		onMessageCreate func(*discordgo.Session, *discordgo.MessageCreate) = c.onMessageCreate
+		onChannelCreate func(*discordgo.Session, *discordgo.ChannelCreate) = c.onChannelCreate
+	)
 
 	discordgo.Logger = c.gatewayLog
+
+	for _, h := range []any{onReady, onResumed, onDisconnect, onMessageCreate, onChannelCreate} {
+		sess.AddHandler(h)
+	}
 
 	if err := sess.Open(); err != nil {
 		return fmt.Errorf("gateway open: %w", err)
@@ -132,6 +136,20 @@ func (c *Client) Start(ctx context.Context) error {
 		"agent", c.cfg.AgentID,
 		"intents", strings.Join(IntentsList(), ","),
 		"token", c.cfg.RedactedToken())
+
+	// v0.29.0 keeps the URL of the *connected* socket private (Ready only gained
+	// ResumeGatewayURL in later releases), so ask the public API once, off the
+	// hot path. Cosmetic if it fails - the default above stays.
+	go func() {
+		g, err := sess.Gateway()
+		if err != nil {
+			c.log.Debug("gateway url lookup failed", "err", err.Error())
+			return
+		}
+		c.mu.Lock()
+		c.snap.Gateway = hostOf(g)
+		c.mu.Unlock()
+	}()
 
 	go c.watchdog(ctx)
 	return nil
@@ -214,9 +232,6 @@ func (c *Client) onReady(_ *discordgo.Session, r *discordgo.Ready) {
 	c.snap.ReadyCount++
 	if r != nil {
 		c.snap.SessionID = r.SessionID
-		if r.ResumeGatewayURL != "" {
-			c.snap.Gateway = hostOf(r.ResumeGatewayURL)
-		}
 	}
 	c.snap.SelfID, c.snap.SelfName, c.snap.SelfTag = self, name, tag
 	first := c.snap.ReadyCount == 1
@@ -388,7 +403,7 @@ func (c *Client) normalize(s *discordgo.Session, m *discordgo.Message) *bus.Even
 		if e == nil {
 			continue
 		}
-		ev.Embeds = append(ev.Embeds, bus.Embed{Type: e.Type, Title: e.Title, Description: e.Description, URL: e.URL})
+		ev.Embeds = append(ev.Embeds, bus.Embed{Type: string(e.Type), Title: e.Title, Description: e.Description, URL: e.URL})
 	}
 
 	return ev
