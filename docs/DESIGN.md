@@ -231,9 +231,9 @@ envelope：
 | `--transport` | `stdio`（`--http-addr` 127.0.0.1:8787、`--origin`、未來 `--auth` per-agent token） |
 | `--poll-min-wait / --poll-max-wait / --poll-default-wait / --poll-jitter-pct` | 5 / 600 / 45 / 15 |
 | `--bus-capacity` | 2000 |
-| `--state-file` | `~/.cache/mcp-discord-roleplay/state.json`（空字串停用） |
+| `--state-file` | `mcpdr-state.json`（**cwd 底下**，空字串停用）|
 | `--media-image / --media-audio / --media-video / --media-other` | `inline / skip / skip / skip` |
-| `--media-out` | `~/.cache/mcp-discord-roleplay/media`；`--no-media-out` 停用 save |
+| `--media-out` | `mcpdr-media`（**cwd 底下**）；`--no-media-out` 停用 save |
 | `--media-keep / --media-max-mb` | 7 天 / 512 MiB |
 | inline 尺寸政策 | 見 §6（`--inline-max-bytes-image 4MiB` 等）|
 | `--max-arg-base64-bytes` | **不需要**（LLM 不送 base64；見 §6 入口/出口分工）|
@@ -246,6 +246,8 @@ envelope：
 | `--dry-run` | false |
 | `--log-level / --log-file` | info / stderr（slog；**stdout 只能是 MCP 訊息**） |
 
+ **路徑政策**（user 定案）：所有路徑參數（`--state-file` / `--media-out` / `--log-file` / `--env-file` / `--config` / `--file-root`）一律**照原樣使用**——絕對路徑，或相對 process cwd。我們**不解析 `~`**（那是 shell 的事）、不查 `$HOME` / `$XDG_CACHE_HOME` / `$TMPDIR`、不把值改写到別的地方；預設值也都是純檔名，所以沒設定就落在 cwd。唯一例外：`--file-root` 內部走 `filepath.Abs`，因為 chroot containment 要比對一致的目錄字串（這也正是「相對 = cwd」的實作）。
+
 routing.json（未來多 agent 直接長在這裡）：
 ```json
 {"agents":[{"id":"a1","targets":["boss","dm:333"]}],
@@ -253,7 +255,7 @@ routing.json（未來多 agent 直接長在這裡）：
    {"alias":"boss","id":"channel:111222333","agent":"a1","read":true,"write":true,"name":"#rp-main"},
    {"alias":"dm:333","id":"user:333","agent":"a1"}
  ],
- "unknown_dm":"quarantine"}
+ "unknown_dm":"ignore"}
 ```
 
 安全：token 不落地 argv；發送 ACL；`os.Root` 沙箱（讀與 save 寫）；URL 下載解析後驗 IP（擋 private/link-local/localhost）；限流+斷路器；intents 最小化；README 寫「沒開 Message Content intent → content 為空字串」這個最常見的坑。

@@ -188,6 +188,47 @@ func TestFileRootDefaultsToCwd(t *testing.T) {
 	}
 }
 
+// The two paths this server *writes* must stay plain and cwd-local: no $HOME,
+// no XDG cache dir, no /tmp, and no rewriting of what the operator typed.
+func TestWrittenPathsStayRelativeToCwd(t *testing.T) {
+	cfg, err := Load([]string{"-selftest"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.StateFile != DefaultStateFile || cfg.MediaOut != DefaultMediaOut {
+		t.Fatalf("defaults moved: state=%q media=%q", cfg.StateFile, cfg.MediaOut)
+	}
+	for _, p := range []string{cfg.StateFile, cfg.MediaOut} {
+		if filepath.IsAbs(p) || filepath.Dir(p) != "." || strings.ContainsAny(p, "~$") {
+			t.Fatalf("%q must be a plain name inside the cwd", p)
+		}
+	}
+
+	// What is passed is stored verbatim: not Abs'd, not Clean'd, no ~ expansion.
+	cfg, err = Load([]string{"-selftest", "-state-file=run/state.json", "-media-out=./media/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.StateFile != "run/state.json" {
+		t.Fatalf("state file was rewritten: %q", cfg.StateFile)
+	}
+	if cfg.MediaOut != "./media/" {
+		t.Fatalf("media out was rewritten: %q", cfg.MediaOut)
+	}
+
+	// '' and --no-media-out still mean disabled.
+	cfg, err = Load([]string{"-selftest", "-state-file=", "-no-media-out"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.StateFile != "" {
+		t.Fatalf("-state-file= should disable, got %q", cfg.StateFile)
+	}
+	if cfg.MediaOut != "" || cfg.SaveEnabled() {
+		t.Fatalf("--no-media-out should disable save, got %q", cfg.MediaOut)
+	}
+}
+
 // Regression: the repeatable ACL flags are collected in flag.Value structs, and
 // an earlier build never copied them into Config — so --allow-channels /
 // --deny-channels / --allow-guilds silently did nothing. Both the command line

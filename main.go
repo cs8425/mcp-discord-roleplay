@@ -180,6 +180,10 @@ func selftest(cfg *config.Config, rt *router.Router, logger *slog.Logger) int {
 	}
 
 	report(true, "transport=%s agent=%s tz=%s (%s)", cfg.Transport, cfg.AgentID, cfg.TZ, tz.Now().Format("-07:00"))
+	// Everything we write defaults to a plain name in the cwd; say which cwd that is.
+	if wd, err := os.Getwd(); err == nil {
+		report(true, "working directory: %s (relative --state-file / --media-out / --log-file land here)", wd)
+	}
 	report(true, "intents: %s (MessageContent is privileged — enable it in the Developer Portal)",
 		strings.Join(discord.IntentsList(), "|"))
 
@@ -230,7 +234,7 @@ func selftest(cfg *config.Config, rt *router.Router, logger *slog.Logger) int {
 	if cfg.MediaOut == "" {
 		report(true, "save mode disabled (--no-media-out)")
 	} else {
-		report(true, "media cache: %s (keep %s, max %d MiB)", cfg.MediaOut, cfg.MediaKeep, cfg.MediaMaxMB)
+		report(true, "media cache: %s (keep %s, max %d MiB; relative = under the cwd)", cfg.MediaOut, cfg.MediaKeep, cfg.MediaMaxMB)
 	}
 	report(true, "inline caps: %d B/image, side<=%d, %d per result, %d B total per result",
 		cfg.InlineMaxBytesImage, cfg.InlineMaxSide, cfg.InlineMaxCount, cfg.InlineMaxTotalBytes)
@@ -241,7 +245,7 @@ func selftest(cfg *config.Config, rt *router.Router, logger *slog.Logger) int {
 	report(true, "ring: %d events, text truncated at %d runes", cfg.BusCapacity, cfg.TextMaxRunes)
 	report(true, "send budget: %d/min, %d ms gap per channel, breaker after %d rate-limit errors",
 		cfg.MaxSendsPerMin, cfg.SendGapMS, cfg.BreakerErrors)
-	report(true, "state file: %s", orNone(cfg.StateFile))
+	report(true, "state file: %s (relative = under the cwd)", orNone(cfg.StateFile))
 	if cfg.DryRun {
 		report(false, "dry-run is ON: sends will be logged, not delivered")
 	}

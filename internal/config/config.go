@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
@@ -22,6 +21,15 @@ import (
 
 // Module is the Go module name / MCP serverInfo name.
 const Module = "mcp-discord-roleplay"
+
+// Where this server writes when the operator did not say otherwise: plain
+// relative paths, i.e. directly inside the process working directory. Nothing
+// here consults $HOME, $XDG_CACHE_HOME or $TMPDIR, and the values are never
+// rewritten (no ~ expansion, no Abs, no Clean) — what you pass is what lands.
+const (
+	DefaultStateFile = "mcpdr-state.json"
+	DefaultMediaOut  = "mcpdr-media"
+)
 
 // MediaMode decides what happens to an inbound attachment.
 type MediaMode string
@@ -73,12 +81,12 @@ type Config struct {
 
 	// --- bus / state ----------------------------------------------------------
 	BusCapacity  int
-	StateFile    string
+	StateFile    string // "" = disabled; otherwise used exactly as typed (relative = cwd)
 	TextMaxRunes int
 
 	// --- inbound media policy -------------------------------------------------
 	Media               map[string]MediaMode // key: image|audio|video|other
-	MediaOut            string               // "" = save disabled
+	MediaOut            string               // "" = save disabled; relative = under the cwd
 	MediaKeep           time.Duration
 	MediaMaxMB          int
 	InlineMaxBytesImage int
@@ -104,8 +112,8 @@ type Config struct {
 	UnknownDM     string // ignore | ring
 
 	// --- files that feed the config -------------------------------------------
-	EnvFile       string
-	RoutingFile   string // resolved path ("" = none)
+	EnvFile       string // used exactly as typed; "" = nothing loaded
+	RoutingFile   string // used exactly as typed; "" = none found/loaded
 	LoadedEnvKeys []string
 
 	// --- runtime --------------------------------------------------------------
@@ -163,14 +171,14 @@ func Load(args []string) (*Config, error) {
 	fs.IntVar(&c.PollJitterPct, "poll-jitter-pct", 15, "percent jitter added to the poll deadline only")
 
 	fs.IntVar(&c.BusCapacity, "bus-capacity", 2000, "in-memory ring buffer size (messages)")
-	fs.StringVar(&c.StateFile, "state-file", filepath.Join(cacheDir(), Module, "state.json"), "cursor persistence file ('' disables)")
+	fs.StringVar(&c.StateFile, "state-file", DefaultStateFile, "cursor persistence file, relative to the working directory ('' disables)")
 	fs.IntVar(&c.TextMaxRunes, "text-max-runes", 4000, "truncate stored message text beyond this many runes")
 
 	fs.StringVar(&c.mImage, "media-image", "inline", "policy for inbound images: inline|save|skip")
 	fs.StringVar(&c.mAudio, "media-audio", "skip", "policy for inbound audio (skip = never burn tokens on voice)")
 	fs.StringVar(&c.mVideo, "media-video", "skip", "policy for inbound video: inline|save|skip")
 	fs.StringVar(&c.mOther, "media-other", "skip", "policy for any other attachment: inline|save|skip")
-	fs.StringVar(&c.MediaOut, "media-out", filepath.Join(cacheDir(), Module, "media"), "directory 'save' writes attachments into")
+	fs.StringVar(&c.MediaOut, "media-out", DefaultMediaOut, "directory 'save' writes attachments into, relative to the working directory")
 	fs.BoolVar(&c.NoMediaOut, "no-media-out", false, "disable the save mode entirely")
 	fs.DurationVar(&c.MediaKeep, "media-keep", 168*time.Hour, "delete saved attachments older than this")
 	fs.IntVar(&c.MediaMaxMB, "media-max-mb", 512, "cap the media cache at this many MiB (LRU by mtime)")
@@ -180,7 +188,7 @@ func Load(args []string) (*Config, error) {
 	fs.IntVar(&c.InlineMaxCount, "inline-max-count", 4, "max inlined attachments per tool result")
 	fs.IntVar(&c.InlineMaxTotalBytes, "inline-max-total-bytes", 12<<20, "max raw bytes inlined per tool result")
 
-	fs.Var(&roots, "file-root", "directory send may read files from, relative paths only (repeatable)")
+	fs.Var(&roots, "file-root", "directory send may read files from; absolute or relative to the cwd. Attachment paths stay relative to it (repeatable)")
 	fs.BoolVar(&c.NoFileRoot, "no-file-root", false, "forbid reading any local file in send")
 	fs.IntVar(&c.MaxUploadBytes, "max-upload-bytes", 8<<20, "max bytes per outbound file")
 	fs.IntVar(&c.MaxFilesPerMsg, "max-files-per-msg", 10, "max attachments per outbound message")
@@ -250,20 +258,16 @@ func (c *Config) loadEnvFile(fs *flag.FlagSet) error {
 	if c.EnvFile == "" {
 		return nil
 	}
-	abs, err := expandPath(c.EnvFile)
-	if err != nil {
-		return fmt.Errorf("--env-file: %w", err)
-	}
-	st, err := os.Stat(abs)
+	// Used as typed: absolute, or relative to the cwd. No ~ expansion, no Abs.
+	st, err := os.Stat(c.EnvFile)
 	if err != nil || st.IsDir() {
-		c.EnvFile = ""
+		c.EnvFile = "" // silently ignored when absent
 		return nil
 	}
-	keys, err := LoadDotEnv(abs)
+	keys, err := LoadDotEnv(c.EnvFile)
 	if err != nil {
 		return fmt.Errorf("env file: %w", err)
 	}
-	c.EnvFile = abs
 	c.LoadedEnvKeys = keys
 	return nil
 }
@@ -339,12 +343,13 @@ func (c *Config) finalize() error {
 
 	// 5. paths
 	var err error
-	if c.StateFile, err = expandPath(c.StateFile); err != nil {
-		return fmt.Errorf("--state-file: %w", err)
-	}
-	if c.MediaOut, err = expandPath(c.MediaOut); err != nil {
-		return fmt.Errorf("--media-out: %w", err)
-	}
+	// --state-file / --media-out stay exactly as typed: relative means "inside the
+	// cwd", which is the documented default. No ~ expansion, no Abs, no Clean —
+	// these are the paths the server *writes*, so they must be predictable. The
+	// read-side paths (--config, --env-file) are likewise used as typed; only
+	// --file-root goes through filepath.Abs, for the chroot containment checks.
+	c.StateFile = strings.TrimSpace(c.StateFile)
+	c.MediaOut = strings.TrimSpace(c.MediaOut)
 	if c.NoMediaOut {
 		c.MediaOut = ""
 	}
@@ -353,19 +358,14 @@ func (c *Config) finalize() error {
 		return err
 	}
 
-	// 6. routing
+	// 6. routing (path used as typed: absolute, or relative to the cwd)
 	if c.RoutingFile != "" {
-		abs, e := expandPath(c.RoutingFile)
-		if e != nil {
-			return fmt.Errorf("--config: %w", e)
-		}
-		if st, e := os.Stat(abs); e == nil && !st.IsDir() {
-			r, e := LoadRouting(abs)
+		if st, e := os.Stat(c.RoutingFile); e == nil && !st.IsDir() {
+			r, e := LoadRouting(c.RoutingFile)
 			if e != nil {
 				return e
 			}
 			c.Routing = r
-			c.RoutingFile = abs
 			if r.UnknownDM != "" {
 				c.UnknownDM = strings.ToLower(r.UnknownDM)
 			}
@@ -537,7 +537,12 @@ func (c *Config) Audit() map[string]any {
 	}
 }
 
-// resolveRoots turns --file-root values into absolute, existing directories.
+// resolveRoots turns --file-root values into existing directories. The value is
+// used as typed - an absolute path, or one relative to the cwd, which is exactly
+// how the OS resolves it when we open a file under the root. We do not expand ~:
+// that is the shell's job, and a second private path language here would only
+// surprise people. The only transformation is filepath.Abs, because the chroot
+// containment checks in M1 compare against a canonical directory string.
 // With no flag at all we default to the current working directory (the agent
 // writes a file, then hands the server its relative path); --no-file-root
 // turns local reads off completely.
@@ -558,55 +563,32 @@ func resolveRoots(raw []string, none bool) ([]string, error) {
 	seen := map[string]bool{}
 	out := make([]string, 0, len(raw))
 	for _, r := range raw {
-		abs, err := expandPath(r)
+		root, err := filepath.Abs(strings.TrimSpace(r))
 		if err != nil {
 			return nil, fmt.Errorf("--file-root %q: %w", r, err)
 		}
-		st, err := os.Stat(abs)
+		st, err := os.Stat(root)
 		if err != nil {
-			return nil, fmt.Errorf("--file-root %q: %w", abs, err)
+			return nil, fmt.Errorf("--file-root %q: %w", root, err)
 		}
 		if !st.IsDir() {
-			return nil, fmt.Errorf("--file-root %q is not a directory", abs)
+			return nil, fmt.Errorf("--file-root %q is not a directory", root)
 		}
-		if seen[abs] {
+		if seen[root] {
 			continue
 		}
-		seen[abs] = true
-		out = append(out, abs)
+		seen[root] = true
+		out = append(out, root)
 	}
 	return out, nil
 }
 
-// SortStrings is exported for tests and status output determinism.
-func SortStrings(s []string) []string {
-	out := append([]string(nil), s...)
-	sort.Strings(out)
-	return out
-}
-
-func expandPath(p string) (string, error) {
-	p = strings.TrimSpace(p)
-	if p == "" {
-		return "", nil
-	}
-	if p == "~" || strings.HasPrefix(p, "~/") || strings.HasPrefix(p, `~\`) {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", fmt.Errorf("cannot expand ~ in %q: %w", p, err)
-		}
-		p = filepath.Join(home, strings.TrimLeft(p[1:], `/\`))
-	}
-	abs, err := filepath.Abs(p)
-	if err != nil {
-		return "", fmt.Errorf("cannot resolve %q: %w", p, err)
-	}
-	return filepath.Clean(abs), nil
-}
-
-func cacheDir() string {
-	if d, err := os.UserCacheDir(); err == nil && d != "" {
-		return filepath.Join(d, Module)
-	}
-	return filepath.Join(os.TempDir(), Module)
-}
+// Path policy, and the reason there is no expandPath / cacheDir helper any more:
+// every path argument (--state-file, --media-out, --log-file, --env-file,
+// --config, --file-root) is taken as typed — absolute, or relative to the
+// process cwd. We never expand ~ (the operator's shell does that, and a second
+// private path language would only surprise people), we never consult $HOME,
+// $XDG_CACHE_HOME or $TMPDIR, and nothing rewrites a value into a different
+// location. The single exception is --file-root, where filepath.Abs is needed
+// for the chroot containment checks; Abs is also what makes "relative = under the
+// cwd" true, so it is the documented semantics rather than a surprise.
