@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 
 	mcp "mcptransport"
@@ -15,6 +16,7 @@ import (
 	"mcp-discord-roleplay/internal/bus"
 	"mcp-discord-roleplay/internal/config"
 	"mcp-discord-roleplay/internal/discord"
+	"mcp-discord-roleplay/internal/files"
 	"mcp-discord-roleplay/internal/router"
 )
 
@@ -25,11 +27,18 @@ type Deps struct {
 	Router    *router.Router
 	Bus       *bus.Bus
 	DC        *discord.Client
+	Files     *files.Store  // sandbox for send's file paths; nil-safe, reports files_disabled
 	Stopping  chan struct{} // closed as soon as shutdown begins
 	StartedAt time.Time
 	Version   string
 
 	toolNames []string // filled in by RegisterAll, reported by discord_status
+
+	// last maps an agent id to the target it most recently spoke to, which is
+	// what discord_send to:"last" resolves against. Per-agent on purpose: two
+	// personas sharing one server must not inherit each other's conversation.
+	// Deps is only ever used through a pointer, so this lock is never copied.
+	last sync.Map
 }
 
 // RegisterAll registers the tools available in this build onto reg (which is
@@ -41,7 +50,7 @@ func RegisterAll(reg *mcp.Registry, d *Deps) error {
 		fn   mcp.Handler
 	}{
 		{statusTool(), d.handleStatus},
-		// M1: {sendTool(), d.handleSend}
+		{sendTool(), d.handleSend},
 		// M2: {pollTool(), d.handlePoll}
 		// M3: {historyTool(), d.handleHistory}, {channelsTool(), d.handleChannels}
 	}

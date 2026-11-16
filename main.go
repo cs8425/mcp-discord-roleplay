@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -25,13 +26,14 @@ import (
 	"mcp-discord-roleplay/internal/bus"
 	"mcp-discord-roleplay/internal/config"
 	"mcp-discord-roleplay/internal/discord"
+	"mcp-discord-roleplay/internal/files"
 	"mcp-discord-roleplay/internal/router"
 	"mcp-discord-roleplay/internal/tools"
 	"mcp-discord-roleplay/internal/tz"
 )
 
 // version is stamped per milestone; keep it in sync with tools.BuildMilestone.
-const version = "0.1.0-M0"
+const version = "0.1.0-M1"
 
 func main() {
 	os.Exit(run(os.Args[1:]))
@@ -73,6 +75,7 @@ func run(args []string) int {
 
 	b := bus.New(cfg.BusCapacity)
 	cl := discord.New(cfg, logger, b, rt)
+	store := files.New(cfg, logger)
 
 	if err := cl.Start(ctx); err != nil {
 		logger.Error("discord gateway start failed", "err", err,
@@ -90,6 +93,7 @@ func run(args []string) int {
 		Router:    rt,
 		Bus:       b,
 		DC:        cl,
+		Files:     store,
 		Stopping:  shutting,
 		StartedAt: time.Now(),
 		Version:   version,
@@ -242,7 +246,16 @@ func selftest(cfg *config.Config, rt *router.Router, logger *slog.Logger) int {
 		report(false, "no --file-root: send cannot read local files")
 	} else {
 		report(true, "file roots: %s", strings.Join(cfg.FileRoots, ", "))
+		report(true, "attachment paths are named inside the first root that holds them (a leading '/' just means that root, "+
+			"and the name is cleaned); opened through os.Root, so a '..' that leaves the root, '~' and links pointing out are refused")
+		for _, r := range cfg.FileRoots {
+			if filepath.Clean(r) == string(filepath.Separator) {
+				report(false, "--file-root is the filesystem root: os.Root cannot stop us at the boundary, "+
+					"so send can read any regular file this user can (including /proc files). Use the project directory")
+			}
+		}
 	}
+	report(true, "url attachments are pasted into the message, never fetched by this server")
 	report(true, "upload caps: %d bytes/file, %d files/message", cfg.MaxUploadBytes, cfg.MaxFilesPerMsg)
 	report(true, "inbound media: image=%s audio=%s video=%s other=%s",
 		cfg.MediaFor(config.KindImage), cfg.MediaFor(config.KindAudio),
@@ -261,6 +274,11 @@ func selftest(cfg *config.Config, rt *router.Router, logger *slog.Logger) int {
 	report(true, "ring: %d events, text truncated at %d runes", cfg.BusCapacity, cfg.TextMaxRunes)
 	report(true, "send budget: %d/min, %d ms gap per channel, breaker after %d rate-limit errors",
 		cfg.MaxSendsPerMin, cfg.SendGapMS, cfg.BreakerErrors)
+	report(true, "429 handling: discordgo's own retry is OFF; we absorb retry_after<=%dms once, then answer "+
+		"rate_limited, and after %d in a row the breaker refuses everything for 60s",
+		cfg.SendRetryWaitMS, cfg.BreakerErrors)
+	report(true, "long messages: split at %d characters, sent in order, attachments on the last part",
+		discord.MaxContentRunes)
 	report(true, "state file: %s (relative = under the cwd)", orNone(cfg.StateFile))
 	if cfg.DryRun {
 		report(false, "dry-run is ON: sends will be logged, not delivered")
@@ -272,6 +290,7 @@ func selftest(cfg *config.Config, rt *router.Router, logger *slog.Logger) int {
 	deps := &tools.Deps{
 		Cfg: cfg, Router: rt, Bus: b,
 		DC:        discord.New(cfg, logger, b, rt), // never started in selftest
+		Files:     files.New(cfg, logger),
 		Stopping:  make(chan struct{}),
 		StartedAt: time.Now(),
 		Version:   version,
@@ -333,8 +352,10 @@ func toolNames(reg *mcp.Registry) []string {
 func instructions(cfg *config.Config, names []string) string {
 	return "Discord bridge for roleplay. Available tools: " + strings.Join(names, ", ") + ". " +
 		"Call discord_status first to learn which target aliases you may use. " +
-		"Targets are given as an alias, channel:<id>, user:<id>, #name or me. " +
-		"You never send binary data: reference local files by a path relative to the server's --file-root. " +
+		"Targets are given as an alias, channel:<id>, user:<id>, #name, me or last. " +
+		"You never send binary data: reference local files by a path under the server's --file-root (a leading '/' means that root), " +
+		"and put links in files[].url - they are pasted, not fetched. " +
+		"Text over 2000 characters is split for you. " +
 		"This process serves agent '" + cfg.AgentID + "'."
 }
 

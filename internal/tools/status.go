@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"path/filepath"
 	"strconv"
 	"time"
 
@@ -15,7 +16,7 @@ import (
 )
 
 // BuildMilestone marks how much of the tool surface exists in this binary.
-const BuildMilestone = "M0"
+const BuildMilestone = "M1"
 
 func statusTool() *mcp.Tool {
 	return &mcp.Tool{
@@ -97,6 +98,10 @@ func (d *Deps) handleStatus(ctx context.Context, call *mcp.Call) (*mcp.ToolResul
 		"tools":   d.toolNames,
 	}
 
+	if st := d.sendSection(p); len(st) > 0 {
+		out["send"] = st
+	}
+
 	select {
 	case <-d.Stopping:
 		out["stopping"] = true
@@ -112,6 +117,38 @@ func (d *Deps) handleStatus(ctx context.Context, call *mcp.Call) (*mcp.ToolResul
 		out["warnings"] = w
 	}
 	return jsonResult(out), nil
+}
+
+// sendSection is the outbound half of the status answer: how much of this
+// minute's budget is left, whether the breaker is open, where send can read
+// files from, and what to:"last" currently points at. An agent that gets a
+// rate_limited answer can see here whether waiting is even worth it.
+func (d *Deps) sendSection(p router.Principal) map[string]any {
+	if d.DC == nil {
+		return nil
+	}
+	lim := d.DC.Stats()
+	out := map[string]any{
+		"budget_left":       lim.BudgetLeft,
+		"sends_per_min":     lim.SendsPerMin,
+		"gap_ms":            lim.GapMS,
+		"breaker_open":      lim.BreakerOpen,
+		"consecutive_429":   lim.Consecutive429,
+		"max_files_per_msg": d.Cfg.MaxFilesPerMsg,
+		"max_upload_bytes":  d.Cfg.MaxUploadBytes,
+		"file_roots":        d.Cfg.FileRoots,
+		"mentions":          "none (roles, users and @everyone are always stripped)",
+	}
+	if lim.RetryAfterMS > 0 {
+		out["retry_after_ms"] = lim.RetryAfterMS
+	}
+	if lim.Probing {
+		out["probing"] = true
+	}
+	if t := d.lastTarget(p.AgentID); t != "" {
+		out["last_target"] = t
+	}
+	return out
 }
 
 // warnings turns the usual foot-guns into short actionable lines.
@@ -143,6 +180,17 @@ func (d *Deps) warnings(snap discord.Snapshot, stats bus.Stats, p router.Princip
 	}
 	if len(d.Cfg.FileRoots) == 0 {
 		w = append(w, "--no-file-root is in effect: send cannot attach local files, only url targets work")
+	}
+	for _, r := range d.Cfg.FileRoots {
+		if filepath.Clean(r) == string(filepath.Separator) {
+			w = append(w, "--file-root is the filesystem root: send can read any regular file the process can, "+
+				"including /proc entries. Name the project directory instead")
+			break
+		}
+	}
+	if st := d.DC.Stats(); st.BreakerOpen {
+		w = append(w, "send circuit breaker is open after repeated 429s: sends are refused for another "+
+			strconv.FormatInt(st.RetryAfterMS, 10)+"ms")
 	}
 	if d.Cfg.DryRun {
 		w = append(w, "dry-run mode: sends are logged and not delivered")

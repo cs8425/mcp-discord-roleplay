@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"time"
 
@@ -100,9 +101,10 @@ type Config struct {
 	MaxFilesPerMsg int
 
 	// --- outbound rate limits -------------------------------------------------
-	MaxSendsPerMin int
-	SendGapMS      int
-	BreakerErrors  int
+	MaxSendsPerMin  int
+	SendGapMS       int
+	BreakerErrors   int
+	SendRetryWaitMS int // largest retry_after we absorb locally instead of reporting
 
 	// --- access control -------------------------------------------------------
 	AllowGuilds   []string
@@ -193,7 +195,7 @@ func Load(args []string) (*Config, error) {
 	fs.IntVar(&c.InlineMaxCount, "inline-max-count", 4, "max inlined attachments per tool result")
 	fs.IntVar(&c.InlineMaxTotalBytes, "inline-max-total-bytes", 12<<20, "max raw bytes inlined per tool result")
 
-	fs.Var(&roots, "file-root", "directory send may read files from; absolute or relative to the cwd. Attachment paths stay relative to it (repeatable)")
+	fs.Var(&roots, "file-root", "directory send may read files from, absolute or relative to the cwd; attachment paths are named inside it (a leading '/' just means that root; the name is cleaned, so a '..' inside resolves and only one that would leave is refused, as is '~'), opened through os.Root (repeatable; do not use '/')")
 	fs.BoolVar(&c.NoFileRoot, "no-file-root", false, "forbid reading any local file in send")
 	fs.IntVar(&c.MaxUploadBytes, "max-upload-bytes", 8<<20, "max bytes per outbound file")
 	fs.IntVar(&c.MaxFilesPerMsg, "max-files-per-msg", 10, "max attachments per outbound message")
@@ -201,6 +203,7 @@ func Load(args []string) (*Config, error) {
 	fs.IntVar(&c.MaxSendsPerMin, "max-sends-per-min", 20, "outbound message budget per minute")
 	fs.IntVar(&c.SendGapMS, "send-gap-ms", 250, "minimum gap between two sends into the same channel")
 	fs.IntVar(&c.BreakerErrors, "breaker-errors", 3, "consecutive rate-limit errors before a 60s circuit break")
+	fs.IntVar(&c.SendRetryWaitMS, "send-retry-wait-ms", 1500, "largest Discord retry_after we absorb by waiting; anything longer is reported back to the caller")
 
 	fs.Var(&allowGuilds, "allow-guilds", "guild IDs to admit when routing.json is absent (repeatable; empty = unrestricted)")
 	fs.Var(&allowChannels, "allow-channels", "channel IDs to admit when routing.json is absent (repeatable)")
@@ -431,6 +434,12 @@ func (c *Config) finalize() error {
 	if c.MaxUploadBytes < 1 {
 		return fmt.Errorf("--max-upload-bytes must be >= 1, got %d", c.MaxUploadBytes)
 	}
+	if c.BreakerErrors < 1 {
+		return fmt.Errorf("--breaker-errors must be >= 1, got %d", c.BreakerErrors)
+	}
+	if c.SendRetryWaitMS < 0 {
+		return fmt.Errorf("--send-retry-wait-ms must be >= 0, got %d", c.SendRetryWaitMS)
+	}
 	if c.InlineMaxCount < 0 {
 		return fmt.Errorf("--inline-max-count must be >= 0, got %d", c.InlineMaxCount)
 	}
@@ -529,7 +538,8 @@ func (c *Config) Audit() map[string]any {
 		"max_upload_bytes":  c.MaxUploadBytes,
 		"max_files_per_msg": c.MaxFilesPerMsg,
 		"rate_limit": map[string]any{
-			"sends_per_min": c.MaxSendsPerMin, "gap_ms": c.SendGapMS, "breaker_errors": c.BreakerErrors,
+			"sends_per_min": c.MaxSendsPerMin, "gap_ms": c.SendGapMS,
+			"breaker_errors": c.BreakerErrors, "retry_wait_ms": c.SendRetryWaitMS,
 		},
 		"acl": map[string]any{
 			"allow_guilds": c.AllowGuilds, "allow_channels": c.AllowChannels,
@@ -548,12 +558,22 @@ func (c *Config) Audit() map[string]any {
 	}
 }
 
+// MarshalJSON refuses to marshal a Config. It carries the bot token, and this
+// project encodes maps into tool results, audit lines and logs all over the
+// place; a Config that accidentally landed in one of those would leak the token
+// into a model context or a file. The secret-free view is Audit().
+func (c *Config) MarshalJSON() ([]byte, error) {
+	return nil, fmt.Errorf("%s: %s is not marshalable because it holds the bot token; use Audit()",
+		Module, reflect.TypeOf(*c).String())
+}
+
 // resolveRoots turns --file-root values into existing directories. The value is
 // used as typed - an absolute path, or one relative to the cwd, which is exactly
 // how the OS resolves it when we open a file under the root. We do not expand ~:
 // that is the shell's job, and a second private path language here would only
-// surprise people. The only transformation is filepath.Abs, because the chroot
-// containment checks in M1 compare against a canonical directory string.
+// surprise people. The only transformation is filepath.Abs, and only so the list
+// can be de-duplicated and printed in logs - containment itself is enforced by
+// os.Root at open time, not by comparing directory strings here.
 // With no flag at all we default to the current working directory (the agent
 // writes a file, then hands the server its relative path); --no-file-root
 // turns local reads off completely.
@@ -600,6 +620,6 @@ func resolveRoots(raw []string, none bool) ([]string, error) {
 // process cwd. We never expand ~ (the operator's shell does that, and a second
 // private path language would only surprise people), we never consult $HOME,
 // $XDG_CACHE_HOME or $TMPDIR, and nothing rewrites a value into a different
-// location. The single exception is --file-root, where filepath.Abs is needed
-// for the chroot containment checks; Abs is also what makes "relative = under the
-// cwd" true, so it is the documented semantics rather than a surprise.
+// location. filepath.Abs is applied to --file-root for de-duplication and
+// readable logs only; the sandbox itself is enforced by os.Root when a file is
+// opened (internal/files), so no path string comparison decides access here.

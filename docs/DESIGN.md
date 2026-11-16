@@ -2,10 +2,11 @@
 
 - 2026-11-16　v0→v1→v2→**v3**。v3：C1/C3/C4 拍定；**C2 我原先的說法是錯的，已改正**（4 MiB 是「入口」限制，出口 streaming 無上限）
 - 狀態：**設計定案（v3.1），已依此動工**。本檔是實作的依據，與 `_state/` 的討論稿同步。
-- 實作進度：**M0 完成**（config / router / bus / discord gateway client / `discord_status` / `--selftest`）；M1 = `discord_send`，M2 = `discord_poll` + media，M3 = history/channels，M4 = README。
+- 實作進度：**M0 完成**（config / router / bus / discord gateway client / `discord_status` / `--selftest`）、**M1 寫完待編譯**（`internal/files` 沙箱 + `discord_send` + 預算/間隔/斷路器 + 單測）；M2 = `discord_poll` + media，M3 = history/channels，M4 = README。
+- ⚠ M1 的碼**尚未經過編譯**（sandbox 無 go）；驗證指令見 `_state/build-notes.md` 與 `_state/plan-M1.md`。
 - 建置驗證由 user 執行（sandbox 內無 shell / 無 go）：見 `_state/build-notes.md`。
 - 環境：**Go 1.27.4**（已確認）、單一 bot token、client = 自研 agent、測試由 user 直接把 token/指令接進 session
-- 依賴：`github.com/bwmarrin/discordgo v0.29.0`（API 簽名已逐條對过原始碼）
+- 依賴：`github.com/bwmarrin/discordgo v0.29.0`（API 簽名已逐條對過原始碼）
 
 ## 定案總表
 | 項目 | 決定 |
@@ -19,9 +20,11 @@
 | 介面契約 | **LLM 只送文字**（path / url / ID / 內文）；**二進位全部 server 端處理**：出口由 server 從 `--file-root` 開檔上傳、入口由 server inline 或落地回 path。無 `base64` 入參 |
 | 附件 | **config 驅動三段式**：`inline` / `save`(落 fs 回 path) / `skip`(不下載只列 URL+meta)。**定案預設：image=inline、audio=skip、video=skip、other=skip** |
 | 未匹配路由的 DM | **定案：ignore**（完全不進 ring，也不建 target）；保留 `--unknown-dm` 以便日後改 policy |
-| 環境檔 | 支援 **`.env`**（自己寫 10 行 loader，不引外部依赖；`--env-file` 預設 cwd 的 `.env`，存在才載） |
+| 環境檔 | 支援 **`.env`**（自己寫 10 行 loader，不引外部依賴；`--env-file` 預設 cwd 的 `.env`，存在才載） |
 | persona | 不做 |
-| 本機檔讀取 | `os.OpenRoot` / `*os.Root`（RESOLVE_BENEATH，擋 `..`/absolute/symlink 逃逸） |
+| 本機檔讀取 | `os.OpenRoot` / `*os.Root` 當沙箱根；只用 `/` 當分隔符，開頭 `/` 等於根（`/x.png` == `x.png`）；剩餘照 `filepath.IsLocal`（`..`/`~`/volume name 拒），多 `--file-root` 依宣告順序第一個命中（不做 mount 語法） |
+| 出站 `url` | **只貼不抓**：驗證後原樣附加到內文，由 Discord 自己拉（零 SSRF 面、不建 embed） |
+| 429 處理 | 關掉 discordgo 自己的重試（`ShouldRetryOnRateLimit=false`、`MaxRestRetries=2`）；**直接回 `rate_limited`/`circuit_open` + `retry_after_ms`**，斷路器期間 server 端自動擋掉後續呼叫（不碰 REST） |
 | RequestTimeout | 保持 0；若被設定自動抬到 `max_wait+jitter+30s` |
 | mcptransport | MVP 零修改（除了一個 4 MiB 常數的取捨，見 C2） |
 
@@ -151,28 +154,75 @@ envelope：
 
 ---
 
-## 4. `discord_send`
+## 4. `discord_send`（M1 已實作）
 ```json
 {"type":"object","required":["to"],
  "properties":{
-  "to":{"type":"string","description":"目標：alias（路由表）/ channel:<ID> / user:<ID> / #名稱 / @名稱 / me(最近 DM 對象) / last(最近互動的 target)"},
-  "text":{"type":"string","description":"內文（單則 2000 字，超過自動依換行切多則）"},
+  "to":{"type":"string","description":"目標：alias（路由表）/ channel:<ID> / user:<ID> / #名稱 / @名稱 / me(傳给自己的 DM) / last(本 agent 最近說話的 target)"},
+  "text":{"type":"string","description":"內文；超過 2000 字元自動切多則依序送出"},
   "files":{"type":"array","items":{"type":"object","properties":{
-    "name":{"type":"string","description":"檔名；省略由 path/url 推"},
-    "path":{"type":"string","description":"相對 --file-root 的本機路徑（os.Root 沙箱）。server 自己開檔上傳，LLM 不經手二進位"},
-    "url":{"type":"string","description":"遠端 URL（server 下載後上傳；擋 private/link-local IP）"},
-    "mime":{"type":"string","description":"省略則副檔名 + sniff"}}}}}
+    "name":{"type":"string","description":"Discord 顯示的檔名；省略取 path 的 basename"},
+    "path":{"type":"string","description":"相對某個 --file-root 根目錄的檔案路徑（os.Root 沙箱）。server 自己開檔上傳，LLM 不經手二進位"},
+    "url":{"type":"string","description":"http(s) 連結：**不下載**，原樣貼進內文讓 Discord 自己抓"},
+    "mime":{"type":"string","description":"省略則副檔名 → sniff 前 512 byte → application/octet-stream"}}}}}
  }}
 ```
-> **介面契約（定案）**：LLM 只送**文字**——路徑、URL、ID、內文。**二進位一律由 server 端處理**：出口從 `--file-root` 開檔上傳，入口用 `inline`/`save` 落地後回 path。沒有 `base64` 入參，也不期待它出現。
-- `text` 與 `files` 至少其一；`to` 必須通過 **發送 ACL**（不屬於本 agent 的 target → `isError` + 提示）
-- 附件載入 → `[]*discordgo.File{Name, ContentType, Reader}`；`MessageSend{Content, Files, AllowedMentions: none(硬編碼)}`
-- >2000 字 → 依 `\n` 打包 2..N 則，附件掛最後一則
-- `ChannelMessageSendComplex(ch, msg, discordgo.WithContext(ctx))`
-- 回：`{"ok":true,"sent":[{"id":"1234","target":"boss","channel":"111","link":"https://discord.com/channels/@me/111/1234","chars":42,"attachments":1}],"note":"split into 2"}`
-- 錯：`isError` + `{"ok":false,"error":"missing_access","hint":"bot 不在該伺服器或沒有 View Channel / Send Messages","detail":...}`（403/404/429 一律翻成可操作建議）
-- 本機檔：`os.OpenRoot`，只收相對路徑、Clean 後 `root.Stat/Open`；上限 `--max-upload-bytes`(8 MiB/檔)、`--max-files-per-msg`(10)；`--no-file-root` 全關
-- 提醒（未來跨機）：`path` 指 **server 那台**的檔案；agent 在別台就下 `url`（或未來把 server 搬到 agent 本機）
+> **介面契約（定案 v3.1）**：LLM 只送**文字**——路徑、URL、ID、內文。**二進位一律由 server 端處理**：出口從 `--file-root` 開檔上傳，入口用 `inline`/`save` 落地後回 path。沒有 `base64` 入參，也不期待它出現。
+
+### 4.1 URL 是「貼上」不是「下載」（user 裁示）
+「本來就不該我們抓下來轉送，只負責複製貼上 url 跟從 fs root 把檔案塞進去。」
+- `files[].url` 驗證通過後，**逐條附加到內文結尾**（空行分隔、一行一條），不建 embed、不開任何出站連線。
+- 好處：零 SSRF 面（我們不碰目標位址，沒有 private/link-local/redirect 的問題要處理）、零頻寬與暫存、Discord 自己渲染 preview。
+- 驗證只問「這是一條乾淨的 http(s) URL 嗎」：scheme ∈ {http,https}、要有 host、長度 ≤2048、**不得含任何 <0x21 或 0x7f 的位元組**（換行會變成在訊息裡夾帶第二行＝語意注入）。回傳 `url.URL.String()` 的標準化結果。
+- 注意：貼上的連結會算進 2000 字元的切段預算（先合體再切段）。
+
+### 4.2 本機檔案沙箱（`internal/files`）
+- **路徑政策照 user 裁示**：「`--file-root` 直接是 `/`，其他全照原本的 filepath 邏輯」——不做 `HOST=VIRT` 之類的 mount 語法；每個 `--file-root DIR` **本身就是根**。
+- **分隔符只用 `/`（不分 OS）**：`--file-root` 們就是整個命名空間，所以開頭的 `/` 不攜帶資訊——`/pose.png` 與 `pose.png` 是同一個檔（user：「直接 `/` == `./` 就行」）。尾端的 `/` 也當飾邊處理；剝完只剩 `.` 的就是根本身 → `not_a_file`。
+- **順序（user 定案：先 clean，再 `/` == `.`）**：`toRootPath()` = `filepath.ToSlash` → `path.Clean` → 剔掉開頭 `/`。用 `path.Clean` 不用 `filepath.Clean`：後者在 Windows 把 `\` 也當分隔符，跟「只用 `/`」相反。
+- clean 先跑意味著 `".."` 在 root **內**只是別名：`./a/../b` 就是 `b`（允許）。剔完開頭 `/` 後仍剩 `..` 元素的，才是真的要離開 root → `path_escapes`；volume name（`C:/x`）同拒；`~/` 另校（IsLocal 覺得它合法，但我們永不展開）。另：`/../etc/passwd` 會被 clean 成 `etc/passwd`（命名空間的根之上沒有上層，跟 POSIX 絕對路徑一樣），所以是 `not_found` 不是 escapes。
+- 然後對**每個 root 依宣告順序** `os.OpenRoot(root)` → `Open(name)`，**第一個命中的贏**，開完立刻 `rt.Close()`（Root 關掉不影響已開的 fd）。
+- `os.Root` 會跟 symlink 但**禁止指向 root 外**（Go 端已處理，我們不重複實作）；它**不管 fs 邊界/bind mount/`/proc`/device file**，所以我們自己補 `Stat().Mode().IsRegular()`，且 `--file-root /` 會在 selftest/status 出現 WARN。
+- 上限：`--max-upload-bytes`（預設 8 MiB/檔，訊息用 KiB/MiB 講清楚）、`--max-files-per-msg`（10）；`--no-file-root` 全部關掉 → `files_disabled`。**`*Store` 為 nil 時所有方法安全回 `files_disabled`**。
+- 檔名過 `SafeName`（去目錄、控制字元一律換 `_`（不吞掉，留住邊界）、`*?"<>|:/` 與反斜線 → `_`、去前導點、≤120 rune 且保留副檔名、空 → `file.bin`）。
+- 代碼：`files_disabled / empty_path / path_escapes / not_found / not_a_file / too_large / too_many_files / bad_url / open_failed`；`not_found` 的 tool 回覆會附 `file_roots` 讓 operator 看得出對不上。
+- **先全數開好、再開始送**：壞路徑讓整次呼叫失敗，不會送出半個場景。
+
+### 4.3 切段
+- 常數 `discord.MaxContentRunes = 2000`（不是 flag：超過就是被拒，切段只有一個正確數字）。以 **rune** 計，不是 byte。
+- `splitMessage` 順序：換行符 → 句末（`。．！？!?；;…` 並吸收隨後的閉符號 `”"’）)】]》」』`）→ 空白 → 硬切（並回報 `hardCut` 警告「可能切到單字中間」）。
+- 候選切點必須 ≥ min（= limit/2），避免產出碎片；純 whitespace 段略過；每輪至少吃掉 min 個 rune（或硬切吃滿 limit），保證終止。
+- 段數上限 `maxSendParts = 20`（=40k 字元），超過 → `text_too_long`，建議改寫成檔案當附件。
+- **附件只掛在最後一段**；空 text + 附件是合法訊息（會 warning 說明）。
+- 第 2 段起先查 `ctx.Err()`：呼叫者走了就停，並回報 `parts_sent`。
+
+### 4.4 限流、預算、斷路器（`internal/discord`）
+user 裁示：「直接回 429 rate limit 跟時間讓 LLM 知道，然後 mcp server side 自動擋掉後續時限內的 call。」
+
+| 機制 | 行為 |
+|---|---|
+| 每分鐘預算 | `--max-sends-per-min`(20)：滑動 60s 視窗，**在 admitted 的那一刻就佔額度**（併發不會超賣）。耗盡且還要等 >5s → `budget_exhausted` + `retry_after_ms`；≤5s 我們自己等 |
+| 同頻道間隔 | `--send-gap-ms`(250)：以頻道為鍵，不同頻道互不拖慢 |
+| 本地吸收 | `--send-retry-wait-ms`(1500)：Discord 的 `retry_after` ≤ 此值 → 我們等一次再試（重試前 **`Rewind()` 附件**，否則第二次會上傳 0 byte）；較大 → 原封不動回報 |
+| 斷路器 | 連續 `--breaker-errors`(3) 次 429 → 開啟 60s（`breakerHold`）：期間每個 send **完全不碰 REST**，直接 `circuit_open` + `retry_after_ms`；60s 後只放 **1 個 half-open probe**（其餘拿 `circuit_open`，`retry_after_ms=2000`）；probe 成功即重置，失敗再關 60s。非 429 的失敗也會歸還 probe 權，不會卡死 |
+
+**為何關掉函式庫自己的重試**：`/_tmp/dg_v0290_restapi.go:279-298` — `ShouldRetryOnRateLimit = true` 時 429 **永遠不會變成 error**（`time.Sleep(rl.RetryAfter)` 後用同一 sequence 遞迴重試，且**不看 ctx**）。那樣一來斷路器是裝飾品、tool call 可能無限阻塞。所以 `Start()` 設 `ShouldRetryOnRateLimit = false`（429 以 `*RateLimitError` 回到我們手上）＋ `MaxRestRetries = 2`（只管 502）。
+
+### 4.5 回覆格式（實作）
+成功：
+```json
+{"ok":true,"target":"boss","kind":"channel","channel_id":"111...","delivered_channel_id":"111...",
+ "parts_sent":2,"message_ids":["123","124"],"last_message_id":"124","created_at":"2026-01-02 03:04:05",
+ "attachments":[{"name":"pose.png","size":12345,"mime":"image/png"}],"url_count":1,"dry_run":false,"warnings":[...]}
+```
+失敗（`isError:true`）：`{"ok":false,"error":"<code>","hint":"<下一步>","retry_after_ms":...,"http_status":...,"discord_code":"...","breaker_open":true,"target":"boss","kind":"channel","channel_id":"...","parts_sent":1,"message_ids":[...],"part_failed":2,"delivered_before_failure":1}`
+- 部分送達時 `hint` 內會寫「N of M part(s) landed … continue from part N+1」，**不要整則重傳**。
+- 代碼：`not_connected / circuit_open / budget_exhausted / rate_limited / cancelled / unauthorized / forbidden / unknown_channel / cannot_send_to_channel / bad_request / server_error / network_error / api_error / attachment_failed / dm_channel_failed`，加上路由層的 `empty_target / unknown_target / not_allowlisted / foreign_agent / write_denied / no_last_target` 與檔案層的 9 個碼。
+- `AllowedMentions{Parse: []}` 硬編碼（**空 slice 而非 nil**：`Parse` 不帶 `omitempty`，nil 會被整欄不送＝Discord 預設全解析 → @everyone 可被 ping）。無 flag 可關。
+- 不回 `link`：訊息連結需要 guild id，我們不保證有；`message_ids` + `channel_id` 足夠。
+- DM target：`user:<id>` 走 `UserChannelCreate`（快取於 `Client.dm`，DM 頻道 id 穩定故不須失效）；`me` 用 `SelfID()`，尚未 READY → `not_connected`。
+- `--dry-run`：不佔額度、不碰 REST、不建 DM；仍走完路由/沙箱/切段並在結果標 `dry_run:true`。
+
 
 ---
 
@@ -210,7 +260,7 @@ envelope：
 - 對稱性：進（`save` 回 `local_path`）出（`files[].path` 讀 `--file-root`）**都以檔案路徑為介面**，LLM 世界裡沒有 base64。
 
 **inline 尺寸政策（定案值，純成本考量，全部可調）**：
-`--inline-max-bytes-image 4194304`(4 MiB)、`--inline-max-side 1280`（png/jpeg 本地 `x/image/draw` 縮；或先試 Discord media proxy `?width=1280` 省 CPU，實测定案）、`--inline-max-count 4`/包、`--inline-max-total-bytes 12 MiB`/包、超限走降級鏈（inline→save→skip）。
+`--inline-max-bytes-image 4194304`(4 MiB)、`--inline-max-side 1280`（png/jpeg 本地 `x/image/draw` 縮；或先試 Discord media proxy `?width=1280` 省 CPU，實測定案）、`--inline-max-count 4`/包、`--inline-max-total-bytes 12 MiB`/包、超限走降級鏈（inline→save→skip）。
 
 ---
 
@@ -237,7 +287,7 @@ envelope：
 | `--media-keep / --media-max-mb` | 7 天 / 512 MiB |
 | inline 尺寸政策 | 見 §6（`--inline-max-bytes-image 4MiB` 等）|
 | `--max-arg-base64-bytes` | **不需要**（LLM 不送 base64；見 §6 入口/出口分工）|
-| `--env-file` | `.env`（存在才載；自己寫 loader，不引依赖）|
+| `--env-file` | `.env`（存在才載；自己寫 loader，不引依賴）|
 | `--allow-guilds / --allow-channels / --deny-channels / --allow-dm` | 空=不限制 / true（沒 routing.json 時的簡化 allowlist，建議一律填） |
 | `--unknown-dm` | `ignore`（定案；不進 ring） |
 | `--max-sends-per-min / --send-gap-ms / --breaker-errors` | 20 / 250 / 3（斷路 60s） |
@@ -246,7 +296,7 @@ envelope：
 | `--dry-run` | false |
 | `--log-level / --log-file` | info / stderr（slog；**stdout 只能是 MCP 訊息**） |
 
- **路徑政策**（user 定案）：所有路徑參數（`--state-file` / `--media-out` / `--log-file` / `--env-file` / `--config` / `--file-root`）一律**照原樣使用**——絕對路徑，或相對 process cwd。我們**不解析 `~`**（那是 shell 的事）、不查 `$HOME` / `$XDG_CACHE_HOME` / `$TMPDIR`、不把值改写到別的地方；預設值也都是純檔名，所以沒設定就落在 cwd。唯一例外：`--file-root` 內部走 `filepath.Abs`，因為 chroot containment 要比對一致的目錄字串（這也正是「相對 = cwd」的實作）。
+ **路徑政策**（user 定案）：所有路徑參數（`--state-file` / `--media-out` / `--log-file` / `--env-file` / `--config` / `--file-root`）一律**照原樣使用**——絕對路徑，或相對 process cwd。我們**不解析 `~`**（那是 shell 的事）、不查 `$HOME` / `$XDG_CACHE_HOME` / `$TMPDIR`、不把值改寫到別的地方；預設值也都是純檔名，所以沒設定就落在 cwd。唯一例外：`--file-root` 內部走 `filepath.Abs`，因為 chroot containment 要比對一致的目錄字串（這也正是「相對 = cwd」的實作）。附件的 `path` 是另一回事，見 §4.2：在 root 之內，開頭 `/` 等於那個 root。
 
 routing.json（未來多 agent 直接長在這裡）：
 ```json
@@ -277,13 +327,13 @@ MVP 零修改（除非選 §6 的 (B)，改兩行常數 + 一個 config）。P2 
 | | 內容 | 驗收（你跑） |
 |---|---|---|
 | M0 | go.mod + config + router 骨架 + discord/client（狀態機）+ main（`--selftest`、shutdown：在飛 poll 全部 `reason:"shutdown"` 再 Close）+ `discord_status` | `go mod tidy && go build ./...`；`go run . --selftest` 印身分/guild/target 表 |
-| M1 | target 解析 + files(os.Root/url/base64) + 限流/斷路 + `discord_send` | 對測試 DM/頻道：純文字、純圖、文+圖；錯誤路徑 hint 可讀 |
+| M1 | target 解析 + `internal/files`（os.Root 沙箱；url 只貼不抓；無 base64）+ 預算/同頻道間隔/斷路器 + `discord_send`（切段、附件掛末段）+ 三個 `_test.go` | `go build ./... && go vet ./... && go test ./...`；`go run . --selftest --file-root . --file-root ./docs`；`--dry-run` 下對測試頻道：純文字、純圖、文+圖、超長切段、壞路徑 hint 可讀、429/斷路器回 `retry_after_ms` |
 | M2 | bus + MessageCreate 正規化 + `discord_poll`（下限/jitter/cursor/持久化）+ media 三段式 | 發訊→瞬間回；不發→timeout；Esc→cancelled；重啟不重播；大圖降級正確 |
 | M3 | `discord_history`、`discord_channels` | alias⇄ID 可用、history 補舊訊 |
 | M4 | README（Portal/intents/routing/接入）、拔網線 30s 重連不漏不炸、多 agent 檔預演 | e2e |
 
 ## 12. 測試計畫（不需要 token 的部分都寫成單測）
-bus（游標/ring 覆蓋 dropped/broadcast 不丟/ctx cancel/jitter 區間/filter 組合）、router（規則優先序、ACL 拒發、unknown-dm）、target（`user:`/`channel:`/alias/`#名`/`@名`/`me`/`last`；模糊名回候選不瞎猜）、files（os.Root 逃逸 absolute/`..`/symlink 全擋、mime sniff、大小數量上限、url private IP 用 httptest 擋）、media（三 mode × 降級鏈 × dedupe，用極小測試圖/音檔）、send（抽象 `api` interface + fake session 驗 split 打包與 AllowedMentions=none）、poll（假事件序列 → envelope 斷言）、`--selftest`（真連煙霧測試）
+bus（游標/ring 覆蓋 dropped/broadcast 不丟/ctx cancel/jitter 區間/filter 組合）、router（規則優先序、ACL 拒發、unknown-dm）、target（`user:`/`channel:`/alias/`#名`/`@名`/`me`/`last`；模糊名回候選不瞎猜）、files（路徑政策：先 `path.Clean` 再把開頭 `/` 當根（`./a/../b` == `b`）、`..` 倖存者/`~`/volume name 拒；symlink 逃出 root 被 `os.Root` 擋、根內可用；多 root 優先序；目錄/超大/數量上限；mime 四層優先序與 sniff 後 offset 歸零；`ValidateURL`）、send（seam 注入假 poster + 假時鐘：AllowedMentions.Parse 為空 slice、gap/預算/斷路器狀態機、小 `retry_after` 本地重試且**重試前有 Rewind**、 breaker open 時完全不碰 REST、half-open 只放 1、DryRun 不碰 REST 不佔額度、classify 全碼）、tools（`-dry-run` 端到端 envelope、各 `to` 拒因與 `targets` 候選、切段邊界 1999/2000/2001/CJK/附件僅末段、`text_too_long`、`last` per-agent 隔離、部分送達）、poll（假事件序列 → envelope 斷言）、`--selftest`（真連煙霧測試）
 
 ---
 
@@ -303,4 +353,4 @@ bus（游標/ring 覆蓋 dropped/broadcast 不丟/ctx cancel/jitter 區間/filte
 5. `main.go`：`--selftest`、`--transport`、SIGINT/EOF → 在飛 poll 回 `reason:"shutdown"` → `Session.Close()`
 6. `internal/tools/status.go`：`discord_status`
 7. 交給你跑：`go mod tidy && go build ./... && go run . --selftest`，輸出貼回 → 我修 → 記錄在 `_state/build-notes.md`
-（M1 起才碰 send/poll/media；`files` 的 base64 上限與 ErrTooLong 對策在 M1 內完成）
+（M1 已交：`internal/files` + `discord/send.go` + `tools/send.go` + 單測；base64 入參不存在（已砍），入口 4 MiB 只留 `bufio.ErrTooLong` → exit 4 的防呆）

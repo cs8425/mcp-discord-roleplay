@@ -76,11 +76,25 @@ type Client struct {
 
 	startedAt time.Time
 	closing   atomic.Bool
+
+	// --- outbound sending (M1). See send.go for the policy these implement. ---
+	lim *sendLimiter // sliding budget, per-channel gap, circuit breaker
+	dm  sync.Map     // recipient user id -> DM channel id (stable, never evicted)
+
+	// Test seams. They stay nil in production and exist so the rate-limit, retry
+	// and rewind behaviour can be proven without a network: the Go sandbox in this
+	// project has no compiler, so the logic must be testable by the operator.
+	post     poster                                           // nil = ChannelMessageSendComplex
+	dmCreate channelPoster                                    // nil = UserChannelCreate
+	sleep    func(ctx context.Context, d time.Duration) error // nil = real timer, ctx-aware
 }
 
 // New builds a client; nothing is connected until Start.
 func New(cfg *config.Config, log *slog.Logger, b *bus.Bus, rt *router.Router) *Client {
-	return &Client{cfg: cfg, log: log, b: b, rt: rt}
+	if log == nil {
+		log = slog.Default()
+	}
+	return &Client{cfg: cfg, log: log, b: b, rt: rt, lim: newSendLimiter(cfg)}
 }
 
 // Start creates the session, installs handlers and opens the gateway.
@@ -98,7 +112,13 @@ func (c *Client) Start(ctx context.Context) error {
 	sess.Identify.Intents = Intents()
 	sess.LogLevel = dgoLogLevel(c.cfg.LogLevel)
 	sess.ShouldReconnectOnError = true
-	sess.ShouldRetryOnRateLimit = true
+	// 429 must reach us as an error. With the library's retry switched on, a rate
+	// limit is swallowed in restapi.go (time.Sleep on retry_after, then the same
+	// bucket again, ignoring any context), so our breaker would never see a hit and
+	// a tool call could block for an unbounded time. We keep MaxRestRetries for the
+	// one case that still uses it: HTTP 502 (restapi.go:270-278).
+	sess.ShouldRetryOnRateLimit = false
+	sess.MaxRestRetries = 2
 	// One process, one gateway: keep the default single shard explicit.
 	sess.ShardID = 0
 	sess.ShardCount = 1
