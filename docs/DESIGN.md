@@ -1,9 +1,9 @@
 # mcp-discord-roleplay — 設計 **v3（定稿候選）**
 
 - 2026-11-16　v0→v1→v2→**v3**。v3：C1/C3/C4 拍定；**C2 我原先的說法是錯的，已改正**（4 MiB 是「入口」限制，出口 streaming 無上限）
-- 狀態：**設計定案（v3.1）＋ M2a 已寫完待編譯**。本檔是實作的依據，與 `_state/` 的討論稿同步。
-- 實作進度：**M0 ✅**（config / router / bus / discord gateway client / `discord_status` / `--selftest`）、**M1 ✅**（`internal/files` 沙箱 + `discord_send` + 預算/間隔/斷路器 + 單測）、**M2a 寫完待編譯**（per-agent Queue/Hub + `router.Audience` + `discord_poll`）；M2b = media 三段式、M3 = history/channels，M4 = README。
-- ⚠ 碼**尚未經過編譯**（sandbox 無 go）；`-race` 從未跑過。驗證指令見 `_state/build-notes.md`。
+- 狀態：**設計定案（v3.1）＋ M2a 已實作並通過 `go vet` / `go test`**。本檔是實作的依據。
+- 實作進度：**M0 ✅**（config / router / bus / discord gateway client / `discord_status` / `--selftest`）、**M1 ✅**（`internal/files` 沙箱 + `discord_send` + 預算/間隔/斷路器 + 單測）、**M2a ✅**（per-agent Queue/Hub + `router.Audience` + `discord_poll`；`go vet ./...` + `go test ./...` 全綠 2026-11-17）；M2b = media 三段式（草案 `_state/plan-M2b.md`）、M3 = history/channels，M4 = README。
+- ⚠ **`-race` 仍未跑過**（`go build` / `go vet` / `go test` 已由 user 驗證全綠）。驗證紀錄 → `_state/build-notes.md`。
 - 建置驗證由 user 執行（sandbox 內無 shell / 無 go）：見 `_state/build-notes.md`。
 - 環境：**Go 1.27.4**（已確認）、單一 bot token、client = 自研 agent、測試由 user 直接把 token/指令接進 session
 - 依賴：`github.com/bwmarrin/discordgo v0.29.0`（API 簽名已逐條對過原始碼）

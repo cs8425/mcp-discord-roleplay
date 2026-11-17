@@ -35,6 +35,12 @@ const (
 	// taking events once its answer would be big and the rest wait for the next
 	// poll (in order).
 	DefaultPollMaxBytes = 16384
+
+	// DefaultMediaSaveMaxBytes caps a single saved attachment. Discord lets a
+	// file reach ~200 MB and people throw 30-50 MB videos around without
+	// thinking; writing those to disk for an agent that may never read them is
+	// the expensive mistake, so save gets its own ceiling beside inline's.
+	DefaultMediaSaveMaxBytes = 4 << 20
 )
 
 // MediaMode decides what happens to an inbound attachment.
@@ -95,10 +101,13 @@ type Config struct {
 	MediaOut            string               // "" = save disabled; relative = under the cwd
 	MediaKeep           time.Duration
 	MediaMaxMB          int
+	// The inline caps and the save cap share one rule (decided 2026-11-17):
+	// -1 = no limit, 0 = that mode is switched off, anything else = the limit.
 	InlineMaxBytesImage int
 	InlineMaxSide       int
 	InlineMaxCount      int
 	InlineMaxTotalBytes int
+	MediaSaveMaxBytes   int
 
 	// --- outbound files -------------------------------------------------------
 	FileRoots      []string // absolute, one per --file-root
@@ -195,10 +204,11 @@ func Load(args []string) (*Config, error) {
 	fs.DurationVar(&c.MediaKeep, "media-keep", 168*time.Hour, "delete saved attachments older than this")
 	fs.IntVar(&c.MediaMaxMB, "media-max-mb", 512, "cap the media cache at this many MiB (LRU by mtime)")
 
-	fs.IntVar(&c.InlineMaxBytesImage, "inline-max-bytes-image", 4<<20, "max raw bytes per inlined image")
-	fs.IntVar(&c.InlineMaxSide, "inline-max-side", 1280, "downscale images so the longest side fits (0 = never)")
-	fs.IntVar(&c.InlineMaxCount, "inline-max-count", 4, "max inlined attachments per tool result")
-	fs.IntVar(&c.InlineMaxTotalBytes, "inline-max-total-bytes", 12<<20, "max raw bytes inlined per tool result")
+	fs.IntVar(&c.InlineMaxBytesImage, "inline-max-bytes-image", 4<<20, "max raw bytes per inlined image (-1 = no limit, 0 = inline off)")
+	fs.IntVar(&c.InlineMaxSide, "inline-max-side", 1280, "longest side an image may have to still be inlined; we never resize, bigger just skips (-1 = no check, 0 = inline off)")
+	fs.IntVar(&c.InlineMaxCount, "inline-max-count", 4, "max inlined attachments per tool result (-1 = no limit, 0 = inline off)")
+	fs.IntVar(&c.InlineMaxTotalBytes, "inline-max-total-bytes", 12<<20, "max raw bytes inlined per tool result (-1 = no limit, 0 = inline off)")
+	fs.IntVar(&c.MediaSaveMaxBytes, "media-save-max-bytes", DefaultMediaSaveMaxBytes, "max raw bytes per saved attachment; Discord allows ~200 MB and people attach them casually (-1 = no limit, 0 = save off)")
 
 	fs.Var(&roots, "file-root", "directory send may read files from, absolute or relative to the cwd; attachment paths are named inside it (a leading '/' just means that root; the name is cleaned, so a '..' inside resolves and only one that would leave is refused, as is '~'), opened through os.Root (repeatable; do not use '/')")
 	fs.BoolVar(&c.NoFileRoot, "no-file-root", false, "forbid reading any local file in send")
@@ -423,8 +433,8 @@ func (c *Config) finalize() error {
 	if c.BusCapacity < 10 {
 		return fmt.Errorf("--bus-capacity must be >= 10, got %d", c.BusCapacity)
 	}
-	if c.PollMaxBytes != 0 && (c.PollMaxBytes < 4096 || c.PollMaxBytes > 1<<20) {
-		return fmt.Errorf("--poll-max-bytes must be 0 (no cap) or within [4096,1048576], got %d", c.PollMaxBytes)
+	if c.PollMaxBytes != 0 && c.PollMaxBytes != -1 && (c.PollMaxBytes < 4096 || c.PollMaxBytes > 1<<20) {
+		return fmt.Errorf("--poll-max-bytes must be -1 or 0 (no cap) or within [4096,1048576], got %d", c.PollMaxBytes)
 	}
 	if c.TextMaxRunes < 200 {
 		return fmt.Errorf("--text-max-runes must be >= 200, got %d", c.TextMaxRunes)
@@ -447,11 +457,20 @@ func (c *Config) finalize() error {
 	if c.SendRetryWaitMS < 0 {
 		return fmt.Errorf("--send-retry-wait-ms must be >= 0, got %d", c.SendRetryWaitMS)
 	}
-	if c.InlineMaxCount < 0 {
-		return fmt.Errorf("--inline-max-count must be >= 0, got %d", c.InlineMaxCount)
+	if err := checkGate("--inline-max-bytes-image", c.InlineMaxBytesImage); err != nil {
+		return err
 	}
-	if c.InlineMaxTotalBytes < 0 {
-		return fmt.Errorf("--inline-max-total-bytes must be >= 0, got %d", c.InlineMaxTotalBytes)
+	if err := checkGate("--inline-max-side", c.InlineMaxSide); err != nil {
+		return err
+	}
+	if err := checkGate("--inline-max-count", c.InlineMaxCount); err != nil {
+		return err
+	}
+	if err := checkGate("--inline-max-total-bytes", c.InlineMaxTotalBytes); err != nil {
+		return err
+	}
+	if err := checkGate("--media-save-max-bytes", c.MediaSaveMaxBytes); err != nil {
+		return err
 	}
 	if c.MediaFor(KindImage) == MediaSave && c.MediaOut == "" {
 		return fmt.Errorf("media-image=save needs --media-out; pass one or use --no-media-out with media-image=inline")
@@ -478,11 +497,46 @@ func (c *Config) MediaFor(kind string) MediaMode {
 }
 
 // SaveEnabled reports whether the save mode is available.
-func (c *Config) SaveEnabled() bool { return c.MediaOut != "" }
+func (c *Config) SaveEnabled() bool {
+	return c.MediaOut != "" && !Disabled(c.MediaSaveMaxBytes)
+}
 
-// CanInline reports whether any inline budget exists at all.
+// AnySave reports whether at least one kind asks for the save mode. It decides
+// whether the cache directory has to exist at all: with nothing set to save,
+// the server should not leave an empty folder behind on first run.
+func (c *Config) AnySave() bool {
+	for _, k := range []string{KindImage, KindAudio, KindVideo, KindOther} {
+		if c.MediaFor(k) == MediaSave {
+			return true
+		}
+	}
+	return false
+}
+
+// CanInline reports whether inlining is switched on at all. Under the "-1 = no
+// limit, 0 = off" rule every gate counts: a total of 0 bytes, 0 images or a
+// longest side of 0 leaves nothing that could be inlined, so the mode is off.
+// A gate at -1 only stops checking, it does not disable anything.
 func (c *Config) CanInline() bool {
-	return c.InlineMaxCount > 0 && c.InlineMaxTotalBytes > 0 && c.InlineMaxBytesImage > 0
+	return !Disabled(c.InlineMaxCount) &&
+		!Disabled(c.InlineMaxTotalBytes) &&
+		!Disabled(c.InlineMaxBytesImage) &&
+		!Disabled(c.InlineMaxSide)
+}
+
+// Unlimited reports whether one of the cap flags means "no limit".
+func Unlimited(v int) bool { return v < 0 }
+
+// Disabled reports whether one of the cap flags means "this mode is off".
+func Disabled(v int) bool { return v == 0 }
+
+// checkGate validates one of those caps: -1 (no limit), 0 (off) or a positive
+// number. Anything below -1 is a typo — nobody means "negative four bytes".
+func checkGate(flag string, v int) error {
+	if v < -1 {
+		return fmt.Errorf("%s must be -1 (no limit), 0 (off) or positive, got %d", flag, v)
+	}
+	return nil
 }
 
 // NormalizeToken makes sure a token carries its authorization scheme.
