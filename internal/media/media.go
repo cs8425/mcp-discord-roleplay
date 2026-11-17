@@ -22,7 +22,10 @@ package media
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -36,9 +39,9 @@ import (
 	"strings"
 	"time"
 
-	"mcpdr/internal/bus"
-	"mcpdr/internal/config"
-	"mcpdr/internal/files"
+	"mcp-discord-roleplay/internal/bus"
+	"mcp-discord-roleplay/internal/config"
+	"mcp-discord-roleplay/internal/files"
 
 	mcp "mcptransport"
 )
@@ -97,6 +100,15 @@ type Fetcher struct {
 	// (os.Root follows symlinks but never lets them escape, and its methods
 	// are safe from several goroutines at once).
 	root *os.Root
+
+	// prefix is what we write in front of a saved name when we tell the agent
+	// about it (--local-path, or a reading of --media-out when that is left
+	// empty). The real directory is the operator's business; this string is
+	// the name the agent should be able to hand back to discord_send.
+	prefix string
+
+	// secret backs saveName's token: random per process, never on the wire.
+	secret []byte
 }
 
 // New prepares the process-wide fetcher. It creates the media directory when
@@ -112,6 +124,8 @@ func New(cfg *config.Config, d Deps) *Fetcher {
 		f.log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	f.dir = cleanDir(cfg.MediaOut)
+	f.prefix = cfg.LocalPathPrefix()
+	f.secret = newSecret()
 	if f.dir != "" && cfg.SaveEnabled() && cfg.AnySave() {
 		if err := f.openSaveRoot(); err != nil {
 			f.log.Warn("media: the save directory is unusable, 'save' will skip",
@@ -169,15 +183,20 @@ func (f *Fetcher) Close() error {
 // Dir reports where save writes, "" when saving is off.
 func (f *Fetcher) Dir() string { return f.dir }
 
+// Prefix reports the alias a saved file's name carries on its way to the
+// agent: "" means the bare name is used.
+func (f *Fetcher) Prefix() string { return f.prefix }
+
 // Handle is the outcome for one attachment and what the JSON shows: the answer
 // and nothing else. Error details go to the log, not to the wire.
 type Handle struct {
 	Media  string `json:"media"`
 	Reason string `json:"reason,omitempty"`
 	Bytes  int64  `json:"bytes,omitempty"`
-	// Path is where save wrote, relative to the media directory. The poll note
-	// gives the directory itself, so an agent that wants the file reads
-	// "<dir>/<path>" — and that is also the name discord_send takes.
+	// Path is the name we hand the agent for the saved file: the prefix from
+	// --local-path (see Fetcher.Prefix) and the file name. It is written the
+	// way discord_send takes a path, which is the whole point of the prefix —
+	// the agent can send the file back without knowing where it really lives.
 	Path string `json:"local_path,omitempty"`
 	// ContentIndex is this attachment's block position in the tool result's
 	// content array: how a JSON entry and its base64 find each other. The
@@ -262,10 +281,9 @@ func (s *Session) inline(a bus.Attachment) Handle {
 	}
 }
 
-// save writes the file into the media directory. The name is the attachment ID
-// plus a sanitized filename: IDs are unique per attachment, so two pictures
-// both called photo.png do not overwrite each other. The copy is streamed, so
-// saving does not hold the whole file in memory.
+// save writes the file into the media directory under an unguessable name
+// (see saveName). The copy is streamed, so saving does not hold the whole
+// file in memory.
 func (s *Session) save(a bus.Attachment) Handle {
 	if s.f.root == nil {
 		return skip(SkipSaveOff)
@@ -274,7 +292,7 @@ func (s *Session) save(a bus.Attachment) Handle {
 	if !config.Unlimited(s.f.cfg.MediaSaveMaxBytes) && int64(a.Size) > lim {
 		return skip(SkipTooBig)
 	}
-	name := saveName(a)
+	name := saveName(a, s.f.secret)
 	dst := path.Join(s.f.dir, name) // for the log only: writes go through the root
 	resp, err := s.get(a)
 	if err != nil {
@@ -308,7 +326,16 @@ func (s *Session) save(a bus.Attachment) Handle {
 		s.log.Warn("media: save write failed", "path", dst, "err", err.Error())
 		return skip(SkipError)
 	}
-	return Handle{Media: MediaFile, Bytes: written, Path: name}
+	return Handle{Media: MediaFile, Bytes: written, Path: joinPrefix(s.f.prefix, name)}
+}
+
+// joinPrefix puts the declared alias in front of a file name without ever
+// producing a doubled slash, and leaves the bare name when there is no alias.
+func joinPrefix(prefix, name string) string {
+	if prefix == "" {
+		return name
+	}
+	return prefix + "/" + name
 }
 
 // checkCaps runs the inline gates that metadata alone can answer, so we do not
@@ -407,13 +434,34 @@ func readCapped(r io.Reader, n int64) ([]byte, error) {
 	return raw, nil
 }
 
-// saveName builds the on-disk name: <attachment id>-<safe filename>.
-func saveName(a bus.Attachment) string {
+// saveName builds the on-disk name: <8 hex>-<safe filename>.
+//
+// The token is HMAC-shaped — a per-process secret mixed with the attachment ID
+// and the sanitized name — which buys two things at once. It is not guessable
+// from the outside: knowing that a picture was called photo.png does not tell
+// another agent (or the model) which file to open. And it is stable inside one
+// process, so seeing the same attachment twice overwrites the same file
+// instead of leaving a trail of copies behind.
+func saveName(a bus.Attachment, secret []byte) string {
 	base := files.SafeName(a.Filename)
-	if a.ID == "" {
-		return base
+	h := sha256.New()
+	h.Write(secret)
+	h.Write([]byte{0})
+	h.Write([]byte(a.ID))
+	h.Write([]byte{0})
+	h.Write([]byte(base))
+	return hex.EncodeToString(h.Sum(nil)[:4]) + "-" + base
+}
+
+// newSecret draws the bytes behind that token. crypto/rand does not fail in
+// practice; if it ever did we would rather have a weaker name than a dead
+// server, so the fallback is the clock.
+func newSecret() []byte {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return []byte(time.Now().String())
 	}
-	return a.ID + "-" + base
+	return b
 }
 
 // block picks the MCP content constructor for a kind.

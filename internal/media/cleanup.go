@@ -9,7 +9,7 @@ import (
 	"sort"
 	"time"
 
-	"mcpdr/internal/config"
+	"mcp-discord-roleplay/internal/config"
 )
 
 // Report says what a cache sweep did. The numbers are what status and the

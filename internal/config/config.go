@@ -12,6 +12,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -97,10 +98,11 @@ type Config struct {
 	TextMaxRunes int
 
 	// --- inbound media policy -------------------------------------------------
-	Media               map[string]MediaMode // key: image|audio|video|other
-	MediaOut            string               // "" = save disabled; relative = under the cwd
-	MediaKeep           time.Duration
-	MediaMaxMB          int
+	Media      map[string]MediaMode // key: image|audio|video|other
+	MediaOut   string               // "" = save disabled; relative = under the cwd
+	LocalPath  string               // declared prefix for the agent-facing local_path; "" = derive from MediaOut
+	MediaKeep  time.Duration
+	MediaMaxMB int
 	// The inline caps and the save cap share one rule (decided 2026-11-17):
 	// -1 = no limit, 0 = that mode is switched off, anything else = the limit.
 	InlineMaxBytesImage int
@@ -200,6 +202,7 @@ func Load(args []string) (*Config, error) {
 	fs.StringVar(&c.mVideo, "media-video", "skip", "policy for inbound video: inline|save|skip")
 	fs.StringVar(&c.mOther, "media-other", "skip", "policy for any other attachment: inline|save|skip")
 	fs.StringVar(&c.MediaOut, "media-out", DefaultMediaOut, "directory 'save' writes attachments into, relative to the working directory")
+	fs.StringVar(&c.LocalPath, "local-path", "", "prefix we put in front of a saved file's name when we tell the agent about it, e.g. /dc-cache; it declares how the cache looks from inside --file-root (the real --media-out may live anywhere, even behind a bind mount), empty = derive from --media-out")
 	fs.BoolVar(&c.NoMediaOut, "no-media-out", false, "disable the save mode entirely")
 	fs.DurationVar(&c.MediaKeep, "media-keep", 168*time.Hour, "delete saved attachments older than this")
 	fs.IntVar(&c.MediaMaxMB, "media-max-mb", 512, "cap the media cache at this many MiB (LRU by mtime)")
@@ -475,6 +478,9 @@ func (c *Config) finalize() error {
 	if c.MediaFor(KindImage) == MediaSave && c.MediaOut == "" {
 		return fmt.Errorf("media-image=save needs --media-out; pass one or use --no-media-out with media-image=inline")
 	}
+	if err := checkLocalPath(c.LocalPath); err != nil {
+		return err
+	}
 	switch strings.ToLower(c.LogLevel) {
 	case "debug", "info", "warn", "warning", "error":
 	default:
@@ -511,6 +517,56 @@ func (c *Config) AnySave() bool {
 		}
 	}
 	return false
+}
+
+// LocalPathPrefix returns the prefix we put in front of a saved file's name
+// when we tell the agent about it. It is declared, not derived from the
+// filesystem: --media-out may live anywhere the operator chose, including
+// behind a bind mount, and only they know what that directory is called from
+// inside --file-root. Left empty it follows --media-out — a relative one is
+// already a name under the working directory, an absolute one lends its last
+// element, which is the best guess available.
+func (c *Config) LocalPathPrefix() string {
+	p := strings.TrimSpace(filepath.ToSlash(c.LocalPath))
+	if p == "" {
+		p = strings.TrimSpace(filepath.ToSlash(c.MediaOut))
+		if p == "" || p == "." || p == "/" {
+			return ""
+		}
+		if filepath.IsAbs(filepath.FromSlash(p)) {
+			p = "/" + path.Base(p)
+		}
+	}
+	return cleanPrefix(p)
+}
+
+// cleanPrefix tidies a declared prefix: no doubled or trailing slash, and a
+// bare "/" means no prefix at all. A leading slash is kept on purpose — it is
+// the notation discord_send reads as "inside the file root".
+func cleanPrefix(p string) string {
+	p = strings.TrimSuffix(path.Clean(p), "/")
+	if p == "" || p == "." {
+		return ""
+	}
+	return p
+}
+
+// checkLocalPath refuses the two things that stop meaning the same thing once
+// the agent repeats the name back to us: '~', and a '..' that climbs out.
+func checkLocalPath(p string) error {
+	p = strings.TrimSpace(filepath.ToSlash(p))
+	if p == "" {
+		return nil
+	}
+	if strings.HasPrefix(p, "~") {
+		return fmt.Errorf("--local-path must not start with '~', got %q", p)
+	}
+	for _, seg := range strings.Split(p, "/") {
+		if seg == ".." {
+			return fmt.Errorf("--local-path must not contain '..', got %q", p)
+		}
+	}
+	return nil
 }
 
 // CanInline reports whether inlining is switched on at all. Under the "-1 = no
