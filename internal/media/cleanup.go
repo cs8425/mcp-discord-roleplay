@@ -36,7 +36,7 @@ func (r Report) String() string {
 //
 //   - age: anything older than --media-keep goes. --media-keep=0 means the
 //     whole cache is disposable at startup, which is a legitimate thing to ask
-//     for, and a negative value keeps files forever.
+//     for; a NEGATIVE value is the only way to keep files forever.
 //   - total: if what is left is still over --media-max-mb, the oldest files go
 //     until it fits (mtime is the only order we have, and it is the same one
 //     the age rule reads). --media-max-mb <= 0 turns this rule off.
@@ -80,7 +80,10 @@ func Cleanup(cfg *config.Config, log *slog.Logger) (Report, error) {
 	}
 	live := make([]item, 0, len(ents))
 	now := time.Now()
-	expired := cfg.MediaKeep > 0
+	// A duration of 0 means "older than now", i.e. wipe the cache: that is what
+	// an operator asking for --media-keep=0 wants. Only a negative value turns
+	// the age rule off entirely.
+	expired := cfg.MediaKeep >= 0
 	cutoff := now.Add(-cfg.MediaKeep)
 
 	for _, e := range ents {

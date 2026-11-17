@@ -212,7 +212,7 @@ func Load(args []string) (*Config, error) {
 	fs.StringVar(&c.MediaOut, "media-out", DefaultMediaOut, "directory 'save' writes attachments into, relative to the working directory")
 	fs.StringVar(&c.LocalPath, "local-path", "", "prefix we put in front of a saved file's name when we tell the agent about it, e.g. /dc-cache; it declares how the cache looks from inside --file-root (the real --media-out may live anywhere, even behind a bind mount), empty = derive from --media-out")
 	fs.BoolVar(&c.NoMediaOut, "no-media-out", false, "disable the save mode entirely")
-	fs.DurationVar(&c.MediaKeep, "media-keep", 168*time.Hour, "delete saved attachments older than this")
+	fs.DurationVar(&c.MediaKeep, "media-keep", 168*time.Hour, "delete saved attachments older than this at startup (0 wipes the cache, a negative value keeps everything)")
 	fs.IntVar(&c.MediaMaxMB, "media-max-mb", 512, "cap the media cache at this many MiB (LRU by mtime)")
 
 	fs.IntVar(&c.InlineMaxBytesImage, "inline-max-bytes-image", 4<<20, "max raw bytes per inlined image (-1 = no limit, 0 = inline off)")

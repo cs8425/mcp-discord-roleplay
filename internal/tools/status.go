@@ -145,7 +145,7 @@ func (d *Deps) handleStatus(ctx context.Context, call *mcp.Call) (*mcp.ToolResul
 			"poll_default_wait_secs": d.Cfg.PollDefaultWait,
 			"poll_min_wait_secs":     d.Cfg.PollMinWait,
 			"poll_max_wait_secs":     d.Cfg.PollMaxWait,
-			"media":                  mediaSummary(d.Cfg),
+			"media":                  d.mediaSummary(),
 			"file_roots":             d.Cfg.FileRoots,
 			"max_upload_bytes":       d.Cfg.MaxUploadBytes,
 			"max_files_per_msg":      d.Cfg.MaxFilesPerMsg,
@@ -208,17 +208,25 @@ func closed(ch chan struct{}) bool {
 
 // mediaSummary states the inbound attachment policy the way an agent can act on
 // it: one mode per kind, plus the caps that decide whether a given file can be
-// inlined at all. Without this a model has no way to know that the image it was
-// promised arrived as a URL only.
-func mediaSummary(cfg *config.Config) map[string]any {
-	return map[string]any{
-		"image":                  cfg.MediaFor(config.KindImage),
-		"audio":                  cfg.MediaFor(config.KindAudio),
-		"video":                  cfg.MediaFor(config.KindVideo),
-		"other":                  cfg.MediaFor(config.KindOther),
-		"can_inline":             cfg.CanInline(),
-		"save_dir":               cfg.MediaOut,
-		"save_enabled":           cfg.SaveEnabled(),
+// inlined at all, plus where saved files live and under what name the agent is
+// told about them. Without this a model has no way to know that the image it
+// was promised arrived as a URL only.
+func (d *Deps) mediaSummary() map[string]any {
+	cfg := d.Cfg
+	out := map[string]any{
+		"image":        cfg.MediaFor(config.KindImage),
+		"audio":        cfg.MediaFor(config.KindAudio),
+		"video":        cfg.MediaFor(config.KindVideo),
+		"other":        cfg.MediaFor(config.KindOther),
+		"can_inline":   cfg.CanInline(),
+		"save_dir":     cfg.MediaOut,
+		"save_enabled": cfg.SaveEnabled(),
+		// What a saved file is actually allowed to cost, and the prefix its
+		// reported name carries: local_path is the handle the agent gets back,
+		// so a status line naming it is the only way to read a poll's
+		// "mcpdr-media/1a2b3c4d-photo.png" without guessing at the layout.
+		"save_max_bytes":         cfg.MediaSaveMaxBytes,
+		"local_path":             cfg.LocalPathPrefix(),
 		"save_keep":              cfg.MediaKeep.String(),
 		"save_max_mb":            cfg.MediaMaxMB,
 		"inline_max_bytes_image": cfg.InlineMaxBytesImage,
@@ -226,6 +234,22 @@ func mediaSummary(cfg *config.Config) map[string]any {
 		"inline_max_count":       cfg.InlineMaxCount,
 		"inline_max_total_bytes": cfg.InlineMaxTotalBytes,
 	}
+	// The fetcher is the only one who knows whether the cache directory really
+	// opened. save_enabled above is the intent; this is whether 'save' can be
+	// honoured, and the difference is what a "why is everything skip:save_off"
+	// question gets answered from.
+	if d.Media != nil {
+		out["save_ready"] = d.Media.Ready()
+	}
+	if s := d.MediaSweep; s != nil {
+		out["cache_sweep"] = map[string]any{
+			"removed": s.Removed,
+			"bytes":   s.Bytes,
+			"kept":    s.Kept,
+			"skipped": s.Skipped,
+		}
+	}
+	return out
 }
 
 // --- queue views ------------------------------------------------------------

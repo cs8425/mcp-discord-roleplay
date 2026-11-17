@@ -7,12 +7,16 @@ package tools
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -21,6 +25,7 @@ import (
 
 	"mcp-discord-roleplay/internal/bus"
 	"mcp-discord-roleplay/internal/config"
+	"mcp-discord-roleplay/internal/media"
 	"mcp-discord-roleplay/internal/router"
 )
 
@@ -409,8 +414,11 @@ func TestPollOmitsAttachmentsToFit(t *testing.T) {
 	if s, _ := first["url"].(string); !strings.HasPrefix(s, "https://") {
 		t.Errorf("a kept attachment must still carry its url, got %v", first["url"])
 	}
-	if s, _ := first["media"].(string); s != "url_only" {
-		t.Errorf("M2a renders nothing, so media must be url_only, got %q", s)
+	if s, _ := first["media"].(string); s != "url" {
+		t.Errorf("with no fetcher wired up, every attachment is metadata only (media:url), got %q", s)
+	}
+	if _, ok := first["policy"]; ok {
+		t.Errorf("policy is not on the wire: the agent is told what it GOT, not what was configured: %v", first["policy"])
 	}
 }
 
@@ -716,5 +724,160 @@ func TestPollToolSchema(t *testing.T) {
 	}
 	if d := tool.InputSchema.Properties["max_wait"].Description; !strings.Contains(d, "poll-min-wait") {
 		t.Error("max_wait must document where its bounds come from")
+	}
+}
+
+// --- media: the second phase (M2b) -----------------------------------------
+//
+// These are the tests for the wiring, not for the fetcher: the fetcher decides
+// per attachment, the poll handler decides where the bytes go in the answer.
+// The contract being pinned here is that a model reading only the JSON can
+// find the picture it was promised, and that the promise survives the
+// budget-cutter.
+
+// startCDN is the smallest possible Discord CDN: one payload at every path and
+// a counter, so a test can tell "we looked and decided" from "we fetched".
+func startCDN(t *testing.T, body []byte) (string, *atomic.Int64) {
+	t.Helper()
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL, &hits
+}
+
+// firstAttachment digs out the first attachment of the first message.
+func firstAttachment(t *testing.T, out map[string]any) map[string]any {
+	t.Helper()
+	msgs, _ := out["messages"].([]any)
+	if len(msgs) == 0 {
+		t.Fatal("no messages to look at")
+	}
+	list, _ := msgs[0].(map[string]any)["attachments"].([]any)
+	if len(list) == 0 {
+		t.Fatal("no attachments to look at")
+	}
+	return list[0].(map[string]any)
+}
+
+// hasNote reports whether any note contains the text. Notes are prose, so a
+// test wants a fragment, not a whole sentence it would then never update.
+func hasNote(out map[string]any, want string) bool {
+	notes, _ := out["notes"].([]any)
+	for _, n := range notes {
+		if s, ok := n.(string); ok && strings.Contains(s, want) {
+			return true
+		}
+	}
+	return false
+}
+
+// An inline image is not in the JSON: the answer text is content[0] and the
+// picture is content[1], which is what content_index points at.
+func TestPollInlinesImageIntoContentBlocks(t *testing.T) {
+	body := []byte{0x89, 'P', 'N', 'G', 1, 2}
+	url, hits := startCDN(t, body)
+	cfg := routingCfg(t, "-media-image=inline")
+	d := newDeps(t, cfg)
+	d.Media = media.New(cfg, media.Deps{})
+	t.Cleanup(func() { _ = d.Media.Close() })
+
+	e := evMsg("m1", "看這張")
+	e.Attachments = []bus.Attachment{{ID: "a1", Filename: "shot.png", Kind: bus.KindImage,
+		ContentType: "image/png", Size: len(body), URL: url + "/shot.png"}}
+	push(t, d, "default", e)
+
+	res := pollCall(t, d, context.Background(), `{"max_wait":1}`)
+	out := decode(t, res)
+	att := firstAttachment(t, out)
+
+	if att["media"] != "base64" {
+		t.Fatalf("an inlined image must say base64, got %v (reason %v)", att["media"], att["reason"])
+	}
+	if _, ok := att["reason"]; ok {
+		t.Errorf("base64 carries no reason: %v", att["reason"])
+	}
+	if _, ok := att["policy"]; ok {
+		t.Errorf("policy is not on the wire: the answer is what it GOT: %v", att["policy"])
+	}
+	if ci, _ := att["content_index"].(float64); ci != 1 {
+		t.Errorf("content[0] is the JSON answer itself, so the first block is index 1, got %v", att["content_index"])
+	}
+	if len(res.Content) != 2 {
+		t.Fatalf("want [text, image], got %d parts", len(res.Content))
+	}
+	if res.Content[0].Text == "" || res.Content[0].Type != "text" {
+		t.Fatalf("content[0] must stay the JSON answer: %+v", res.Content[0])
+	}
+	if res.Content[1].Type != "image" {
+		t.Errorf("a KindImage must arrive as an image block, got %q", res.Content[1].Type)
+	}
+	if res.Content[1].Data != base64.StdEncoding.EncodeToString(body) {
+		t.Errorf("the block must carry the bytes, got %d chars of base64", len(res.Content[1].Data))
+	}
+	if b, _ := att["bytes"].(float64); int64(b) != int64(len(body)) {
+		t.Errorf("bytes = %v, want %d", att["bytes"], len(body))
+	}
+	if hits.Load() != 1 {
+		t.Errorf("one attachment, one fetch: %d", hits.Load())
+	}
+	// The base64 must not be in the JSON either, or result_bytes would be a
+	// lie and the byte budget would be paying for it twice.
+	if strings.Contains(res.Content[0].Text, base64.StdEncoding.EncodeToString(body)) {
+		t.Error("base64 belongs in the content block, not in the JSON answer")
+	}
+}
+
+// A saved attachment costs the answer nothing but a path, that path must be a
+// file that exists, and the same attachment must not be fetched twice.
+func TestPollSavesAttachmentAndReportsLocalPath(t *testing.T) {
+	dir := t.TempDir()
+	body := []byte("saved, not inlined")
+	url, hits := startCDN(t, body)
+	cfg := routingCfg(t, "-media-image=save", "-media-out="+dir, "-local-path=/dc-cache")
+	d := newDeps(t, cfg)
+	d.Media = media.New(cfg, media.Deps{})
+	t.Cleanup(func() { _ = d.Media.Close() })
+
+	e := evMsg("m1", "")
+	e.Attachments = []bus.Attachment{{ID: "a1", Filename: "shot.png", Kind: bus.KindImage,
+		ContentType: "image/png", Size: len(body), URL: url + "/shot.png"}}
+	push(t, d, "default", e)
+
+	out := pollOK(t, d, `{"max_wait":1}`)
+	att := firstAttachment(t, out)
+	if att["media"] != "file" {
+		t.Fatalf("want media=file, got %v/%v", att["media"], att["reason"])
+	}
+	lp, _ := att["local_path"].(string)
+	if !strings.HasPrefix(lp, "/dc-cache/") {
+		t.Fatalf("local_path must carry the declared prefix: %q", lp)
+	}
+	if _, ok := att["content_index"]; ok {
+		t.Errorf("a saved file has no content block, so no content_index: %v", att["content_index"])
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, filepath.Base(lp)))
+	if err != nil {
+		t.Fatalf("local_path must name a file that exists: %v", err)
+	}
+	if string(raw) != string(body) {
+		t.Errorf("wrong bytes on disk: %q", raw)
+	}
+	if !hasNote(out, "local_path") {
+		t.Errorf("a save must be explained, because the agent has to know the path is readable: %v", out["notes"])
+	}
+
+	// Same attachment again — a second agent, or a requeue: the file is reused,
+	// and the bytes are never fetched a second time in this process.
+	push(t, d, "default", e)
+	out2 := pollOK(t, d, `{"max_wait":1}`)
+	if firstAttachment(t, out2)["media"] != "file" {
+		t.Errorf("the second look must still be a file: %v", firstAttachment(t, out2))
+	}
+	if hits.Load() != 1 {
+		t.Errorf("a saved attachment must not be downloaded twice in one process: %d", hits.Load())
 	}
 }

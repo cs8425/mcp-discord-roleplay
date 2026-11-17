@@ -17,20 +17,23 @@ import (
 	"mcp-discord-roleplay/internal/config"
 	"mcp-discord-roleplay/internal/discord"
 	"mcp-discord-roleplay/internal/files"
+	"mcp-discord-roleplay/internal/media"
 	"mcp-discord-roleplay/internal/router"
 )
 
 // Deps is what a tool handler needs. It is built once in main and shared;
 // every field is safe for concurrent use.
 type Deps struct {
-	Cfg       *config.Config
-	Router    *router.Router
-	Hub       *bus.Hub // one queue per agent; the inbound fan-out target
-	DC        *discord.Client
-	Files     *files.Store  // sandbox for send's file paths; nil-safe, reports files_disabled
-	Stopping  chan struct{} // closed as soon as shutdown begins
-	StartedAt time.Time
-	Version   string
+	Cfg        *config.Config
+	Router     *router.Router
+	Hub        *bus.Hub // one queue per agent; the inbound fan-out target
+	DC         *discord.Client
+	Files      *files.Store   // sandbox for send's file paths; nil-safe, reports files_disabled
+	Media      *media.Fetcher // inbound attachments for poll; nil means poll reports metadata only
+	MediaSweep *media.Report  // what the startup cache sweep did; nil when it did not run
+	Stopping   chan struct{}  // closed as soon as shutdown begins
+	StartedAt  time.Time
+	Version    string
 
 	toolNames []string // filled in by RegisterAll, reported by discord_status
 

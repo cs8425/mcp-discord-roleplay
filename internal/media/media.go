@@ -12,7 +12,7 @@
 //     carries the path.
 //
 // There is deliberately no fallback chain between them. When a policy cannot
-// be honoured the attachment reports media:"skip" plus a machine-readable
+// be honoured the attachment reports media:"url" plus a machine-readable
 // reason, and the URL is still there — losing information quietly is worse
 // than letting the agent decide what a skip meant.
 //
@@ -64,7 +64,8 @@ const (
 	MediaURL    = "url"
 )
 
-// Reasons for media:"skip". Stable strings so an agent can branch on them.
+// Reasons for media:"url" — the answer "we did not hand over any bytes".
+// Stable strings so an agent can branch on them.
 const (
 	SkipPolicy      = "policy"      // the config says skip for this kind
 	SkipUnsupported = "unsupported" // MCP has no block for it, or the mode is capped to zero
@@ -184,26 +185,41 @@ func (f *Fetcher) Close() error {
 // Dir reports where save writes, "" when saving is off.
 func (f *Fetcher) Dir() string { return f.dir }
 
+// Ready reports whether 'save' can actually be honoured: the cache directory is
+// open through its root. Dir() can name a directory we never opened (no kind is
+// set to save, or --media-save-max-bytes turned the mode off), so the status
+// line that answers "why is everything save_off" has to ask this instead.
+func (f *Fetcher) Ready() bool { return f != nil && f.root != nil }
+
 // Prefix reports the alias a saved file's name carries on its way to the
 // agent: "" means the bare name is used.
 func (f *Fetcher) Prefix() string { return f.prefix }
 
-// Handle is the outcome for one attachment and what the JSON shows: the answer
-// and nothing else. Error details go to the log, not to the wire.
+// Handle is the outcome for one attachment: what the agent got and nothing
+// else. Error details go to the log, not to the wire.
+//
+// It carries no JSON tags on purpose: the caller copies these fields into its
+// own wire struct, because the field names and defaults a tool result uses
+// (omitempty everywhere) are the tool's business, not this package's.
 type Handle struct {
-	Media  string `json:"media"`
-	Reason string `json:"reason,omitempty"`
-	Bytes  int64  `json:"bytes,omitempty"`
+	// Media is MediaBase64, MediaFile or MediaURL. MediaURL always comes with a
+	// Reason; the other two never do.
+	Media  string
+	Reason string
+	// Bytes is what was actually fetched or written. The attachment's own
+	// metadata size may disagree (or be 0); both are reported because the
+	// disagreement is information.
+	Bytes int64
 	// Path is the name we hand the agent for the saved file: the prefix from
 	// --local-path (see Fetcher.Prefix) and the file name. It is written the
 	// way discord_send takes a path, which is the whole point of the prefix —
 	// the agent can send the file back without knowing where it really lives.
-	Path string `json:"local_path,omitempty"`
-	// ContentIndex is this attachment's block position in the tool result's
-	// content array: how a JSON entry and its base64 find each other. The
-	// first block is index 0, which omitempty leaves out because that is also
-	// the value for "there is no block".
-	ContentIndex int `json:"content_index,omitempty"`
+	Path string
+	// ContentIndex is this attachment's block position WITHIN THE SESSION, and
+	// -1 when there is no block (file/url answers). The caller has to offset it
+	// to get the real position in the tool result, because that array starts
+	// with the caller's own text block — 0 here is a legitimate first block.
+	ContentIndex int
 }
 
 // Session is one poll's working state: what it has inlined so far and the
@@ -335,7 +351,7 @@ func (s *Session) save(a bus.Attachment) Handle {
 		s.log.Warn("media: save write failed", "path", dst, "err", err.Error())
 		return skip(SkipError)
 	}
-	return Handle{Media: MediaFile, Bytes: written, Path: joinPrefix(s.f.prefix, name)}
+	return Handle{Media: MediaFile, Bytes: written, Path: joinPrefix(s.f.prefix, name), ContentIndex: -1}
 }
 
 // joinPrefix puts the declared alias in front of a file name without ever

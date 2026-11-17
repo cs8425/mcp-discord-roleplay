@@ -19,6 +19,14 @@
 // enough, trailing attachments are counted out (attachments_omitted). Metadata
 // (ids, channel, author, timestamps, urls) is never trimmed — without it the
 // agent could not answer what it just read.
+//
+// Media runs in a second phase, after the drain. Queue.Drain calls the verdict
+// function under the queue's lock, and a download must not hold that lock: the
+// gateway would stop being able to Push. So the budget decides which messages
+// and which attachments this call keeps from metadata alone, and only those are
+// fetched afterwards. Base64 consequently never shows up in result_bytes (it
+// lives in the result's content array, not in this JSON); the room it will take
+// in the model's context is held back by the per-attachment estimate instead.
 package tools
 
 import (
@@ -27,6 +35,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand/v2"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -35,6 +44,7 @@ import (
 
 	"mcp-discord-roleplay/internal/bus"
 	"mcp-discord-roleplay/internal/config"
+	"mcp-discord-roleplay/internal/media"
 	"mcp-discord-roleplay/internal/router"
 )
 
@@ -67,6 +77,8 @@ func pollTool() *mcp.Tool {
 			"reason=cancelled/shutdown means this answer was not delivered. " +
 			"If partial is true, messages are still queued — poll again right away. " +
 			"If dropped is present, messages were overwritten while nobody polled; poll more often. " +
+			"Each attachment reports what it came as: media=base64 means the bytes are appended to this result as a content block (content_index names it), " +
+			"media=file means they were saved and local_path says where, media=url means metadata only and reason says why. " +
 			"This call blocks up to max_wait seconds, so your client's request timeout must be at least that long.",
 		InputSchema: mcp.Schema{
 			Type:        mcp.TypeObject,
@@ -167,11 +179,27 @@ type pollAttachment struct {
 	DurationSecs float64 `json:"duration_secs,omitempty"`
 	URL          string  `json:"url"`
 
-	// Media is the verdict for this call. Until the fetcher lands it is always
-	// url_only, with the configured policy reported next to it so nobody has to
-	// guess: an agent must never believe it saw pixels it did not receive.
+	// Media says what THIS call handed over: media.Base64 (a content block
+	// follows, see ContentIndex), media.File (saved, see Path) or media.URL
+	// (nothing but the link, and Reason says why). It starts as url in the first
+	// phase and is only upgraded by applyMedia, so a value on the wire always
+	// describes bytes the agent really got — never the policy behind them.
 	Media  string `json:"media"`
-	Policy string `json:"policy,omitempty"`
+	Reason string `json:"reason,omitempty"`
+
+	// Bytes is what was fetched or written. Size above is Discord's own claim,
+	// which can be 0 or disagree; both are kept because the gap is useful.
+	Bytes int64 `json:"bytes,omitempty"`
+
+	// Path is the name a saved file can be handed straight back to discord_send
+	// as files[].path — the cache directory's real location is the operator's
+	// business, this string is what makes the round trip work.
+	Path string `json:"local_path,omitempty"`
+
+	// ContentIndex is this attachment's block in the tool result's content
+	// array. Index 0 is the JSON answer itself, so a real block is always >= 1;
+	// omitted when there is no block.
+	ContentIndex int `json:"content_index,omitempty"`
 
 	// est is the room this attachment holds back in the reply budget for the
 	// payload it may grow into (an inline image is not in the JSON, so the JSON
@@ -316,6 +344,23 @@ func (d *Deps) handlePoll(ctx context.Context, call *mcp.Call) (*mcp.ToolResult,
 	}
 	d.notePoll(p.AgentID)
 
+	// Second phase: the queue lock is gone, so this is where the bytes are
+	// fetched. msgs is written through (it IS st.msgsOut), so the JSON built
+	// below carries the verdicts, and the blocks go after it.
+	blocks, mnotes := d.applyMedia(ctx, msgs, st.kept)
+	notes = append(notes, mnotes...)
+
+	// A caller that vanished during the downloads would not read this answer
+	// either, so the messages go back instead of being swallowed. Anything
+	// already saved stays on disk: the next poll reuses it rather than refetching.
+	if ctx.Err() != nil {
+		q.RequeueFront(st.kept)
+		return jsonResult(pollEnvelope(pollMeta{
+			reason: "cancelled", agent: p.AgentID, waitedMS: durMS(time.Since(start)),
+			maxWait: waitS, connected: connected,
+		})), nil
+	}
+
 	var self string
 	if d.DC != nil {
 		snap := d.DC.Snapshot()
@@ -324,13 +369,93 @@ func (d *Deps) handlePoll(ctx context.Context, call *mcp.Call) (*mcp.ToolResult,
 			self = snap.SelfTag
 		}
 	}
-	return jsonResult(pollEnvelope(pollMeta{
+	res := jsonResult(pollEnvelope(pollMeta{
 		reason: "messages", agent: p.AgentID, waitedMS: durMS(time.Since(start)),
 		maxWait: waitS, connected: connected, self: self,
 		count: len(msgs), remaining: remaining, partial: st.stopped,
 		bytes: used, notes: notes, messages: msgs,
 		dropped: queueDropped(q),
-	})), nil
+	}))
+	// The JSON answer occupies content[0]; every media block lands after it, in
+	// the order the messages were read. That is what makes content_index
+	// addressable — and why base64 never counts towards result_bytes.
+	res.Content = append(res.Content, blocks...)
+	return res, nil
+}
+
+// applyMedia is the second half of a poll: it runs the media policy over the
+// attachments this call actually kept and returns the content blocks they grew
+// into, plus notes worth telling the model.
+//
+// kept is the drain's own record of which event produced which message, in the
+// same order, so kept[i].Attachments is where the bytes for
+// msgs[i].Attachments come from. fitMessage may have shortened that list, but
+// only from the tail, so the two line up on a prefix — which is the whole point
+// of splitting poll into two phases: an attachment trimmed out of the budget
+// never costs a download.
+func (d *Deps) applyMedia(ctx context.Context, msgs []pollMessage, kept []*bus.Event) ([]mcp.ContentPart, []string) {
+	if d.Media == nil || len(msgs) == 0 {
+		return nil, nil
+	}
+	sess := d.Media.NewSession(ctx)
+	defer sess.Close()
+
+	var (
+		saved, skipped int
+		reasons        = map[string]int{}
+	)
+	for i := range msgs {
+		if i >= len(kept) {
+			break // defensive: the two are built in lockstep
+		}
+		ev := kept[i]
+		for j := range msgs[i].Attachments {
+			if j >= len(ev.Attachments) {
+				break // ditto: the wire list is a prefix of the event's
+			}
+			before := len(sess.Content())
+			h := sess.Handle(ev.Attachments[j])
+			att := &msgs[i].Attachments[j]
+			att.Media, att.Reason, att.Bytes, att.Path = h.Media, h.Reason, h.Bytes, h.Path
+			switch h.Media {
+			case media.MediaFile:
+				saved++
+			case media.MediaBase64:
+				// The block is the session's `before`-th, and the wire array has
+				// the JSON answer in front of every block, hence the +1. Counting
+				// here instead of trusting Handle.ContentIndex keeps this
+				// function the owner of the result's layout.
+				if len(sess.Content()) > before {
+					att.ContentIndex = before + 1
+				}
+			default:
+				skipped++
+				if h.Reason != "" {
+					reasons[h.Reason]++
+				}
+			}
+		}
+	}
+
+	var notes []string
+	if saved > 0 {
+		notes = append(notes, "有附件存進了媒體快取：local_path 可以直接餵回 discord_send 的 files[].path，"+
+			"同一個附件再 poll 不會重抓")
+	}
+	if skipped > 0 {
+		keys := make([]string, 0, len(reasons))
+		for r := range reasons {
+			keys = append(keys, r)
+		}
+		sort.Strings(keys)
+		parts := make([]string, 0, len(keys))
+		for _, r := range keys {
+			parts = append(parts, r+"×"+strconv.Itoa(reasons[r]))
+		}
+		notes = append(notes, "有 "+strconv.Itoa(skipped)+" 個附件只給了 url（reason："+
+			strings.Join(parts, "、")+"）；檔案還在 Discord 上，url 可以直接貼")
+	}
+	return sess.Content(), notes
 }
 
 // --- filters ---------------------------------------------------------------
@@ -595,17 +720,19 @@ func (d *Deps) buildMessage(p router.Principal, e *bus.Event) pollMessage {
 		m.AgeS = round1(time.Since(e.Ts).Seconds())
 	}
 	for _, a := range e.Attachments {
-		policy := string(d.Cfg.MediaFor(a.Kind))
-		// Hold back room for the payload the fetcher would attach to an inlinable
-		// kind, so a 4-image message cannot sneak past the byte budget.
+		// Hold back room for the payload the fetcher may attach to an inlinable
+		// kind, so a 4-image message cannot sneak past the byte budget. Saved and
+		// skipped attachments only grow by a path or a reason, which is what the
+		// smaller estimate covers.
 		est := estMetaAttachment
-		if policy == string(config.MediaInline) && (a.Kind == bus.KindImage || a.Kind == bus.KindAudio) {
+		if policy := string(d.Cfg.MediaFor(a.Kind)); policy == string(config.MediaInline) &&
+			(a.Kind == bus.KindImage || a.Kind == bus.KindAudio) {
 			est = estInlineAttachment
 		}
 		m.Attachments = append(m.Attachments, pollAttachment{
 			ID: a.ID, Filename: a.Filename, MIME: a.ContentType, Kind: a.Kind,
 			Size: a.Size, Width: a.Width, Height: a.Height, DurationSecs: a.DurationSecs,
-			URL: a.URL, Media: "url_only", Policy: policy, est: est,
+			URL: a.URL, Media: media.MediaURL, est: est,
 		})
 	}
 	return m

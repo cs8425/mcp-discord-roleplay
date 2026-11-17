@@ -108,8 +108,7 @@ type Event struct {
  "mentions_only":{"type":"boolean","description":"true=只回 @我 或直接 DM"},
  "from":{"type":"array","items":{"type":"string"},"description":"作者過濾：user ID 或名稱"},
  "include_self":{"type":"boolean","description":"預設 false（true 會看到自己發的，小心回音循環；會順帶放行 bot）"},
- "ignore_bots":{"type":"boolean","description":"預設 true"},
- "media":{"type":"string","description":"本包附件處理覆蓋：inline | save | skip；省略=依 config。M2a 一律回報 media:\"url_only\"，M2b 才真的抓"}
+ "ignore_bots":{"type":"boolean","description":"預設 true"}
 }}
 ```
 （`mcptransport.Schema` 沒有 min/max/default 欄位 ⇒ 範圍與預設只能寫進 description，並由 handler 驗證。）
@@ -132,7 +131,8 @@ poll(args):
       <-shutdown   : q.RequeueFront(kept); return {reason:"shutdown"}
     }
   }
-  return envelope(msgs, remaining)     // media 依 §5 處理（M2b）
+  return envelope(msgs, remaining)     // 先回文字骨架
+  // 附件在**第二相位**處理（見 §5）：預算裁完才抓，被丟掉的附件一個 request 都不花
 ```
 envelope（`omitempty` 的欄位只在有意義時出現；下面把常見的都列齊）：
 ```json
@@ -143,18 +143,19 @@ envelope（`omitempty` 的欄位只在有意義時出現；下面把常見的都
    "from":{"id":"333","name":"阿明","tag":"ahming#0001","bot":false},
    "ts":"2026-11-16T19:20:31+08:00","age_s":12,"text":"晚安","mentions_self":true,
    "attachments":[{"id":"a1","filename":"night.png","mime":"image/png","kind":"image","size":182341,
-      "width":940,"height":924,"url":"https://cdn.discordapp.com/...","media":"url_only","policy":"image:inline"}],
-   "attachments_total":1,"attachments_omitted":0,"embeds":[{"type":"rich","title":"..."}]}],
+      "width":940,"height":924,"url":"https://cdn.discordapp.com/...","media":"base64","bytes":182341,"content_index":1}],
+   "attachments_total":1,"embeds":[{"type":"rich","title":"..."}]}],
  "result_bytes":14213}
 ```
 - 空結果要極短（**恰好 6 個 key**）：`{"ok":true,"reason":"timeout","waited_ms":44213,"agent":"default","max_wait_applied":45,"connected":true}`
-- `bytes` = messages 陣列計入**預算**的位元組（含附件/embed 估價）；`result_bytes` = 整個回應 JSON 的實際寬度（含 envelope 自身，給 client 排 context 用）
+- `bytes` = messages 陣列計入**預算**的位元組（含附件/embed 估價）；`result_bytes` = 整個回應 JSON 的實際寬度（含 envelope 自身，給 client 排 context 用）。inline 的 base64 在 content block 裡、**不在 JSON 裡** ⇒ 兩個數字都不含它
 - `reason` ∈ `messages|timeout|cancelled|shutdown|error`；**timeout 是 ok:true**
-- **byte 預算**（`--poll-max-bytes`，預設 16 KiB，0=不設限）：只算 messages 陣列的 JSON；每則成本 = 實際位元組 +（inline 附件 1000 / url_only 附件 300 / embed 200 的估價）。裝不下的整則留 queue。單條就超預算 → 先按 **rune 邊界**裁 `text`（標 `text_truncated:true` + `text_full_bytes`），再丟附件（`attachments_omitted`），最後丟 embeds；估價**跟著留下的附件走**（丟掉的不再佔位，否則多圖訊息會一個都列不出來）；裁完還是超 → 不送空殼，整則留著
+- **byte 預算**（`--poll-max-bytes`，預設 16 KiB，0=不設限）：只算 messages 陣列的 JSON；每則成本 = 實際位元組 +（圖 1000 / 其他附件 300 / embed 200 的估價）。裝不下的整則留 queue。單條就超預算 → 先按 **rune 邊界**裁 `text`（標 `text_truncated:true` + `text_full_bytes`），再丟附件（`attachments_omitted`），最後丟 embeds；估價**跟著留下的附件走**（丟掉的不再佔位，否則多圖訊息會一個都列不出來）；裁完還是超 → 不送空殼，整則留著
 - `partial:true` = 因 limit 或預算而斷，**請立刻再 poll**（被 filter 掉而留下的不算 partial，免得模型無限 poll）
 - `dropped` 只在 >0 時出現：那是「沒人 poll 把 queue 擠爆、被覆蓋掉的舊訊息」，要直接告訴模型
 - `target` 標的是**這個 agent 認得的 alias**（`router.AliasForTarget` 在組裝時現算）；沒有 rule 收養它就留內部座標 `channel:<id>`。同一個 Event 在兩條 queue 裡可以標不同名字，所以這個欄位只能長在 `pollMessage` 上
-- inline 時 content = [text(JSON), image|audio...]，JSON 內用 `media:"inline"` + `content_index` 對照；`media:"skipped:too_big"` 等降級原因要寫明（M2b）
+- `attachments_total` = 這條訊息**本來**有幾個附件；`attachments_omitted` 只在預算逼我們丟附件時才出現（omitempty），被丟的那幾個不佔預算、也不在 `attachments` 清單裡
+- **附件在輸出裡只有三種形態**（`policy` 不上線，只告訴模型你**拿到**了什麼）：`media:"base64"` + `content_index`（≥1：`content[0]` 是這段 JSON，圖 block 接在後面）／`media:"file"` + `local_path`（可直接餵 `discord_send` 的 `files[].path`）／`media:"url"` + `reason`（見 §5 詞表）。`bytes` 是我們實際交付的位元組
 
 ---
 
@@ -266,7 +267,7 @@ user 裁示：「直接回 429 rate limit 跟時間讓 LLM 知道，然後 mcp s
 - 對稱性：進（`save` 回 `local_path`）出（`files[].path` 讀 `--file-root`）**都以檔案路徑為介面**，LLM 世界裡沒有 base64。
 
 **inline 尺寸政策（定案值，純成本考量，全部可調）**：
-`--inline-max-bytes-image 4194304`(4 MiB)、`--inline-max-side 1280`（png/jpeg 本地 `x/image/draw` 縮；或先試 Discord media proxy `?width=1280` 省 CPU，實測定案）、`--inline-max-count 4`/包、`--inline-max-total-bytes 12 MiB`/包、超限走降級鏈（inline→save→skip）。
+`--inline-max-bytes-image 4194304`(4 MiB)、`--inline-max-side 1280`（**不縮放**：邊長超過就不內聯，我們不碰像素）、`--inline-max-count 4`/包、`--inline-max-total-bytes 12 MiB`/包、超限**不降級**，由 `reason` 說明是哪一條（見 §5）。
 
 ---
 

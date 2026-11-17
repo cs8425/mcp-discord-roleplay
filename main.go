@@ -27,6 +27,7 @@ import (
 	"mcp-discord-roleplay/internal/config"
 	"mcp-discord-roleplay/internal/discord"
 	"mcp-discord-roleplay/internal/files"
+	"mcp-discord-roleplay/internal/media"
 	"mcp-discord-roleplay/internal/router"
 	"mcp-discord-roleplay/internal/tools"
 	"mcp-discord-roleplay/internal/tz"
@@ -79,6 +80,18 @@ func run(args []string) int {
 	cl := discord.New(cfg, logger, hub, rt)
 	store := files.New(cfg, logger)
 
+	// Inbound attachments: one fetcher for the whole process (it owns the HTTP
+	// client and the open handle on the cache directory), and one sweep of that
+	// cache at startup instead of a background goroutine nobody can see.
+	fetcher := media.New(cfg, media.Deps{Log: logger})
+	defer fetcher.Close()
+	sweep, err := media.Cleanup(cfg, logger)
+	if err != nil {
+		logger.Warn("media cache sweep failed; the cache is simply still full", "err", err)
+	} else if sweep.Removed > 0 || sweep.Skipped > 0 {
+		logger.Info("media cache sweep", "result", sweep.String())
+	}
+
 	if err := cl.Start(ctx); err != nil {
 		logger.Error("discord gateway start failed", "err", err,
 			"hint", "check the token, the privileged Message Content intent, and network reachability")
@@ -91,14 +104,16 @@ func run(args []string) int {
 
 	reg := mcp.NewRegistry("discord_")
 	deps := &tools.Deps{
-		Cfg:       cfg,
-		Router:    rt,
-		Hub:       hub,
-		DC:        cl,
-		Files:     store,
-		Stopping:  shutting,
-		StartedAt: time.Now(),
-		Version:   version,
+		Cfg:        cfg,
+		Router:     rt,
+		Hub:        hub,
+		DC:         cl,
+		Files:      store,
+		Media:      fetcher,
+		MediaSweep: &sweep,
+		Stopping:   shutting,
+		StartedAt:  time.Now(),
+		Version:    version,
 	}
 	if err := tools.RegisterAll(reg, deps); err != nil {
 		logger.Error("tool registration failed", "err", err)
@@ -275,7 +290,16 @@ func selftest(cfg *config.Config, rt *router.Router, logger *slog.Logger) int {
 	if cfg.MediaOut == "" {
 		report(true, "save mode disabled (--no-media-out)")
 	} else {
-		report(true, "media cache: %s (keep %s, max %d MiB; relative = under the cwd)", cfg.MediaOut, cfg.MediaKeep, cfg.MediaMaxMB)
+		report(true, "media cache: %s (keep %s, max %d MiB, %d bytes/attachment; relative = under the cwd)",
+			cfg.MediaOut, cfg.MediaKeep, cfg.MediaMaxMB, cfg.MediaSaveMaxBytes)
+		if p := cfg.LocalPathPrefix(); p != "" {
+			report(true, "local_path: saved files are reported to the agent as %s/<name>, which is what it hands back to discord_send", p)
+			if len(cfg.FileRoots) == 0 {
+				report(false, "save mode is on but there is no --file-root: the agent can be told about a saved file and still be refused when it tries to send it back")
+			}
+		} else {
+			report(false, "neither --local-path nor --media-out yields a prefix: saved files are reported by bare name, so they can only be sent back if the cache sits directly under a --file-root")
+		}
 	}
 	report(true, "inline caps: %d B/image, side<=%d, %d per result, %d B total per result",
 		cfg.InlineMaxBytesImage, cfg.InlineMaxSide, cfg.InlineMaxCount, cfg.InlineMaxTotalBytes)
