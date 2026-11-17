@@ -29,6 +29,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"mime"
 	"net/http"
@@ -294,6 +295,14 @@ func (s *Session) save(a bus.Attachment) Handle {
 	}
 	name := saveName(a, s.f.secret)
 	dst := path.Join(s.f.dir, name) // for the log only: writes go through the root
+
+	// The name is deterministic inside one process, so a second look at the same
+	// attachment finds the file we wrote the first time: hand that back instead of
+	// downloading it again. A zero-length leftover (a crash mid-copy) is not
+	// trusted and gets rewritten.
+	if fi, err := fs.Stat(s.f.root.FS(), name); err == nil && fi.Mode().IsRegular() && fi.Size() > 0 {
+		return Handle{Media: MediaFile, Bytes: fi.Size(), Path: joinPrefix(s.f.prefix, name), ContentIndex: -1}
+	}
 	resp, err := s.get(a)
 	if err != nil {
 		s.log.Warn("media: save fetch failed", "id", a.ID, "err", err.Error())

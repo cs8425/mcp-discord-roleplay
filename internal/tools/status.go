@@ -96,7 +96,7 @@ func (d *Deps) handleStatus(ctx context.Context, call *mcp.Call) (*mcp.ToolResul
 			"self_tag":         snap.SelfTag,
 			"last_error":       snap.LastError,
 			"last_error_age_s": snap.LastErrorAgoS,
-			"intents":          discord.IntentsList(),
+			"intents":          discord.IntentsList(d.Cfg.MessageContentEnabled()),
 		},
 
 		// --- send health ----------------------------------------------------
@@ -306,6 +306,10 @@ func (d *Deps) warnings(snap discord.Snapshot, qs []bus.QueueStat, p router.Prin
 	if snap.SelfID == "" && snap.Started {
 		w = append(w, "the bot identity is still unknown — READY has not arrived yet, so mentions_self cannot be computed")
 	}
+	if !d.Cfg.MessageContentEnabled() {
+		w = append(w, "the Message Content intent is off (--no-message-content): incoming 'text' is always empty, "+
+			"so a poll proves that something arrived, not what was said; mentions, attachments and embeds still work")
+	}
 
 	if d.Router.HasRouting() && d.Router.DeclaresAgent(p.AgentID) {
 		// fine: the caller is named in routing.json
@@ -337,7 +341,7 @@ func (d *Deps) warnings(snap discord.Snapshot, qs []bus.QueueStat, p router.Prin
 			" inbound event(s) had no audience and were discarded; check --allow-*/routing.json")
 	}
 	if !d.Cfg.SaveEnabled() && !d.Cfg.CanInline() {
-		w = append(w, "all inbound media is url_only or skipped: image content will not reach the model")
+		w = append(w, "inbound attachments are all skipped: no file content will reach the model, only url and metadata")
 	}
 	if d.Cfg.DryRun {
 		w = append(w, "dry-run mode: discord_send is not delivering to Discord")

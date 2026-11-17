@@ -22,20 +22,31 @@ import (
 	"mcp-discord-roleplay/internal/tz"
 )
 
-// Intents is the minimal gateway subscription for this server:
-// guild list (so channels resolve), messages in guilds we are in, DMs, and
-// message content. Message Content is a PRIVILEGED intent that must also be
-// switched on in the Discord Developer Portal, otherwise Content is "".
-func Intents() discordgo.Intent {
-	return discordgo.IntentsGuilds |
+// Intents is the minimal gateway subscription for this server: guild list (so
+// channels resolve), messages in guilds we are in, and DMs.
+//
+// withContent adds Message Content, the one PRIVILEGED intent we use. It has to
+// be switched on in the Discord Developer Portal as well; an operator who left
+// it off, or who does not want a privileged intent at all, passes false and
+// then simply never receives message text. Mentions, attachments and embeds are
+// not gated by it and arrive either way.
+func Intents(withContent bool) discordgo.Intent {
+	i := discordgo.IntentsGuilds |
 		discordgo.IntentsGuildMessages |
-		discordgo.IntentsDirectMessages |
-		discordgo.IntentsMessageContent
+		discordgo.IntentsDirectMessages
+	if withContent {
+		i |= discordgo.IntentsMessageContent
+	}
+	return i
 }
 
 // IntentsList is the same thing rendered for humans.
-func IntentsList() []string {
-	return []string{"Guilds", "GuildMessages", "DirectMessages", "MessageContent"}
+func IntentsList(withContent bool) []string {
+	l := []string{"Guilds", "GuildMessages", "DirectMessages"}
+	if withContent {
+		l = append(l, "MessageContent")
+	}
+	return l
 }
 
 // Snapshot is the observable gateway state, handed to discord_status.
@@ -109,7 +120,7 @@ func (c *Client) Start(ctx context.Context) error {
 		// discordgo.New only fails on a malformed token; never echo the token.
 		return fmt.Errorf("discord session: %w", err)
 	}
-	sess.Identify.Intents = Intents()
+	sess.Identify.Intents = Intents(c.cfg.MessageContentEnabled())
 	sess.LogLevel = dgoLogLevel(c.cfg.LogLevel)
 	sess.ShouldReconnectOnError = true
 	// 429 must reach us as an error. With the library's retry switched on, a rate
@@ -154,8 +165,12 @@ func (c *Client) Start(ctx context.Context) error {
 
 	c.log.Info("gateway connecting",
 		"agent", c.cfg.AgentID,
-		"intents", strings.Join(IntentsList(), ","),
+		"intents", strings.Join(IntentsList(c.cfg.MessageContentEnabled()), ","),
 		"token", c.cfg.RedactedToken())
+	if !c.cfg.MessageContentEnabled() {
+		c.log.Warn("message content intent is off: incoming 'text' will be empty, " +
+			"only attachments, embeds and mentions describe what was said")
+	}
 
 	// v0.29.0 keeps the URL of the *connected* socket private (Ready only gained
 	// ResumeGatewayURL in later releases), so ask the public API once, off the

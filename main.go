@@ -199,8 +199,13 @@ func selftest(cfg *config.Config, rt *router.Router, logger *slog.Logger) int {
 	if wd, err := os.Getwd(); err == nil {
 		report(true, "working directory: %s (relative --media-out / --log-file land here)", wd)
 	}
-	report(true, "intents: %s (MessageContent is privileged — enable it in the Developer Portal)",
-		strings.Join(discord.IntentsList(), "|"))
+	if cfg.MessageContentEnabled() {
+		report(true, "intents: %s (MessageContent is privileged — enable it in the Developer Portal)",
+			strings.Join(discord.IntentsList(true), "|"))
+	} else {
+		report(true, "intents: %s (Message Content intent OFF by --no-message-content: incoming text is always empty)",
+			strings.Join(discord.IntentsList(false), "|"))
+	}
 
 	routingLabel := cfg.RoutingFile
 	switch {

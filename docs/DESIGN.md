@@ -91,7 +91,7 @@ type Event struct {
 - 醒來機制 `close(notify); notify = make(chan struct{})`（`sync.Cond` 無法配合 ctx/timer select）；`Push` 非阻塞
 - gateway handler 內只做正規化＋**非阻塞** append，絕不在 handler 呼叫 REST
 - `Drain(want)` 在鎖內跑 filter（`want` 必須是純計算，不得 I/O）；被 filter 掉／超出 limit／超出 byte 預算的，用 `RequeueFront` 原序放回，不丟
-- Intents（MVP）：`IntentsGuilds|IntentsGuildMessages|IntentsDirectMessages|IntentsMessageContent`；Handlers：`MessageCreate/Ready/Disconnected/Resumed`
+- Intents（MVP）：`IntentsGuilds|IntentsGuildMessages|IntentsDirectMessages|IntentsMessageContent`（**Message Content 可用 `--no-message-content` 關掉**，見 §8）；Handlers：`MessageCreate/Ready/Disconnected/Resumed`
 
 ---
 
@@ -235,14 +235,16 @@ user 裁示：「直接回 429 rate limit 跟時間讓 LLM 知道，然後 mcp s
 
 | mode | 行為 | 回給 LLM |
 |---|---|---|
-| `inline` | 下載 → （必要時縮放）→ base64 進 MCP result | 對 attachment 標 `media:"inline"` + `content_index`，另附 `url` |
-| `save` | 下載寫入 `--media-out` 目錄（用 `os.Root` 沙箱；檔名 `<attachmentID>_<sanitizedName>`；已存在就跳過下載） | `media:"saved"` + `local_path`（給 agent 自己的工具讀/送 STT）+ `url` |
-| `skip` | **不下載** | `media:"skip"` + `url`/`proxy_url`/size/mime（要圖再自己抓） |
+| `inline` | 下載 → （必要時縮放）→ base64 進 MCP result | 對 attachment 標 `media:"base64"` + `content_index`，另附 `url` |
+| `save` | 下載寫入 `--media-out` 目錄（全程 `os.Root`；**檔名 `<8 hex>-<safe name>`**，token 由「每 process 亂數 secret ＋ attachment id ＋檔名」哈希而來 ⇒ 外部猜不到、同 process 可重現；**同名檔已存在就直接沿用，不再下載**） | `media:"file"` + `local_path`（=`--local-path` 前綴＋檔名，可直接回喂 `discord_send`）+ `url` |
+| `skip` | **不下載**（零 I/O） | `media:"url"` + `reason` ＋ `url`/`proxy_url`/size/mime（要圖再自己抓） |
 
 **預設（定案）**：`image=inline`、`audio=skip`、`video=skip`、`other=skip`。（音訊依 C3 決定 skip，需要 STT 時你自己改 mode 即可）
-**降級規則**：`inline` 超過 §6 上限 → 自動退 `save`（若 `--media-out` 有開）→ 再退 `skip`，並在 result 標 `media:"skipped:too_big"`（讓模型知道有東西但太大）。
-**dedupe**（M2b）：在 `tools` 層記一個有上限的 attachment id 集合 → 已 inline/save 過的再次出現只給 URL（不寫回 Event，也不寫盤）。
-`save` 的清理：`--media-keep` 天數 + `--media-max-mb` LRU（避免吃滿磁碟）。
+**超過上限怎麼辦（M2a 定案：不降級）**：`inline` 碰到任一上限 → 直接 `skip`，由 `reason` 講清楚是哪一條。不自動退 `save`：降級鏈會讓同一張圖在不同輪的形態飄移，模型無從判斷，而 save 也是要 I/O 的。
+**上限共通規則**：`--inline-max-*` 與 `--media-save-max-bytes` 一律 **`-1`＝不設限、`0`＝該模式停用**，其他值＝上限。
+**能力上限（不是降級）**：MCP 的 content block 只有 `text`/`image`/`audio`/`resource_link`（見 `mcptransport/content.go` 的 encoder），**沒有 video block** ⇒ `--media-video=inline` 得到 `media:"url"`＋`reason:"unsupported"`。
+**`reason` 詞表**（只在 `media:"url"` 出現）：`policy`（設定就是 skip）、`unsupported`（該 kind 沒有 content block）、`too_big`（超過單檔 bytes／save 上限）、`side`（邊長超過 `--inline-max-side`，我們不縮放）、`no_budget`（超過每包 `--inline-max-count`／`--inline-max-total-bytes`）、`save_off`（設定要 save 但 `--media-out` 停用或目錄不可用）、`error`（抓檔／寫盤失敗；細節在 log，不上線）。
+`save` 的清理：開機跑一次 `media.Cleanup`（先 `--media-keep` 天數、再 `--media-max-mb` LRU by mtime），只碰 regular file，子目錄一律跳過。
 
 ---
 
@@ -288,6 +290,8 @@ user 裁示：「直接回 429 rate limit 跟時間讓 LLM 知道，然後 mcp s
 | `--poll-max-bytes` | `16384`（16 KiB；0=不設上限。只算 messages 的 JSON，附件按 §3 估價計入）|
 | `--media-image / --media-audio / --media-video / --media-other` | `inline / skip / skip / skip` |
 | `--media-out` | `mcpdr-media`（**cwd 底下**）；`--no-media-out` 停用 save |
+| `--local-path` | `""`＝由 `--media-out` 推。給 LLM 的 `local_path` 前綴：宣告「`--media-out` 這個目錄在 `--file-root` 眼裡叫什麼」，bind mount 也對得上 |
+| `--media-save-max-bytes` | `4 MiB`（單檔落地上限；`-1` 不設限、`0` 停用 save。Discord 允許到 ~200 MB，超限不降級，直接 `media:"url"`＋`reason:"too_big"`）|
 | `--media-keep / --media-max-mb` | 7 天 / 512 MiB |
 | inline 尺寸政策 | 見 §6（`--inline-max-bytes-image 4MiB` 等）|
 | `--max-arg-base64-bytes` | **不需要**（LLM 不送 base64；見 §6 入口/出口分工）|
@@ -298,6 +302,7 @@ user 裁示：「直接回 429 rate limit 跟時間讓 LLM 知道，然後 mcp s
 | `--file-root`（可重複）/ `--no-file-root` | cwd / off |
 | `--max-upload-bytes / --max-files-per-msg` | 8 MiB / 10 |
 | `--dry-run` | false |
+| `--no-message-content` | false。關掉 **Message Content**（我們唯一的 privileged intent）：gateway 不再要求該 bit，incoming `text` 恆為空，但 `mentions` / `attachments` / `embeds` 不受影響照收（Portal 沒開卻硬要該 bit 會被 4014 踢）|
 | `--log-level / --log-file` | info / stderr（slog；**stdout 只能是 MCP 訊息**） |
 
  **路徑政策**（user 定案）：所有路徑參數（`--media-out` / `--log-file` / `--env-file` / `--config` / `--file-root`）一律**照原樣使用**——絕對路徑，或相對 process cwd。我們**不解析 `~`**（那是 shell 的事）、不查 `$HOME` / `$XDG_CACHE_HOME` / `$TMPDIR`、不把值改寫到別的地方；預設值也都是純檔名，所以沒設定就落在 cwd。唯一例外：`--file-root` 內部走 `filepath.Abs`，因為 chroot containment 要比對一致的目錄字串（這也正是「相對 = cwd」的實作）。附件的 `path` 是另一回事，見 §4.2：在 root 之內，開頭 `/` 等於那個 root。

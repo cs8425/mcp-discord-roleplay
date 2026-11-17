@@ -154,8 +154,9 @@ type Config struct {
 	rawRoots                       []string
 
 	// toggles
-	NoMediaOut bool
-	NoFileRoot bool
+	NoMediaOut       bool
+	NoFileRoot       bool
+	NoMessageContent bool // drop the privileged Message Content intent
 }
 
 // stringList is a repeatable, comma-splitting flag.Value.
@@ -187,6 +188,13 @@ func Load(args []string) (*Config, error) {
 	fs.StringVar(&c.Transport, "transport", "stdio", "transport: stdio (http reserved for a later milestone)")
 	fs.StringVar(&c.HTTPAddr, "http-addr", "127.0.0.1:8787", "reserved: listen address for the future http transport")
 	fs.Var(&origins, "origin", "allowed CORS Origin for http transport (repeatable)")
+
+	// Message Content is the only PRIVILEGED intent this server asks for, so it is
+	// the one that can be dropped: a bot whose portal toggle is off (or whose
+	// operator does not want a privileged intent at all) still gets MESSAGE_CREATE,
+	// just with an empty content. Mentions, attachments and embeds are NOT gated by
+	// this intent, so they keep arriving.
+	fs.BoolVar(&c.NoMessageContent, "no-message-content", false, "do not request the privileged Message Content intent: incoming text will always be empty, only attachments/embeds/mentions describe the message")
 
 	fs.IntVar(&c.PollMinWait, "poll-min-wait", 5, "smallest max_wait (seconds) a poll may request")
 	fs.IntVar(&c.PollMaxWait, "poll-max-wait", 600, "largest max_wait (seconds) a poll may request")
@@ -502,6 +510,11 @@ func (c *Config) MediaFor(kind string) MediaMode {
 	return MediaSkip
 }
 
+// MessageContentEnabled reports whether we ask Discord for the privileged
+// Message Content intent. Off means MESSAGE_CREATE arrives with an empty
+// content: the queue still fills up, but 'text' says nothing.
+func (c *Config) MessageContentEnabled() bool { return !c.NoMessageContent }
+
 // SaveEnabled reports whether the save mode is available.
 func (c *Config) SaveEnabled() bool {
 	return c.MediaOut != "" && !Disabled(c.MediaSaveMaxBytes)
@@ -631,10 +644,11 @@ func (c *Config) RedactedToken() string {
 // Audit is the token-free view handed to the discord_status tool.
 func (c *Config) Audit() map[string]any {
 	return map[string]any{
-		"agent":        c.AgentID,
-		"transport":    c.Transport,
-		"token_source": c.TokenSource,
-		"token":        c.RedactedToken(),
+		"agent":           c.AgentID,
+		"transport":       c.Transport,
+		"message_content": c.MessageContentEnabled(),
+		"token_source":    c.TokenSource,
+		"token":           c.RedactedToken(),
 		"poll": map[string]any{
 			"min_wait_s": c.PollMinWait, "max_wait_s": c.PollMaxWait,
 			"default_wait_s": c.PollDefaultWait, "jitter_pct": c.PollJitterPct,
@@ -646,6 +660,8 @@ func (c *Config) Audit() map[string]any {
 			"image": c.MediaFor(KindImage), "audio": c.MediaFor(KindAudio),
 			"video": c.MediaFor(KindVideo), "other": c.MediaFor(KindOther),
 			"out": c.MediaOut, "keep": c.MediaKeep.String(), "max_mb": c.MediaMaxMB,
+			"local_path":     c.LocalPathPrefix(),
+			"save_max_bytes": c.MediaSaveMaxBytes,
 		},
 		"inline": map[string]any{
 			"max_bytes_image": c.InlineMaxBytesImage, "max_side": c.InlineMaxSide,
