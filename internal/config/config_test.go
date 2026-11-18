@@ -164,8 +164,14 @@ func TestLoadRejectsUnknownRoutingKeys(t *testing.T) {
 }
 
 func TestMediaForAndSaveGuard(t *testing.T) {
-	if _, err := Load([]string{"-selftest", "-no-file-root", "-media-image=save", "-no-media-out", "-media-out="}); err == nil {
-		t.Fatal("media-image=save with no --media-out must fail validation")
+	// The save mode has exactly one switch: --media-save-max-bytes=0. An empty
+	// --media-out without it is a missing path, not another way to say "off".
+	if _, err := Load([]string{"-selftest", "-no-file-root", "-media-out="}); err == nil {
+		t.Fatal("empty --media-out with a live save cap must fail validation")
+	}
+	if _, err := Load([]string{"-selftest", "-no-file-root",
+		"-media-out=", "-media-save-max-bytes=0"}); err != nil {
+		t.Fatalf("empty --media-out plus cap 0 is the documented way off: %v", err)
 	}
 	cfg, err := Load([]string{"-selftest", "-no-file-root", "-media-audio=inline"})
 	if err != nil {
@@ -218,18 +224,28 @@ func TestWrittenPathsStayRelativeToCwd(t *testing.T) {
 		t.Fatalf("media out was rewritten: %q", cfg.MediaOut)
 	}
 
-	// '' and --no-media-out still mean disabled.
-	cfg, err = Load([]string{"-selftest", "-no-media-out"})
+	// cap 0 turns the save mode off; an empty --media-out is legal alongside it
+	// and means the same thing -- nothing gets written either way.
+	cfg, err = Load([]string{"-selftest", "-media-save-max-bytes=0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SaveEnabled() {
+		t.Fatalf("--media-save-max-bytes=0 should disable save, got %q", cfg.MediaOut)
+	}
+	cfg, err = Load([]string{"-selftest", "-media-out=", "-media-save-max-bytes=0"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cfg.MediaOut != "" || cfg.SaveEnabled() {
-		t.Fatalf("--no-media-out should disable save, got %q", cfg.MediaOut)
+		t.Fatalf("empty --media-out plus cap 0 should disable save, got %q", cfg.MediaOut)
 	}
 }
 
-// The poll reply budget: default 16 KiB, 0 means uncapped, and nonsense values
-// are refused at startup rather than silently truncating every answer.
+// The poll reply budget: default 16 KiB, -1 means uncapped, and 0 is refused --
+// it used to be a second way to say "uncapped" while every other byte flag reads
+// 0 as "this mode is off", which is exactly the kind of ambiguity an operator
+// types wrong. How small or large a real budget is stays their business.
 func TestPollMaxBytes(t *testing.T) {
 	cfg, err := Load([]string{"-selftest"})
 	if err != nil {
@@ -245,17 +261,21 @@ func TestPollMaxBytes(t *testing.T) {
 	if cfg.PollMaxBytes != 40000 {
 		t.Fatalf("budget not applied: %d", cfg.PollMaxBytes)
 	}
-	cfg, err = Load([]string{"-selftest", "-poll-max-bytes=0"})
+	cfg, err = Load([]string{"-selftest", "-poll-max-bytes=-1"})
 	if err != nil {
-		t.Fatalf("0 must mean uncapped and load, got %v", err)
+		t.Fatalf("-1 must mean uncapped and load, got %v", err)
 	}
-	if cfg.PollMaxBytes != 0 {
-		t.Fatalf("0 lost: %d", cfg.PollMaxBytes)
+	if !Unlimited(cfg.PollMaxBytes) {
+		t.Fatalf("-1 lost: %d", cfg.PollMaxBytes)
 	}
-	for _, bad := range []string{"100", "2000000"} {
-		if _, err := Load([]string{"-selftest", "-poll-max-bytes=" + bad}); err == nil {
-			t.Fatalf("--poll-max-bytes=%s should be rejected", bad)
-		}
+	if _, err := Load([]string{"-selftest", "-poll-max-bytes=100"}); err != nil {
+		t.Fatalf("a small budget is silly but legal, and must load: %v", err)
+	}
+	if _, err := Load([]string{"-selftest", "-poll-max-bytes=0"}); err == nil {
+		t.Fatal("--poll-max-bytes=0 must be refused: use -1 for no cap")
+	}
+	if _, err := Load([]string{"-selftest", "-poll-max-bytes=one"}); err == nil {
+		t.Fatal("a non-numeric budget must be rejected")
 	}
 	t.Setenv("MCPDR_POLL_MAX_BYTES", "20000")
 	cfg, err = Load([]string{"-selftest", "-env-file=/nonexistent"})

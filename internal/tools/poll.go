@@ -635,7 +635,7 @@ func (f *pollFilter) keep(e *bus.Event) bool {
 // drainState carries one Drain attempt's budget accounting.
 type drainState struct {
 	limit  int
-	budget int // bytes, 0 = uncapped
+	budget int // bytes, -1 = uncapped (config rejects 0, so there is only one sentinel)
 	used   int
 	count  int
 	notes  []string
@@ -670,7 +670,7 @@ func (st *drainState) want(d *Deps, p router.Principal, f *pollFilter) func(*bus
 		}
 		m := d.buildMessage(p, e)
 		cost := messageCost(m)
-		if st.budget > 0 && st.used+cost > st.budget {
+		if !config.Unlimited(st.budget) && st.used+cost > st.budget {
 			if st.count > 0 {
 				st.stopped = true
 				st.noteBudgetFull()

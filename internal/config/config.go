@@ -95,7 +95,7 @@ type Config struct {
 
 	// --- bus / state ----------------------------------------------------------
 	BusCapacity  int
-	PollMaxBytes int // reply budget for one discord_poll call; 0 = unlimited
+	PollMaxBytes int // reply budget for one discord_poll call; -1 = unlimited (0 is a rejected typo)
 	TextMaxRunes int
 
 	// --- inbound media policy -------------------------------------------------
@@ -161,7 +161,6 @@ type Config struct {
 	rawRoots                       []string
 
 	// toggles
-	NoMediaOut       bool
 	NoFileRoot       bool
 	NoMessageContent bool // drop the privileged Message Content intent
 }
@@ -210,16 +209,15 @@ func Load(args []string) (*Config, error) {
 	fs.IntVar(&c.PollJitterPct, "poll-jitter-pct", 15, "percent jitter added to the poll deadline only")
 
 	fs.IntVar(&c.BusCapacity, "bus-capacity", 2000, "per-agent in-memory queue size (messages); the oldest is dropped when full")
-	fs.IntVar(&c.PollMaxBytes, "poll-max-bytes", DefaultPollMaxBytes, "largest reply discord_poll builds (bytes); 0 removes the cap")
+	fs.IntVar(&c.PollMaxBytes, "poll-max-bytes", DefaultPollMaxBytes, "largest reply discord_poll builds (bytes); -1 removes the cap")
 	fs.IntVar(&c.TextMaxRunes, "text-max-runes", 4000, "truncate stored message text beyond this many runes")
 
 	fs.StringVar(&c.mImage, "media-image", "inline", "policy for inbound images: inline|save|skip")
 	fs.StringVar(&c.mAudio, "media-audio", "skip", "policy for inbound audio (skip = never burn tokens on voice)")
 	fs.StringVar(&c.mVideo, "media-video", "skip", "policy for inbound video: inline|save|skip")
 	fs.StringVar(&c.mOther, "media-other", "skip", "policy for any other attachment: inline|save|skip")
-	fs.StringVar(&c.MediaOut, "media-out", DefaultMediaOut, "directory 'save' writes attachments into, relative to the working directory")
+	fs.StringVar(&c.MediaOut, "media-out", DefaultMediaOut, "directory 'save' writes attachments into, relative to the working directory; empty is only allowed together with --media-save-max-bytes=0")
 	fs.StringVar(&c.LocalPath, "local-path", "", "prefix we put in front of a saved file's name when we tell the agent about it, e.g. /dc-cache; it declares how the cache looks from inside --file-root (the real --media-out may live anywhere, even behind a bind mount), empty = derive from --media-out")
-	fs.BoolVar(&c.NoMediaOut, "no-media-out", false, "disable the save mode entirely")
 	fs.DurationVar(&c.MediaKeep, "media-keep", 168*time.Hour, "delete saved attachments older than this at startup (0 wipes the cache, a negative value keeps everything)")
 	fs.IntVar(&c.MediaMaxMB, "media-max-mb", 512, "cap the media cache at this many MiB (LRU by mtime)")
 
@@ -323,7 +321,7 @@ func flagSet(fs *flag.FlagSet, name string) bool {
 	return found
 }
 
-// NoMediaOut / NoFileRoot live in the Config struct above.
+// NoFileRoot lives in the Config struct above.
 
 // applyEnv lets every flag be set through MCPDR_<FLAG_NAME_IN_CAPS>. Values
 // already given on the command line are never overwritten.
@@ -394,9 +392,6 @@ func (c *Config) finalize() error {
 	// (--config, --env-file) are likewise used as typed; only --file-root goes
 	// through filepath.Abs, for the chroot containment checks.
 	c.MediaOut = strings.TrimSpace(c.MediaOut)
-	if c.NoMediaOut {
-		c.MediaOut = ""
-	}
 	c.FileRoots, err = resolveRoots(c.rawRoots, c.NoFileRoot)
 	if err != nil {
 		return err
@@ -456,8 +451,12 @@ func (c *Config) finalize() error {
 	if c.BusCapacity < 10 {
 		return fmt.Errorf("--bus-capacity must be >= 10, got %d", c.BusCapacity)
 	}
-	if c.PollMaxBytes != 0 && c.PollMaxBytes != -1 && (c.PollMaxBytes < 4096 || c.PollMaxBytes > 1<<20) {
-		return fmt.Errorf("--poll-max-bytes must be -1 or 0 (no cap) or within [4096,1048576], got %d", c.PollMaxBytes)
+	if c.PollMaxBytes == 0 {
+		// There used to be two sentinels here (0 and -1 both meant "no cap"),
+		// while every other byte flag treats 0 as "this mode is off". A poll
+		// budget has no off state, so 0 was only ever a typo -- refuse it and
+		// leave -1 as the one way to say "uncapped".
+		return fmt.Errorf("--poll-max-bytes cannot be 0: use -1 for no cap, or a number of bytes")
 	}
 	if c.TextMaxRunes < 200 {
 		return fmt.Errorf("--text-max-runes must be >= 200, got %d", c.TextMaxRunes)
@@ -495,8 +494,10 @@ func (c *Config) finalize() error {
 	if err := checkGate("--media-save-max-bytes", c.MediaSaveMaxBytes); err != nil {
 		return err
 	}
-	if c.MediaFor(KindImage) == MediaSave && c.MediaOut == "" {
-		return fmt.Errorf("media-image=save needs --media-out; pass one or use --no-media-out with media-image=inline")
+	if c.MediaOut == "" && !Disabled(c.MediaSaveMaxBytes) {
+		// --media-save-max-bytes=0 is the one switch that turns the save mode off;
+		// an empty --media-out without it means the operator forgot a path.
+		return fmt.Errorf("--media-out is empty but --media-save-max-bytes is %d: give the save mode a directory, or set --media-save-max-bytes=0 to turn it off", c.MediaSaveMaxBytes)
 	}
 	if err := checkLocalPath(c.LocalPath); err != nil {
 		return err
@@ -592,7 +593,9 @@ func (c *Config) MediaFor(kind string) MediaMode {
 // content: the queue still fills up, but 'text' says nothing.
 func (c *Config) MessageContentEnabled() bool { return !c.NoMessageContent }
 
-// SaveEnabled reports whether the save mode is available.
+// SaveEnabled reports whether the save mode is available. --media-save-max-bytes=0
+// is the switch that turns it off; an empty --media-out can only mean the same
+// thing, because validate refuses a non-zero cap without a directory.
 func (c *Config) SaveEnabled() bool {
 	return c.MediaOut != "" && !Disabled(c.MediaSaveMaxBytes)
 }

@@ -299,8 +299,15 @@ func selftest(cfg *config.Config, rt *router.Router, logger *slog.Logger) int {
 	report(true, "inbound media: image=%s audio=%s video=%s other=%s",
 		cfg.MediaFor(config.KindImage), cfg.MediaFor(config.KindAudio),
 		cfg.MediaFor(config.KindVideo), cfg.MediaFor(config.KindOther))
-	if cfg.MediaOut == "" {
-		report(true, "save mode disabled (--no-media-out)")
+	if !cfg.SaveEnabled() {
+		// --media-save-max-bytes=0 is the one switch that turns saving off (and it
+		// is the only thing that licenses an empty --media-out), so say whether a
+		// directory is merely idling.
+		if cfg.MediaOut == "" {
+			report(true, "save mode off (--media-save-max-bytes=0): no cache directory configured")
+		} else {
+			report(true, "save mode off (--media-save-max-bytes=0): %s is configured but nothing will be written", cfg.MediaOut)
+		}
 	} else {
 		report(true, "media cache: %s (keep %s, max %d MiB, %d bytes/attachment; relative = under the cwd)",
 			cfg.MediaOut, cfg.MediaKeep, cfg.MediaMaxMB, cfg.MediaSaveMaxBytes)
@@ -329,7 +336,7 @@ func selftest(cfg *config.Config, rt *router.Router, logger *slog.Logger) int {
 			fmt.Fprintf(out, "  queue %s\n", a)
 		}
 	}
-	if cfg.PollMaxBytes == 0 {
+	if config.Unlimited(cfg.PollMaxBytes) {
 		report(false, "poll reply budget is uncapped: one poll can hand back the whole queue in one answer")
 	} else {
 		report(true, "poll reply budget: %d bytes per discord_poll answer; the rest stays queued for the next call",

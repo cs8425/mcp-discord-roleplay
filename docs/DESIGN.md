@@ -150,7 +150,7 @@ envelope（`omitempty` 的欄位只在有意義時出現；下面把常見的都
 - **空結果恰好 2 個 key**：`{"ok":true,"reason":"timeout"}`（quiet server 是常態，而每一個 byte 都會進模型的 context）
 - 預算算的是**上面這個 wire 結構**的 JSON，不是工作結構：`messageCost` 量 `m.wire()` ＋（圖 1000 / 其他附件 300 / embed 200 的估價）。inline 的 base64 在 content block 裡、**不在這段 JSON 裡** ⇒ 不佔預算（舊版那個 `result_bytes` 固定點迴圈就是為了湊一個實際上沒人在用的數字，已整段拿掉）
 - `reason` ∈ `messages|timeout|disconnected|cancelled|shutdown`；**timeout 是 ok:true**。沒有訊息且 gateway 不在聽時，`timeout` 會被改寫成 `disconnected`（對一條死線路說「沒人說話」是誤導）；`cancelled`/`shutdown` 保留自己的字，它們講的是「這一問其實沒送到你手上」
-- **byte 預算**（`--poll-max-bytes`，預設 16 KiB，0=不設限）：只算 messages 陣列的 JSON；每則成本 = 實際位元組 +（圖 1000 / 其他附件 300 / embed 200 的估價）。裝不下的整則留 queue。單條就超預算 → 先按 **rune 邊界**裁 `text`（標 `text_truncated:true`，原本的位元組數寫進 `notes`），再丟附件（少了幾個也寫進 `notes`），最後丟 embeds；估價**跟著留下的附件走**（丟掉的不再佔位，否則多圖訊息會一個都列不出來）；裁完還是超 → 不送空殼，整則留著
+- **byte 預算**（`--poll-max-bytes`，預設 16 KiB，`-1`＝不設限、`0` 報錯）：只算 messages 陣列的 JSON；每則成本 = 實際位元組 +（圖 1000 / 其他附件 300 / embed 200 的估價）。裝不下的整則留 queue。單條就超預算 → 先按 **rune 邊界**裁 `text`（標 `text_truncated:true`，原本的位元組數寫進 `notes`），再丟附件（少了幾個也寫進 `notes`），最後丟 embeds；估價**跟著留下的附件走**（丟掉的不再佔位，否則多圖訊息會一個都列不出來）；裁完還是超 → 不送空殼，整則留著
 - `remaining`（**只在 >0 時出現**）＝ 佇列裡還有幾則 ⇒ **請立刻再 poll**；被 filter 掉而留下的不計在內，免得模型無限 poll。（舊版另有一個 `partial:true` 布林，語意跟這個數字重複，已刪；它進 log）
 - `dropped` 只在 >0 時出現：那是「沒人 poll 把 queue 擠爆、被覆蓋掉的舊訊息」，要直接告訴模型
 - `target` 標的是**這個 agent 認得的 alias**（`router.AliasForTarget` 在組裝時現算）；沒有 rule 收養它就留座標——DM 標 `dm:<peer>`（能直接回話的形式），其餘 `channel:<id>`。wildcard rule 的 alias（`dm:*` 的 `dms`）**不是地址**，所以也不拿去當前綴。同一個 Event 在兩條 queue 裡可以標不同名字，所以這個欄位只能長在 `pollMessage` 上
@@ -245,9 +245,9 @@ user 裁示：「直接回 429 rate limit 跟時間讓 LLM 知道，然後 mcp s
 
 **預設（定案）**：`image=inline`、`audio=skip`、`video=skip`、`other=skip`。（音訊依 C3 決定 skip，需要 STT 時你自己改 mode 即可）
 **超過上限怎麼辦（M2a 定案：不降級）**：`inline` 碰到任一上限 → 直接 `skip`，由 `reason` 講清楚是哪一條。不自動退 `save`：降級鏈會讓同一張圖在不同輪的形態飄移，模型無從判斷，而 save 也是要 I/O 的。
-**上限共通規則**：`--inline-max-*` 與 `--media-save-max-bytes` 一律 **`-1`＝不設限、`0`＝該模式停用**，其他值＝上限。
+**上限共通規則**：`--inline-max-*` 與 `--media-save-max-bytes` 一律 **`-1`＝不設限、`0`＝該模式停用**，其他值＝上限。`--poll-max-bytes` 只有 `-1`＝不設限這半邊，**`0` 直接報錯**（reply 預算沒有「停用」這狀態；舊版讓 0 也等於不設限，是同義字造成兩個 sentinel，已收斂）。
 **能力上限（不是降級）**：MCP 的 content block 只有 `text`/`image`/`audio`/`resource_link`（見 `mcptransport/content.go` 的 encoder），**沒有 video block** ⇒ `--media-video=inline` 得到 `media:"url"`＋`reason:"unsupported"`。
-**`reason` 詞表**（只在 `media:"url"` 出現）：`policy`（設定就是 skip）、`unsupported`（該 kind 沒有 content block）、`too_big`（超過單檔 bytes／save 上限）、`side`（邊長超過 `--inline-max-side`，我們不縮放）、`no_budget`（超過每包 `--inline-max-count`／`--inline-max-total-bytes`）、`save_off`（設定要 save 但 `--media-out` 停用或目錄不可用）、`error`（抓檔／寫盤失敗；細節在 log，不上線）。
+**`reason` 詞表**（只在 `media:"url"` 出現）：`policy`（設定就是 skip）、`unsupported`（該 kind 沒有 content block）、`too_big`（超過單檔 bytes／save 上限）、`side`（邊長超過 `--inline-max-side`，我們不縮放）、`no_budget`（超過每包 `--inline-max-count`／`--inline-max-total-bytes`）、`save_off`（設定要 save 但 save 已被 `--media-save-max-bytes=0` 停用，或目錄開不起來）、`error`（抓檔／寫盤失敗；細節在 log，不上線）。
 `save` 的清理：開機跑一次 `media.Cleanup`（先 `--media-keep` 天數、再 `--media-max-mb` LRU by mtime），只碰 regular file，子目錄一律跳過。
 **timeout 的擁有權在讀端**（live smoke 抓出來的坑）：每檔 15s 由 `Session.fetchCtx()` 建立，`get`/`open` 只收 ctx、**自己不 `defer cancel()`**；cancel 跟著 `inline()`/`save()` 直到 body 讀完。原因是 net/http 把 response body 綁在發 request 那個 ctx 上，headers 一到就 cancel 會讓之後的 `Read()` 直接拿到 `context canceled`——本機 httptest 的 8 byte payload 連 header 同段進 buffer，所以單測摸不到，真 CDN 82 KB + TLS 第一個 chunk 就紅。
 
@@ -293,11 +293,11 @@ user 裁示：「直接回 429 rate limit 跟時間讓 LLM 知道，然後 mcp s
 | `--transport` | `stdio`（`--http-addr` 127.0.0.1:8787、`--origin`、未來 `--auth` per-agent token） |
 | `--poll-min-wait / --poll-max-wait / --poll-default-wait / --poll-jitter-pct` | 5 / 600 / 45 / 15 |
 | `--bus-capacity` | 2000（**每個 agent 各一條**）|
-| `--poll-max-bytes` | `16384`（16 KiB；0=不設上限。只算 messages 的 JSON，附件按 §3 估價計入）|
+| `--poll-max-bytes` | `16384`（16 KiB；`-1`＝不設上限，**`0` 報錯**；數字不做範圍管制，太小是自己找的。只算 messages 的 JSON，附件按 §3 估價計入）|
 | `--media-image / --media-audio / --media-video / --media-other` | `inline / skip / skip / skip` |
-| `--media-out` | `mcpdr-media`（**cwd 底下**）；`--no-media-out` 停用 save |
+| `--media-out` | `mcpdr-media`（**cwd 底下**）；留空只允許搭 `--media-save-max-bytes=0`，否則啟動報錯（忘記給路徑）|
 | `--local-path` | `""`＝由 `--media-out` 推。給 LLM 的 `local_path` 前綴：宣告「`--media-out` 這個目錄在 `--file-root` 眼裡叫什麼」，bind mount 也對得上 |
-| `--media-save-max-bytes` | `4 MiB`（單檔落地上限；`-1` 不設限、`0` 停用 save。Discord 允許到 ~200 MB，超限不降級，直接 `media:"url"`＋`reason:"too_big"`）|
+| `--media-save-max-bytes` | `4 MiB`（單檔落地上限；`-1` 不設限、**`0` 是關閉 save 的唯一開關**（`--no-media-out` 已刪）。Discord 允許到 ~200 MB，超限不降級，直接 `media:"url"`＋`reason:"too_big"`）|
 | `--media-keep / --media-max-mb` | 7 天 / 512 MiB |
 | inline 尺寸政策 | 見 §6（`--inline-max-bytes-image 4MiB` 等）|
 | `--max-arg-base64-bytes` | **不需要**（LLM 不送 base64；見 §6 入口/出口分工）|

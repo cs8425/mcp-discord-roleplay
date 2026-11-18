@@ -412,9 +412,9 @@ func TestPollTrimsOversizedMessage(t *testing.T) {
 	}
 }
 
-// Uncapped means uncapped: a 0 budget never cuts.
-func TestPollBudgetZeroIsUncapped(t *testing.T) {
-	d := newDeps(t, routingCfg(t, "-poll-max-bytes=0"))
+// Uncapped means uncapped: a -1 budget never cuts.
+func TestPollBudgetMinusOneIsUncapped(t *testing.T) {
+	d := newDeps(t, routingCfg(t, "-poll-max-bytes=-1"))
 	push(t, d, "default", evMsg("m1", strings.Repeat("y", 30000)))
 	out := pollOK(t, d, `{"max_wait":1}`)
 	if _, bad := out["remaining"]; bad {
