@@ -1,8 +1,10 @@
 package tools
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -99,6 +101,30 @@ func decode(t *testing.T, res *mcp.ToolResult) map[string]any {
 	return out
 }
 
+// withDebugLog installs a debug logger on d and hands back what it caught. The
+// wire answer now says only what the model needs to act on; everything else a
+// send decided (which alias, which channel, which ids, when) is written here,
+// so a test that cares about the resolution reads the log the way an operator
+// would -- and the log itself stops being code nobody ever exercises.
+func withDebugLog(t *testing.T, d *Deps) *bytes.Buffer {
+	t.Helper()
+	buf := &bytes.Buffer{}
+	d.Log = slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	return buf
+}
+
+// sentTo asserts that the debug line for the send(s) since the buffer was
+// installed carries each of these facts.
+func sentTo(t *testing.T, buf *bytes.Buffer, want ...string) {
+	t.Helper()
+	line := buf.String()
+	for _, w := range want {
+		if !strings.Contains(line, w) {
+			t.Errorf("the send log must say %q, got: %s", w, line)
+		}
+	}
+}
+
 func sendOK(t *testing.T, d *Deps, args string) map[string]any {
 	t.Helper()
 	res := call(t, d, context.Background(), args)
@@ -162,25 +188,21 @@ func wantCode(t *testing.T, out map[string]any, want string) {
 
 func TestSendDryRunEnvelope(t *testing.T) {
 	d := newDeps(t, routingCfg(t))
+	buf := withDebugLog(t, d)
 	out := sendOK(t, d, `{"to":"boss","text":"hello world"}`)
-	wantStr(t, out, "target", "boss")
-	wantStr(t, out, "kind", "channel")
-	wantStr(t, out, "channel_id", "111222333444555666")
-	wantNum(t, out, "parts_sent", 1)
 	if out["dry_run"] != true {
 		t.Error("dry-run must say so, or the model will believe it posted")
 	}
-	ids, ok := out["message_ids"].([]any)
-	if !ok || len(ids) != 1 || ids[0] != discord.DryRunMessageID {
-		t.Errorf("message_ids = %v", out["message_ids"])
+	// One part, no attachments: the whole answer is that it worked, that this was
+	// a rehearsal, and the warning that says what a rehearsal means. A fourth key
+	// has to be argued for here.
+	if got := keySet(out); got != "dry_run,ok,warnings" {
+		t.Errorf("a plain dry-run send costs the model three keys, got %v", out)
 	}
-	wantStr(t, out, "last_message_id", discord.DryRunMessageID)
-	if s, _ := out["created_at"].(string); s == "" {
-		t.Error("created_at should be the timestamp of the (rehearsed) message")
-	}
-	if _, bad := out["attachments"]; bad {
-		t.Error("no attachments, no attachments key")
-	}
+	// Everything else is still decided and still recorded, only not on the wire:
+	// which alias resolved to which channel, and what Discord called the message.
+	sentTo(t, buf, "target=boss", "kind=channel", "channel_id=111222333444555666",
+		"message_ids=[dry-run]", "delivered=111222333444555666")
 }
 
 func TestSendByEveryTargetForm(t *testing.T) {
@@ -201,11 +223,13 @@ func TestSendByEveryTargetForm(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.to, func(t *testing.T) {
+			buf := withDebugLog(t, d)
 			out := sendOK(t, d, `{"to":`+jsonString(tc.to)+`,"text":"hi"}`)
-			wantStr(t, out, "target", tc.alias)
-			wantStr(t, out, "kind", tc.kind)
-			wantStr(t, out, "channel_id", tc.ch)
-			wantStr(t, out, "delivered_channel_id", tc.ch)
+			if out["ok"] != true {
+				t.Fatalf("out = %v", out)
+			}
+			sentTo(t, buf, "target="+tc.alias, "kind="+tc.kind,
+				"channel_id="+tc.ch, "delivered="+tc.ch)
 		})
 	}
 }
@@ -214,9 +238,12 @@ func TestSendByEveryTargetForm(t *testing.T) {
 // --allow-channels: that is the "run it against one server, name nothing" setup.
 func TestAdHocBareSnowflake(t *testing.T) {
 	d := newDeps(t, toolCfg(t))
+	buf := withDebugLog(t, d)
 	out := sendOK(t, d, `{"to":"444555666777888999","text":"hi"}`)
-	wantStr(t, out, "channel_id", "444555666777888999")
-	wantStr(t, out, "kind", "channel")
+	if out["ok"] != true {
+		t.Fatalf("out = %v", out)
+	}
+	sentTo(t, buf, "channel_id=444555666777888999", "kind=channel")
 }
 
 func TestAdHocUserNeedsAllowDM(t *testing.T) {
@@ -325,12 +352,12 @@ func TestLastTargetRoundTripAndIsolation(t *testing.T) {
 		t.Error("no_last_target should offer the aliases it could use instead")
 	}
 
-	if o := sendOK(t, d, `{"to":"dm:ami","text":"first"}`); o["target"] != "dm:ami" {
+	if o := sendOK(t, d, `{"to":"dm:ami","text":"first"}`); o["ok"] != true {
 		t.Fatalf("setup send failed: %v", o)
 	}
-	out2 := sendOK(t, d, `{"to":"LAST","text":"follow-up"}`)
-	wantStr(t, out2, "target", "dm:ami")
-	wantStr(t, out2, "channel_id", "dry-run-dm:222333444555666777")
+	buf := withDebugLog(t, d)
+	sendOK(t, d, `{"to":"LAST","text":"follow-up"}`)
+	sentTo(t, buf, "target=dm:ami", "channel_id=dry-run-dm:222333444555666777")
 
 	// A different agent on the same process must not inherit it.
 	ctx := router.WithPrincipal(context.Background(), router.Principal{AgentID: "solo"})
@@ -345,13 +372,15 @@ func TestLastTargetRoundTripAndIsolation(t *testing.T) {
 	if o := decode(t, call(t, d, soloCtx, `{"to":"boss","text":"hi"}`)); o["ok"] != true {
 		t.Fatalf("solo send failed: %v", o)
 	}
-	if o := decode(t, call(t, d, soloCtx, `{"to":"last","text":"again"}`)); o["target"] != "boss" {
-		t.Errorf("solo 'last' = %v, want boss", o["target"])
+	buf = withDebugLog(t, d)
+	if o := decode(t, call(t, d, soloCtx, `{"to":"last","text":"again"}`)); o["ok"] != true {
+		t.Fatalf("solo 'last' send failed: %v", o)
 	}
+	sentTo(t, buf, "target=boss")
 	// The default agent still points at its own conversation.
-	if o := sendOK(t, d, `{"to":"last","text":"mine"}`); o["target"] != "dm:ami" {
-		t.Errorf("default 'last' = %v, want dm:ami", o["target"])
-	}
+	buf = withDebugLog(t, d)
+	sendOK(t, d, `{"to":"last","text":"mine"}`)
+	sentTo(t, buf, "target=dm:ami")
 }
 
 func TestLastSurvivesTargetRemoval(t *testing.T) {
@@ -368,7 +397,7 @@ func TestLastSurvivesTargetRemoval(t *testing.T) {
 		t.Fatal(err)
 	}
 	d := newDeps(t, toolCfg(t, "-config="+path))
-	if o := sendOK(t, d, `{"to":"log","text":"while allowed"}`); o["target"] != "log" {
+	if o := sendOK(t, d, `{"to":"log","text":"while allowed"}`); o["ok"] != true {
 		t.Fatalf("setup: %v", o)
 	}
 
@@ -502,7 +531,9 @@ func TestURLsJoinTheBodyBeforeSplitting(t *testing.T) {
 	}
 	// Link with no text at all: the link is the message.
 	out = sendOK(t, d, `{"to":"boss","files":[{"url":"https://example.com/a.png"},{"url":"https://example.com/b.png"}]}`)
-	wantNum(t, out, "parts_sent", 1)
+	if _, bad := out["parts_sent"]; bad {
+		t.Errorf("one part needs no counter: %v", out)
+	}
 	wantNum(t, out, "url_count", 2)
 }
 
@@ -578,8 +609,8 @@ func TestAttachmentFromTheSandbox(t *testing.T) {
 	if first["size"].(float64) != 15 {
 		t.Errorf("size = %v, want 15 bytes", first["size"])
 	}
-	if !strings.HasPrefix(first["mime"].(string), "text/plain") {
-		t.Errorf("mime = %v", first["mime"])
+	if _, bad := first["mime"]; bad {
+		t.Errorf("the agent picked the file, it does not need its mime echoed back: %v", first)
 	}
 	if w, _ := out["warnings"].([]any); len(w) == 0 || !strings.Contains(w[0].(string), "blank") {
 		t.Errorf("a file-only message should warn that text was blank: %v", out["warnings"])

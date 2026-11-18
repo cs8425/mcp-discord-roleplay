@@ -15,16 +15,16 @@
 //
 // If a single event is bigger than the whole budget it would sit at the head of
 // the queue forever. Instead it is trimmed into the budget: the text keeps its
-// head and says how big it really was (text_full_bytes); if that is still not
-// enough, trailing attachments are counted out (attachments_omitted). Metadata
-// (ids, channel, author, timestamps, urls) is never trimmed — without it the
-// agent could not answer what it just read.
+// head and a note says how big it really was; if that is still not enough,
+// trailing attachments are counted out, again by note. What reaches the model is
+// only what it needs in order to answer (see msgWire): target, author, text,
+// timestamps, attachment urls. Identifiers and counters went to the log.
 //
 // Media runs in a second phase, after the drain. Queue.Drain calls the verdict
 // function under the queue's lock, and a download must not hold that lock: the
 // gateway would stop being able to Push. So the budget decides which messages
 // and which attachments this call keeps from metadata alone, and only those are
-// fetched afterwards. Base64 consequently never shows up in result_bytes (it
+// fetched afterwards. Base64 consequently never shows up in the JSON answer (it
 // lives in the result's content array, not in this JSON); the room it will take
 // in the model's context is held back by the per-attachment estimate instead.
 package tools
@@ -33,6 +33,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"math"
 	"math/rand/v2"
 	"sort"
@@ -74,8 +75,9 @@ func pollTool() *mcp.Tool {
 		Description: "Wait until this agent's queue holds messages, return them, and remove them from the queue. " +
 			"There is no cursor and no acknowledge step: what a poll hands you is yours, and what you do not take stays. " +
 			"reason=messages means you got something; reason=timeout (ok:true) means nothing arrived within max_wait, call again; " +
+			"reason=disconnected means the gateway was not listening during that wait, so nothing could have arrived; " +
 			"reason=cancelled/shutdown means this answer was not delivered. " +
-			"If partial is true, messages are still queued — poll again right away. " +
+			"If remaining is present, that many messages are still queued — poll again right away. " +
 			"If dropped is present, messages were overwritten while nobody polled; poll more often. " +
 			"Each attachment reports what it came as: media=base64 means the bytes are appended to this result as a content block (content_index names it), " +
 			"media=file means they were saved and local_path says where, media=url means metadata only and reason says why. " +
@@ -139,10 +141,16 @@ type pollArgs struct {
 	IncludeSelf  *bool    `json:"include_self"`
 }
 
-// pollMessage is the wire form of one queued event. It is a separate type from
-// bus.Event on purpose: bus.Event is shared between agents and between polls
-// (fan-out stores one pointer in several queues), so anything computed per call
-// — trimmed text, media verdict — must live here and never back on the event.
+// pollMessage is the WORKING form of one queued event — it never goes on the
+// wire, msgWire does, and the json tags below are decoration left so the two
+// types can be read side by side (nothing marshals this one any more, which is
+// the point: the budget is measured on the wire shape, and a field can be
+// dropped from the answer without touching the bookkeeping).
+//
+// It is a separate type from bus.Event on purpose too: bus.Event is shared
+// between agents and between polls (fan-out stores one pointer in several
+// queues), so anything computed per call — trimmed text, media verdict — must
+// live here and never back on the event.
 type pollMessage struct {
 	ID          string `json:"id,omitempty"`
 	Target      string `json:"target,omitempty"`
@@ -166,8 +174,9 @@ type pollMessage struct {
 	Embeds           []bus.Embed      `json:"embeds,omitempty"`
 }
 
-// pollAttachment is the per-call view of an attachment: metadata plus how THIS
-// call renders it. bus.Attachment stays shared and read-only.
+// pollAttachment is the per-call working view of an attachment: metadata plus
+// how THIS call renders it. bus.Attachment stays shared and read-only, and the
+// agent only ever sees the attWire projected from it.
 type pollAttachment struct {
 	ID           string  `json:"id"`
 	Filename     string  `json:"filename,omitempty"`
@@ -263,7 +272,7 @@ func (d *Deps) handlePoll(ctx context.Context, call *mcp.Call) (*mcp.ToolResult,
 	defer timer.Stop()
 
 	start := time.Now()
-	connected := d.DC != nil && d.DC.Connected()
+	connected := d.gatewayUp()
 
 	var (
 		msgs      []pollMessage
@@ -306,19 +315,19 @@ func (d *Deps) handlePoll(ctx context.Context, call *mcp.Call) (*mcp.ToolResult,
 			continue
 		case <-timer.C:
 			d.notePoll(p.AgentID)
-			return jsonResult(pollEnvelope(pollMeta{
+			return jsonResult(d.pollEnvelope(pollMeta{
 				reason: "timeout", agent: p.AgentID, waitedMS: durMS(time.Since(start)),
 				maxWait: waitS, connected: connected,
 			})), nil
 		case <-ctx.Done():
 			// Nothing deliverable was taken (msgs is empty), so there is nothing
 			// to put back.
-			return jsonResult(pollEnvelope(pollMeta{
+			return jsonResult(d.pollEnvelope(pollMeta{
 				reason: "cancelled", agent: p.AgentID, waitedMS: durMS(time.Since(start)),
 				maxWait: waitS, connected: connected,
 			})), nil
 		case <-d.Stopping:
-			return jsonResult(pollEnvelope(pollMeta{
+			return jsonResult(d.pollEnvelope(pollMeta{
 				reason: "shutdown", agent: p.AgentID, waitedMS: durMS(time.Since(start)),
 				maxWait: waitS, connected: connected,
 			})), nil
@@ -330,7 +339,7 @@ func (d *Deps) handlePoll(ctx context.Context, call *mcp.Call) (*mcp.ToolResult,
 	// oldest end, in order, for the next poll.
 	if ctx.Err() != nil {
 		q.RequeueFront(st.kept)
-		return jsonResult(pollEnvelope(pollMeta{
+		return jsonResult(d.pollEnvelope(pollMeta{
 			reason: "cancelled", agent: p.AgentID, waitedMS: durMS(time.Since(start)),
 			maxWait: waitS, connected: connected,
 		})), nil
@@ -355,7 +364,7 @@ func (d *Deps) handlePoll(ctx context.Context, call *mcp.Call) (*mcp.ToolResult,
 	// already saved stays on disk: the next poll reuses it rather than refetching.
 	if ctx.Err() != nil {
 		q.RequeueFront(st.kept)
-		return jsonResult(pollEnvelope(pollMeta{
+		return jsonResult(d.pollEnvelope(pollMeta{
 			reason: "cancelled", agent: p.AgentID, waitedMS: durMS(time.Since(start)),
 			maxWait: waitS, connected: connected,
 		})), nil
@@ -369,7 +378,7 @@ func (d *Deps) handlePoll(ctx context.Context, call *mcp.Call) (*mcp.ToolResult,
 			self = snap.SelfTag
 		}
 	}
-	res := jsonResult(pollEnvelope(pollMeta{
+	res := jsonResult(d.pollEnvelope(pollMeta{
 		reason: "messages", agent: p.AgentID, waitedMS: durMS(time.Since(start)),
 		maxWait: waitS, connected: connected, self: self,
 		count: len(msgs), remaining: remaining, partial: st.stopped,
@@ -378,7 +387,7 @@ func (d *Deps) handlePoll(ctx context.Context, call *mcp.Call) (*mcp.ToolResult,
 	}))
 	// The JSON answer occupies content[0]; every media block lands after it, in
 	// the order the messages were read. That is what makes content_index
-	// addressable — and why base64 never counts towards result_bytes.
+	// addressable — and why inline base64 never counts towards the byte budget.
 	res.Content = append(res.Content, blocks...)
 	return res, nil
 }
@@ -745,7 +754,7 @@ func (d *Deps) buildMessage(p router.Principal, e *bus.Event) pollMessage {
 // shrink with it, and a message carrying many inlinable files could then never
 // fit at all: every attachment omitted, not even one listed.
 func messageCost(m pollMessage) int {
-	b, err := json.Marshal(m)
+	b, err := json.Marshal(m.wire())
 	if err != nil {
 		// bus.Event is plain data, so this cannot realistically fail; be honest
 		// and treat an unencodable message as huge so it never crowds out others.
@@ -802,13 +811,104 @@ func fitMessage(m *pollMessage, room int, st *drainState) {
 	}
 	if m.AttachmentsOmit > 0 {
 		st.notes = append(st.notes, "附件只列到預算內，少了 "+strconv.Itoa(m.AttachmentsOmit)+
-			" 個（見 attachments_omitted；附件本身仍在 Discord 上，url 沒被裁）")
+			" 個（附件本身仍在 Discord 上，url 沒被裁）")
 	}
 
 	// 3. Embeds are the least useful thing to keep when room is that tight.
 	for len(m.Embeds) > 0 && messageCost(*m) > room {
 		m.Embeds = m.Embeds[:len(m.Embeds)-1]
 	}
+}
+
+// --- wire shapes -----------------------------------------------------------
+//
+// pollMessage above is the WORKING form: budget accounting, trimming and the
+// media verdict all live on it, and it keeps fields the model never sees (its
+// json tags are therefore dead weight kept only for readability). These types
+// below are the only thing that gets marshalled, which buys three things: the
+// budget cost of a message equals the bytes it actually ships (messageCost),
+// bus.Author/bus.Embed shapes can no longer leak onto the wire, and adding a
+// field to pollMessage costs the model nothing until it is deliberately added
+// here too.
+
+type embedWire struct {
+	Title       string `json:"title,omitempty"`
+	Description string `json:"description,omitempty"`
+	URL         string `json:"url,omitempty"`
+}
+
+type attWire struct {
+	Name         string  `json:"name,omitempty"`
+	Kind         string  `json:"kind"`
+	URL          string  `json:"url"`
+	DurationSecs float64 `json:"duration_secs,omitempty"`
+	Media        string  `json:"media"`
+	Reason       string  `json:"reason,omitempty"`
+	Path         string  `json:"local_path,omitempty"`
+	ContentIndex int     `json:"content_index,omitempty"`
+}
+
+type msgWire struct {
+	Target       string      `json:"target,omitempty"`
+	Author       string      `json:"author"`
+	Bot          bool        `json:"bot,omitempty"`
+	Self         bool        `json:"self,omitempty"`
+	DM           bool        `json:"dm,omitempty"`
+	Ts           string      `json:"ts,omitempty"`
+	AgeS         float64     `json:"age_s,omitempty"`
+	Text         string      `json:"text,omitempty"`
+	TextCut      bool        `json:"text_truncated,omitempty"`
+	MentionsSelf bool        `json:"mentions_self,omitempty"`
+	Attachments  []attWire   `json:"attachments,omitempty"`
+	Embeds       []embedWire `json:"embeds,omitempty"`
+}
+
+// wire projects the working form onto what the model receives.
+func (m pollMessage) wire() msgWire {
+	out := msgWire{
+		Target:       m.Target,
+		Author:       m.From.Name,
+		Bot:          m.From.Bot,
+		Self:         m.From.Self,
+		DM:           m.DM,
+		Ts:           m.Ts,
+		AgeS:         m.AgeS,
+		Text:         m.Text,
+		TextCut:      m.TextTruncated,
+		MentionsSelf: m.MentionsSelf,
+	}
+	if out.Author == "" {
+		// An unattributed line is worse than an ugly one: fall back to whatever
+		// tag Discord gave us rather than presenting anonymous text.
+		out.Author = m.From.Tag
+	}
+	if len(m.Attachments) > 0 {
+		out.Attachments = make([]attWire, 0, len(m.Attachments))
+		for _, a := range m.Attachments {
+			out.Attachments = append(out.Attachments, attWire{
+				Name: a.Filename, Kind: a.Kind, URL: a.URL,
+				DurationSecs: a.DurationSecs, Media: a.Media, Reason: a.Reason,
+				Path: a.Path, ContentIndex: a.ContentIndex,
+			})
+		}
+	}
+	if len(m.Embeds) > 0 {
+		out.Embeds = make([]embedWire, 0, len(m.Embeds))
+		for _, e := range m.Embeds {
+			out.Embeds = append(out.Embeds, embedWire{
+				Title: e.Title, Description: e.Description, URL: e.URL,
+			})
+		}
+	}
+	return out
+}
+
+func wireMessages(msgs []pollMessage) []msgWire {
+	out := make([]msgWire, 0, len(msgs))
+	for _, m := range msgs {
+		out = append(out, m.wire())
+	}
+	return out
 }
 
 // --- envelope --------------------------------------------------------------
@@ -829,51 +929,60 @@ type pollMeta struct {
 	dropped   uint64
 }
 
-// pollEnvelope builds the reply. An empty answer stays tiny (six keys) because
-// it is the common case on a quiet server, and every byte of it goes back into
-// the model's context on every turn.
-func pollEnvelope(m pollMeta) map[string]any {
-	out := map[string]any{
-		"ok":               true,
-		"reason":           m.reason,
-		"agent":            m.agent,
-		"waited_ms":        m.waitedMS,
-		"max_wait_applied": m.maxWait,
-		"connected":        m.connected,
+// pollWire is the envelope, and it is the whole budget: a quiet poll costs two
+// keys — the one thing a poll has to answer, plus whether it succeeded — and
+// every other field only earns its place by being non-empty.
+type pollWire struct {
+	OK        bool      `json:"ok"`
+	Reason    string    `json:"reason"`
+	Messages  []msgWire `json:"messages,omitempty"`
+	Remaining int       `json:"remaining,omitempty"` // absent means caught up
+	Dropped   uint64    `json:"dropped,omitempty"`
+	Notes     []string  `json:"notes,omitempty"`
+}
+
+// pollEnvelope builds the reply from the bookkeeping. What pollMeta carries and
+// is not here — agent, timings, byte counts, the persona's own name — is log
+// material: the empty answer stays empty on purpose, because every byte of it
+// goes back into the model's context on every turn.
+func (d *Deps) pollEnvelope(m pollMeta) pollWire {
+	reason := m.reason
+	if m.count == 0 && reason == "timeout" && !m.connected {
+		// "timeout" reads as "nobody spoke". On a dead gateway nobody could
+		// have, and the model should not keep waiting on it. cancelled and
+		// shutdown keep their own words: they say what ended the wait.
+		reason = "disconnected"
 	}
-	if m.count == 0 {
-		return out
+	w := pollWire{OK: true, Reason: reason}
+	// Everything below rides with messages only: a queue that handed over
+	// nothing has nothing left, nothing trimmed and nothing to explain.
+	if m.count > 0 {
+		w.Messages = wireMessages(m.messages)
+		w.Remaining = m.remaining
+		w.Dropped = m.dropped
+		w.Notes = m.notes
 	}
-	out["count"] = m.count
-	out["remaining"] = m.remaining
-	out["partial"] = m.partial
-	out["bytes"] = m.bytes
-	out["messages"] = m.messages
-	if m.self != "" {
-		out["self"] = m.self
+	d.logPoll(m)
+	return w
+}
+
+// logPoll writes the one bookkeeping line a poll leaves behind: every number
+// that used to ship to the model and is now only worth showing an operator.
+func (d *Deps) logPoll(m pollMeta) {
+	lg := d.debug()
+	if !lg.Enabled(context.Background(), slog.LevelDebug) {
+		return
 	}
-	if m.dropped > 0 {
-		out["dropped"] = m.dropped
+	fields := []any{"agent", m.agent, "reason", m.reason, "waited_ms", m.waitedMS,
+		"max_wait", m.maxWait, "connected", m.connected, "self", m.self,
+		"count", m.count, "remaining", m.remaining, "partial", m.partial,
+		"bytes", m.bytes, "dropped", m.dropped, "notes", len(m.notes)}
+	if m.count > 0 {
+		// The answer itself, so an operator can see what the model was handed
+		// without turning the wire back into a struct.
+		fields = append(fields, "result", wireMessages(m.messages))
 	}
-	if len(m.notes) > 0 {
-		out["notes"] = append([]string{}, m.notes...)
-	}
-	// result_bytes is the size of this exact JSON. Its own width depends on the
-	// number it holds, so iterate to the fixed point (converges in ~3 passes).
-	rb := 0
-	for i := 0; i < 5; i++ {
-		out["result_bytes"] = rb
-		b, err := json.Marshal(out)
-		if err != nil {
-			delete(out, "result_bytes")
-			return out
-		}
-		if len(b) == rb {
-			break
-		}
-		rb = len(b)
-	}
-	return out
+	lg.Debug("poll", fields...)
 }
 
 func queueDropped(q *bus.Queue) uint64 {

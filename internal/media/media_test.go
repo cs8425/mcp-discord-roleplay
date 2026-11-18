@@ -116,6 +116,54 @@ func TestInlineProducesAnImageBlock(t *testing.T) {
 	}
 }
 
+// Discord's CDN does not hand over headers and body in one packet, and a tiny
+// test payload never showed it: the body lands in the same buffer read as the
+// headers, so a context cancelled the moment the request "completed" still let
+// the read succeed. Here the headers are flushed alone and the body follows
+// 30 ms later -- exactly the shape that failed the live smoke with
+// `media: inline read failed err="context canceled"`.
+func TestSplitHeaderAndBodyStillInlinesAndSaves(t *testing.T) {
+	body := []byte(strings.Repeat("x", 4096))
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "image/png")
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush() // nothing but the headers on the wire so far
+		}
+		time.Sleep(30 * time.Millisecond)
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(srv.Close)
+
+	in := fetcherFor(t, testCfg(t, "-media-image=inline")).NewSession(context.Background())
+	h := in.Handle(png("a1", srv.URL+"/shot.png", len(body)))
+	if h.Media != MediaBase64 {
+		t.Fatalf("a body that arrives later must not change the verdict: %q/%q", h.Media, h.Reason)
+	}
+	if h.Bytes != int64(len(body)) {
+		t.Errorf("bytes = %d, want %d", h.Bytes, len(body))
+	}
+
+	dir := t.TempDir()
+	sv := fetcherFor(t, testCfg(t, "-media-image=save", "-media-out="+dir)).NewSession(context.Background())
+	h = sv.Handle(png("a2", srv.URL+"/shot.png", len(body)))
+	if h.Media != MediaFile {
+		t.Fatalf("save must survive the same split: %q/%q", h.Media, h.Reason)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, filepath.Base(h.Path)))
+	if err != nil {
+		t.Fatalf("the saved file is missing: %v", err)
+	}
+	if len(raw) != len(body) {
+		t.Errorf("saved %d bytes, want %d", len(raw), len(body))
+	}
+	if hits.Load() != 2 {
+		t.Errorf("one request per attachment: %d", hits.Load())
+	}
+}
+
 // A side that is too long is decided from metadata, so it must not cost a
 // request — and it must NOT be downgraded to a save or retried smaller: we do
 // not resize, and we do not change the operator's policy.

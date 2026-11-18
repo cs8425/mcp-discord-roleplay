@@ -114,6 +114,7 @@ func run(args []string) int {
 		Stopping:   shutting,
 		StartedAt:  time.Now(),
 		Version:    version,
+		Log:        logger,
 	}
 	if err := tools.RegisterAll(reg, deps); err != nil {
 		logger.Error("tool registration failed", "err", err)
@@ -342,6 +343,7 @@ func selftest(cfg *config.Config, rt *router.Router, logger *slog.Logger) int {
 		Stopping:  make(chan struct{}),
 		StartedAt: time.Now(),
 		Version:   version,
+		Log:       logger,
 	}
 	if err := tools.RegisterAll(reg, deps); err != nil {
 		fail("tool registration: %v", err)

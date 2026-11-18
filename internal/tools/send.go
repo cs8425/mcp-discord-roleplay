@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"unicode/utf8"
 
@@ -235,37 +236,57 @@ func (d *Deps) handleSend(ctx context.Context, call *mcp.Call) (*mcp.ToolResult,
 		lastRes = res
 	}
 
-	out := map[string]any{"ok": true}
-	for k, v := range extra {
-		out[k] = v
-	}
-	out["parts_sent"] = len(ids)
-	out["message_ids"] = ids
-	if len(ids) > 0 {
-		out["last_message_id"] = ids[len(ids)-1]
-	} else {
-		out["last_message_id"] = ""
-	}
-	if lastRes != nil {
-		out["delivered_channel_id"] = lastRes.ChannelID
-		if s := tz.Format(lastRes.CreatedAt); s != "" {
-			out["created_at"] = s
-		}
+	w := sendWire{OK: true}
+	if len(parts) > 1 {
+		w.PartsSent = len(ids)
 	}
 	if len(opened) > 0 {
-		out["attachments"] = attachmentView(opened)
+		w.Attachments = attachmentView(opened)
 	}
 	if len(urls) > 0 {
-		out["url_count"] = len(urls)
+		w.URLCount = len(urls)
 	}
 	if d.Cfg.DryRun {
-		out["dry_run"] = true
+		w.DryRun = true
 		warn = append(warn, "dry-run: nothing was delivered to Discord")
 	}
 	if len(warn) > 0 {
-		out["warnings"] = warn
+		w.Warnings = warn
 	}
-	return jsonResult(out), nil
+	d.logSend(p, ru, chanID, ids, lastRes)
+	return jsonResult(w), nil
+}
+
+// sendWire is the successful answer, and it is deliberately almost nothing: the
+// text is on Discord now, so the agent only needs the facts that could change
+// what it does next — did one message go out or five, what became of the files,
+// and is this run not really sending. Which alias was picked, which channel it
+// landed in, and the message ids Discord handed back are for the operator, so
+// they went to the log.
+type sendWire struct {
+	OK          bool       `json:"ok"`
+	PartsSent   int        `json:"parts_sent,omitempty"`
+	Attachments []sentFile `json:"attachments,omitempty"`
+	URLCount    int        `json:"url_count,omitempty"`
+	DryRun      bool       `json:"dry_run,omitempty"`
+	Warnings    []string   `json:"warnings,omitempty"`
+}
+
+// logSend records what a send actually did: which alias resolved to which
+// channel id, every message id Discord handed back, and when it stamped them.
+// None of that is on the wire any more -- the ids an operator needs to read a
+// transcript against are here, in the one line a successful send leaves behind.
+func (d *Deps) logSend(p router.Principal, ru *router.Rule, chanID string, ids []string, last *discord.SendResult) {
+	lg := d.debug()
+	if !lg.Enabled(context.Background(), slog.LevelDebug) {
+		return
+	}
+	fields := []any{"agent", p.AgentID, "target", ru.Alias, "kind", ru.Kind,
+		"channel_id", chanID, "parts", len(ids), "message_ids", ids}
+	if last != nil {
+		fields = append(fields, "delivered", last.ChannelID, "created_at", tz.Format(last.CreatedAt))
+	}
+	lg.Debug("send", fields...)
 }
 
 // ---------------------------------------------------------------------------
@@ -497,15 +518,20 @@ func sendAdvice(se *discord.SendError) string {
 	}
 }
 
-// attachmentView is what the model gets back about what actually rode along.
-func attachmentView(opened []*files.Opened) []map[string]any {
-	out := make([]map[string]any, 0, len(opened))
+// sentFile is the wire view of one upload that went out. The agent named the
+// file, so what it needs back is confirmation of which one rode along and how
+// big it was when we read it; the MIME type we sniffed is an upload detail, not
+// a fact the model acts on.
+type sentFile struct {
+	Name string `json:"name"`
+	Size int64  `json:"size,omitempty"`
+}
+
+// attachmentView projects the opened files onto what the model gets back.
+func attachmentView(opened []*files.Opened) []sentFile {
+	out := make([]sentFile, 0, len(opened))
 	for _, o := range opened {
-		out = append(out, map[string]any{
-			"name": o.Name,
-			"size": o.Size,
-			"mime": o.ContentType,
-		})
+		out = append(out, sentFile{Name: o.Name, Size: o.Size})
 	}
 	return out
 }

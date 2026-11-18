@@ -274,7 +274,9 @@ func (s *Session) inline(a bus.Attachment) Handle {
 	if r := s.checkCaps(a); r != "" {
 		return skip(r)
 	}
-	resp, err := s.get(a)
+	ctx, cancel := s.fetchCtx()
+	defer cancel()
+	resp, err := s.get(ctx, a)
 	if err != nil {
 		s.log.Warn("media: inline fetch failed", "id", a.ID, "kind", a.Kind, "err", err.Error())
 		return skip(SkipError)
@@ -319,7 +321,9 @@ func (s *Session) save(a bus.Attachment) Handle {
 	if fi, err := fs.Stat(s.f.root.FS(), name); err == nil && fi.Mode().IsRegular() && fi.Size() > 0 {
 		return Handle{Media: MediaFile, Bytes: fi.Size(), Path: joinPrefix(s.f.prefix, name), ContentIndex: -1}
 	}
-	resp, err := s.get(a)
+	ctx, cancel := s.fetchCtx()
+	defer cancel()
+	resp, err := s.get(ctx, a)
 	if err != nil {
 		s.log.Warn("media: save fetch failed", "id", a.ID, "err", err.Error())
 		return skip(SkipError)
@@ -401,13 +405,26 @@ func (s *Session) readCap() int64 {
 
 var errTooBig = errors.New("media: over the size cap")
 
+// fetchCtx starts the context that carries one attachment from request to the
+// last byte of its body. The cancel belongs to the READER, not to the request:
+// net/http ties the response body to the context the request was made with, so
+// anything cancelled before the body is drained aborts the read that follows
+// ("context canceled" on a CDN that sends headers and body in separate packets).
+func (s *Session) fetchCtx() (context.Context, context.CancelFunc) {
+	ctx := s.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithTimeout(ctx, defaultTimeout)
+}
+
 // get asks for an attachment, falling back to the proxy URL once when the
 // first attempt fails. Callers close the body.
-func (s *Session) get(a bus.Attachment) (*http.Response, error) {
+func (s *Session) get(ctx context.Context, a bus.Attachment) (*http.Response, error) {
 	if a.URL == "" {
 		return nil, errors.New("media: attachment has no url")
 	}
-	resp, err := s.open(a.URL)
+	resp, err := s.open(ctx, a.URL)
 	if err == nil {
 		return resp, nil
 	}
@@ -415,19 +432,14 @@ func (s *Session) get(a bus.Attachment) (*http.Response, error) {
 		return nil, err
 	}
 	s.log.Debug("media: retrying on the proxy url", "id", a.ID, "err", err.Error())
-	return s.open(a.ProxyURL)
+	return s.open(ctx, a.ProxyURL)
 }
 
-func (s *Session) open(rawURL string) (*http.Response, error) {
-	ctx := s.ctx
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if _, ok := ctx.Deadline(); !ok {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, defaultTimeout)
-		defer cancel()
-	}
+// open issues the request and hands back a live body. It deliberately owns no
+// timeout and registers no cancel: a defer cancel() here would fire the moment
+// the headers arrived and kill a body that has not been read yet. The caller
+// derives the context (fetchCtx) and cancels it when the body is drained.
+func (s *Session) open(ctx context.Context, rawURL string) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, err

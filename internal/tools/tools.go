@@ -7,6 +7,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
 	"sort"
 	"sync"
 	"time"
@@ -34,6 +36,7 @@ type Deps struct {
 	Stopping   chan struct{}  // closed as soon as shutdown begins
 	StartedAt  time.Time
 	Version    string
+	Log        *slog.Logger // operator-facing bookkeeping; nil falls back to a sink
 
 	toolNames []string // filled in by RegisterAll, reported by discord_status
 
@@ -48,6 +51,21 @@ type Deps struct {
 	// at the queue cap).
 	pollMu sync.Mutex
 	pollAt map[string]time.Time
+
+	// up answers "is the gateway listening?" for the poll reason. nil means ask
+	// DC, which is what production does; a test injects its own answer, because a
+	// client that was never started is indistinguishable from one that died.
+	up func() bool
+}
+
+// gatewayUp is the only place that reads the connection state for an answer:
+// a poll that found nothing on a deaf socket says "disconnected" rather than
+// the "timeout" a quiet channel deserves.
+func (d *Deps) gatewayUp() bool {
+	if d.up != nil {
+		return d.up()
+	}
+	return d.DC != nil && d.DC.Connected()
 }
 
 // RegisterAll registers the tools available in this build onto reg (which is
@@ -82,6 +100,20 @@ func (d *Deps) principal(ctx context.Context) router.Principal {
 	}
 	return p
 }
+
+// debug returns the logger a handler writes its bookkeeping line to. Wire
+// answers carry only what the model needs in order to act; the rest (snowflakes,
+// timings, byte counts, which channel a DM resolved to) lands here, and the
+// operator raises --log-level=debug to see it. Tests build a Deps without a
+// logger, so nil degrades to a sink instead of a panic.
+func (d *Deps) debug() *slog.Logger {
+	if d.Log == nil {
+		return devNull
+	}
+	return d.Log
+}
+
+var devNull = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 // ---------------------------------------------------------------------------
 // result helpers

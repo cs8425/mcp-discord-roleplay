@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -143,6 +144,22 @@ func firstMsg(t *testing.T, out map[string]any) map[string]any {
 	return m
 }
 
+// wireText reads the text of one answer message. Tests tell messages apart by
+// what they said, because the internal id is no longer on the wire.
+func wireText(t *testing.T, out map[string]any, i int) string {
+	t.Helper()
+	list := msgs(t, out)
+	if i >= len(list) {
+		t.Fatalf("only %d message(s) in the answer", len(list))
+	}
+	m, ok := list[i].(map[string]any)
+	if !ok {
+		t.Fatalf("messages[%d] is not an object: %T", i, list[i])
+	}
+	s, _ := m["text"].(string)
+	return s
+}
+
 func queueLen(t *testing.T, d *Deps, agent string) int {
 	t.Helper()
 	q, ok := d.Hub.Queue(agent)
@@ -150,6 +167,13 @@ func queueLen(t *testing.T, d *Deps, agent string) int {
 		t.Fatalf("agent %q has no queue", agent)
 	}
 	return q.Stats().Size
+}
+
+// connected tells the handler the gateway is up. The fixture's client is never
+// started, so without this every quiet poll would answer "disconnected" — which
+// is correct behaviour and exactly what TestPollDisconnectedIsNotTimeout checks.
+func connected(d *Deps) {
+	d.up = func() bool { return true }
 }
 
 // withWait adds a short max_wait to an argument object without breaking the
@@ -176,8 +200,10 @@ func TestPollReturnsImmediately(t *testing.T) {
 		t.Errorf("took %v for a message that was already queued", el)
 	}
 	wantStr(t, out, "reason", "messages")
-	wantNum(t, out, "count", 1)
-	wantStr(t, firstMsg(t, out), "id", "m1")
+	if list := msgs(t, out); len(list) != 1 {
+		t.Fatalf("one queued message, one answer: %d", len(list))
+	}
+	wantStr(t, firstMsg(t, out), "text", "hi")
 	if queueLen(t, d, "default") != 0 {
 		t.Error("taking a message out IS the ack; it must not stay queued")
 	}
@@ -187,21 +213,33 @@ func TestPollReturnsImmediately(t *testing.T) {
 // NOT an error: the agent should poll again, not give up.
 func TestPollTimeoutIsSuccessAndTiny(t *testing.T) {
 	d := newDeps(t, routingCfg(t, "-poll-min-wait=1", "-poll-default-wait=1", "-poll-jitter-pct=0"))
+	connected(d)
 	start := time.Now()
 	out := pollOK(t, d, `{}`)
 	if el := time.Since(start); el < 900*time.Millisecond {
 		t.Errorf("returned after %v, should have waited the full second", el)
 	}
 	wantStr(t, out, "reason", "timeout")
-	wantNum(t, out, "max_wait_applied", 1)
-	if len(out) != 6 {
+	if len(out) != 2 {
 		t.Errorf("an empty answer must stay small, got %d keys: %v", len(out), out)
 	}
 	if _, bad := out["messages"]; bad {
 		t.Error("no messages, no messages key")
 	}
-	if _, bad := out["partial"]; bad {
-		t.Error("nothing was cut short, so partial must be absent")
+	if _, bad := out["remaining"]; bad {
+		t.Error("nothing is left in the queue, so remaining must be absent")
+	}
+}
+
+// The same empty moment on a deaf socket is a different answer: an agent that
+// keeps polling a dead gateway burns its context on "timeout" and never learns
+// the bot went away.
+func TestPollDisconnectedIsNotTimeout(t *testing.T) {
+	d := newDeps(t, routingCfg(t, "-poll-min-wait=1", "-poll-default-wait=1", "-poll-jitter-pct=0"))
+	out := pollOK(t, d, `{}`) // the fixture's client was never started
+	wantStr(t, out, "reason", "disconnected")
+	if len(out) != 2 {
+		t.Errorf("still two keys, just a different word: %v", out)
 	}
 }
 
@@ -224,7 +262,7 @@ func TestPollWakesOnPush(t *testing.T) {
 	select {
 	case out := <-done:
 		wantStr(t, out, "reason", "messages")
-		wantStr(t, firstMsg(t, out), "id", "m9")
+		wantStr(t, firstMsg(t, out), "text", "late")
 	case err := <-failed:
 		t.Fatalf("the blocked poll failed: %v", err)
 	case <-time.After(5 * time.Second):
@@ -242,19 +280,18 @@ func TestPollKeepsOrderAndStopsAtLimit(t *testing.T) {
 	if len(list) != 2 {
 		t.Fatalf("want 2 messages, got %d", len(list))
 	}
-	if list[0].(map[string]any)["id"] != "m1" || list[1].(map[string]any)["id"] != "m2" {
+	if list[0].(map[string]any)["text"] != "a" || list[1].(map[string]any)["text"] != "b" {
 		t.Errorf("order must be oldest first, got %v", list)
 	}
+	// remaining is the "poll me again" signal: a caller that can count what is
+	// left does not also need a partial flag.
 	wantNum(t, out, "remaining", 1)
-	if out["partial"] != true {
-		t.Error("a limit cut is a partial answer, or the caller will not poll again")
-	}
 	if notes, _ := out["notes"].([]any); len(notes) == 0 {
 		t.Error("the cut must be explained in notes")
 	}
 
 	out = pollOK(t, d, `{"max_wait":1}`)
-	if list := msgs(t, out); len(list) != 1 || list[0].(map[string]any)["id"] != "m3" {
+	if list := msgs(t, out); len(list) != 1 || list[0].(map[string]any)["text"] != "c" {
 		t.Errorf("second poll should get exactly m3, got %v", list)
 	}
 }
@@ -265,7 +302,8 @@ func TestPollConcurrentNoDuplicates(t *testing.T) {
 	const n = 40
 	evs := make([]*bus.Event, 0, n)
 	for i := 0; i < n; i++ {
-		evs = append(evs, evMsg("id"+string(rune('a'+i%26))+string(rune('0'+i/26)), "m"))
+		id := fmt.Sprintf("id%d", i)
+		evs = append(evs, evMsg(id, id))
 	}
 	push(t, d, "default", evs...)
 
@@ -288,7 +326,7 @@ func TestPollConcurrentNoDuplicates(t *testing.T) {
 				}
 				list, _ := out["messages"].([]any)
 				for _, raw := range list {
-					id, _ := raw.(map[string]any)["id"].(string)
+					id, _ := raw.(map[string]any)["text"].(string)
 					mu.Lock()
 					if seen[id] {
 						dup++
@@ -319,25 +357,25 @@ func TestPollStopsAtByteBudget(t *testing.T) {
 	d := newDeps(t, routingCfg(t, "-poll-max-bytes=16384"))
 	big := strings.Repeat("x", 5000)
 	push(t, d, "default",
-		evMsg("m1", big), evMsg("m2", big), evMsg("m3", big), evMsg("m4", big), evMsg("m5", big))
+		evMsg("m1", "1"+big), evMsg("m2", "2"+big), evMsg("m3", "3"+big),
+		evMsg("m4", "4"+big), evMsg("m5", "5"+big))
 
-	out := pollOK(t, d, `{"max_wait":1,"limit":20}`)
-	count := int(out["count"].(float64))
-	if count != 3 {
-		t.Fatalf("16384/5000 should fit 3 messages, got %d", count)
+	res := pollCall(t, d, context.Background(), `{"max_wait":1,"limit":20}`)
+	out := decode(t, res)
+	if n := len(msgs(t, out)); n != 3 {
+		t.Fatalf("16384/5000 should fit 3 messages, got %d", n)
 	}
 	wantNum(t, out, "remaining", 2)
-	if out["partial"] != true {
-		t.Error("a budget cut must set partial")
-	}
-	if b := out["bytes"].(float64); b > 16384 {
-		t.Errorf("bytes %v exceeded the budget", b)
+	// The budget buys the messages array; the envelope's counters ride on top of
+	// it, so the answer as a whole may only drift past by that much.
+	if b := len(res.Content[0].Text); b > 16384+512 {
+		t.Errorf("answer is %d bytes, far past the 16384 budget", b)
 	}
 	// The leftovers come back in order on the next poll.
 	out = pollOK(t, d, `{"max_wait":1}`)
 	list := msgs(t, out)
-	if len(list) != 2 || list[0].(map[string]any)["id"] != "m4" {
-		t.Errorf("leftovers must keep their order, got %v", list)
+	if len(list) != 2 || !strings.HasPrefix(wireText(t, out, 0), "4") {
+		t.Errorf("leftovers must keep their order, got %d message(s)", len(list))
 	}
 }
 
@@ -348,7 +386,8 @@ func TestPollTrimsOversizedMessage(t *testing.T) {
 	text := strings.Repeat("漢", 4000) // 12000 bytes of 3-byte runes
 	push(t, d, "default", evMsg("m1", text))
 
-	out := pollOK(t, d, `{"max_wait":1}`)
+	res := pollCall(t, d, context.Background(), `{"max_wait":1}`)
+	out := decode(t, res)
 	m := firstMsg(t, out)
 	got, _ := m["text"].(string)
 	if !utf8.ValidString(got) {
@@ -360,12 +399,13 @@ func TestPollTrimsOversizedMessage(t *testing.T) {
 	if m["text_truncated"] != true {
 		t.Error("a trimmed text must say so")
 	}
-	wantNum(t, m, "text_full_bytes", float64(len(text)))
-	if notes, _ := out["notes"].([]any); len(notes) == 0 {
-		t.Error("the trim must be explained in notes")
+	// How big it really was is a note now: the model needs to know the line was
+	// cut, not the exact byte count of a message it has already read.
+	if !hasNote(out, fmt.Sprintf("原本 %d bytes", len(text))) {
+		t.Errorf("the note must report the real size: %v", out["notes"])
 	}
-	if b := out["bytes"].(float64); b > 8192 {
-		t.Errorf("bytes %v exceeded the budget", b)
+	if b := len(res.Content[0].Text); b > 8192+512 {
+		t.Errorf("answer is %d bytes, far past the 8192 budget", b)
 	}
 	if queueLen(t, d, "default") != 0 {
 		t.Error("a trimmed message is still consumed, or it would be re-trimmed forever")
@@ -377,8 +417,8 @@ func TestPollBudgetZeroIsUncapped(t *testing.T) {
 	d := newDeps(t, routingCfg(t, "-poll-max-bytes=0"))
 	push(t, d, "default", evMsg("m1", strings.Repeat("y", 30000)))
 	out := pollOK(t, d, `{"max_wait":1}`)
-	if out["partial"] == true {
-		t.Error("no budget, no partial")
+	if _, bad := out["remaining"]; bad {
+		t.Error("no budget means nothing was left behind, so remaining must be absent")
 	}
 	if m := firstMsg(t, out); m["text_truncated"] == true {
 		t.Error("no budget, no trimming")
@@ -401,14 +441,14 @@ func TestPollOmitsAttachmentsToFit(t *testing.T) {
 
 	out := pollOK(t, d, `{"max_wait":1}`)
 	m := firstMsg(t, out)
-	wantNum(t, m, "attachments_total", 20)
-	omitted, _ := m["attachments_omitted"].(float64)
-	if omitted <= 0 {
-		t.Fatalf("expected some attachments to be omitted, got %v", m["attachments_omitted"])
-	}
 	list, _ := m["attachments"].([]any)
-	if len(list)+int(omitted) != 20 {
-		t.Errorf("listed %d + omitted %v must be the whole set", len(list), omitted)
+	if len(list) == 0 || len(list) >= 20 {
+		t.Fatalf("some of the 20 attachments must be cut to fit, got %d listed", len(list))
+	}
+	// The numbers live in the note now: what the model has to act on is that the
+	// list it got is not the whole set, not the arithmetic.
+	if !hasNote(out, fmt.Sprintf("少了 %d 個", 20-len(list))) {
+		t.Errorf("the omission must be counted in notes: %v", out["notes"])
 	}
 	first := list[0].(map[string]any)
 	if s, _ := first["url"].(string); !strings.HasPrefix(s, "https://") {
@@ -422,14 +462,50 @@ func TestPollOmitsAttachmentsToFit(t *testing.T) {
 	}
 }
 
-// The reported size must be the size of the answer, or a caller cannot budget
-// its own context.
-func TestPollResultBytesIsExact(t *testing.T) {
+// The answer is a wire struct, not the working struct: a key that creeps back
+// onto the wire is context the model pays for twice, so this is the contract
+// test -- the key set is spelled out, and any change must be argued here first.
+func TestPollWireKeysAreExactlyThese(t *testing.T) {
 	d := newDeps(t, routingCfg(t))
-	push(t, d, "default", evMsg("m1", "hello"), evMsg("m2", "world"))
-	res := pollCall(t, d, context.Background(), `{"max_wait":1}`)
-	out := decode(t, res)
-	wantNum(t, out, "result_bytes", float64(len(res.Content[0].Text)))
+	connected(d)
+	e := evMsg("m1", "hello")
+	e.Ts = time.Now().Add(-90 * time.Second) // a real age, so age_s is on the wire
+	e.Embeds = []bus.Embed{{Type: "rich", Title: "t"}}
+	e.Attachments = []bus.Attachment{{ID: "a1", Filename: "shot.png", Kind: bus.KindImage,
+		ContentType: "image/png", Size: 10, URL: "https://cdn.discordapp.com/attachments/1/2/shot.png"}}
+	push(t, d, "default", e)
+
+	out := pollOK(t, d, `{"max_wait":1}`)
+	if got := keySet(out); got != "messages,ok,reason" {
+		t.Errorf("envelope keys = %s, want exactly the three that change what the agent does", got)
+	}
+
+	m := firstMsg(t, out)
+	want := "age_s,attachments,author,embeds,target,text,ts"
+	if got := keySet(m); got != want {
+		t.Errorf("message keys =\n  %s\nwant\n  %s", got, want)
+	}
+
+	att := firstAttachment(t, out)
+	wantAtt := "kind,media,name,url"
+	if got := keySet(att); got != wantAtt {
+		t.Errorf("attachment keys =\n  %s\nwant\n  %s", got, wantAtt)
+	}
+
+	emb := m["embeds"].([]any)[0].(map[string]any)
+	if got := keySet(emb); got != "title" {
+		t.Errorf("embed keys = %s (only the ones present may appear)", got)
+	}
+}
+
+// keySet sorts an answer object's keys into one comparable string.
+func keySet(m map[string]any) string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return strings.Join(keys, ",")
 }
 
 // ---------------------------------------------------------------------------
@@ -449,6 +525,14 @@ func TestPollFilters(t *testing.T) {
 	bot.Author = bus.Author{ID: "u3", Name: "webhook", Bot: true}
 	own := evMsg("m4", "I talk to myself")
 	own.Author = bus.Author{ID: "u9", Name: "selfbot", Bot: true, Self: true}
+
+	// The answer carries no message ids any more, so the table below keeps naming
+	// them for readability while the assertion resolves an id to the text that
+	// message said.
+	textOf := map[string]string{
+		"m1": "hello", "m2": "hey <@777>", "m3": "bot noise",
+		"m4": "I talk to myself", "d1": "in dm",
+	}
 
 	cases := []struct {
 		why  string
@@ -474,6 +558,7 @@ func TestPollFilters(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.why, func(t *testing.T) {
 			d := newDeps(t, routingCfg(t))
+			connected(d)
 			push(t, d, "default", evMsg("m1", "hello"), mention, bot, own, dm)
 			out := pollOK(t, d, withWait(c.args))
 			if len(c.want) == 0 {
@@ -490,8 +575,8 @@ func TestPollFilters(t *testing.T) {
 				t.Fatalf("got %d messages, want %d: %v", len(list), len(c.want), list)
 			}
 			for i, id := range c.want {
-				if got := list[i].(map[string]any)["id"]; got != id {
-					t.Errorf("messages[%d].id = %v want %s", i, got, id)
+				if got := wireText(t, out, i); got != textOf[id] {
+					t.Errorf("messages[%d] = %q, want the one called %s", i, got, id)
 				}
 			}
 		})
@@ -538,8 +623,7 @@ func TestPollQueuesAreIsolated(t *testing.T) {
 
 	ctx := router.WithPrincipal(context.Background(), router.Principal{AgentID: "solo"})
 	out := decode(t, pollCall(t, d, ctx, `{"max_wait":1}`))
-	wantStr(t, out, "agent", "solo")
-	if list := msgs(t, out); len(list) != 1 || list[0].(map[string]any)["id"] != "m2" {
+	if list := msgs(t, out); len(list) != 1 || list[0].(map[string]any)["text"] != "for solo" {
 		t.Errorf("solo got %v", list)
 	}
 	if queueLen(t, d, "default") != 1 {
@@ -628,7 +712,7 @@ func TestPollRequeuesAfterCancel(t *testing.T) {
 
 	out = pollOK(t, d, `{"max_wait":1}`)
 	list := msgs(t, out)
-	if len(list) != 2 || list[0].(map[string]any)["id"] != "m1" || list[1].(map[string]any)["id"] != "m2" {
+	if len(list) != 2 || list[0].(map[string]any)["text"] != "a" || list[1].(map[string]any)["text"] != "b" {
 		t.Errorf("order after requeue must be preserved, got %v", list)
 	}
 }
@@ -646,6 +730,7 @@ func TestPollShutdown(t *testing.T) {
 // caller, nor sit in the queue forever blocking the head.
 func TestPollConsumesSystemEvents(t *testing.T) {
 	d := newDeps(t, routingCfg(t, "-poll-jitter-pct=0"))
+	connected(d)
 	push(t, d, "default", &bus.Event{Kind: bus.KindSystem, Time: "2026-01-01T00:00:00Z", Text: "gateway reconnected"})
 	out := pollOK(t, d, `{"max_wait":1}`)
 	wantStr(t, out, "reason", "timeout")
@@ -661,12 +746,13 @@ func TestPollReportsDrops(t *testing.T) {
 	d := newDeps(t, routingCfg(t, "-bus-capacity=10", "-poll-jitter-pct=0"))
 	evs := make([]*bus.Event, 0, 12)
 	for i := 1; i <= 12; i++ {
-		evs = append(evs, evMsg(fmt.Sprintf("m%d", i), "x"))
+		id := fmt.Sprintf("m%d", i)
+		evs = append(evs, evMsg(id, id))
 	}
 	push(t, d, "default", evs...)
 	out := pollOK(t, d, `{"max_wait":1,"limit":20}`)
 	wantNum(t, out, "dropped", 2)
-	if list := msgs(t, out); len(list) != 10 || list[0].(map[string]any)["id"] != "m3" {
+	if list := msgs(t, out); len(list) != 10 || list[0].(map[string]any)["text"] != "m3" {
 		t.Errorf("the oldest events are the ones overwritten, got %v", list)
 	}
 
@@ -818,8 +904,8 @@ func TestPollInlinesImageIntoContentBlocks(t *testing.T) {
 	if res.Content[1].Data != base64.StdEncoding.EncodeToString(body) {
 		t.Errorf("the block must carry the bytes, got %d chars of base64", len(res.Content[1].Data))
 	}
-	if b, _ := att["bytes"].(float64); int64(b) != int64(len(body)) {
-		t.Errorf("bytes = %v, want %d", att["bytes"], len(body))
+	if _, bad := att["bytes"]; bad {
+		t.Errorf("the block carries its own size; a byte count on the wire is a duplicate: %v", att)
 	}
 	if hits.Load() != 1 {
 		t.Errorf("one attachment, one fetch: %d", hits.Load())
