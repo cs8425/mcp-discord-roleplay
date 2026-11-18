@@ -76,7 +76,6 @@ func newDeps(t *testing.T, cfg *config.Config) *Deps {
 		DC:        discord.New(cfg, nil, hub, rt),
 		Files:     files.New(cfg, nil),
 		StartedAt: time.Now(),
-		Version:   "test",
 	}
 }
 

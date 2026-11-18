@@ -286,8 +286,6 @@ func (d *Deps) fullPanel(p router.Principal) map[string]any {
 		// --- meta -----------------------------------------------------------
 		"meta": map[string]any{
 			"name":             "mcp-discord-roleplay",
-			"version":          d.Version,
-			"milestone":        BuildMilestone,
 			"transport":        d.Cfg.Transport,
 			"dry_run":          d.Cfg.DryRun,
 			"stopping":         closed(d.Stopping),
@@ -378,10 +376,6 @@ func (d *Deps) mediaSummary() map[string]any {
 }
 
 // --- queue views ------------------------------------------------------------
-
-// BuildMilestone is stamped into discord_status so a log or screenshot always
-// says which build produced it. Bump it per milestone.
-const BuildMilestone = "M2c"
 
 func findQueueStat(qs []bus.QueueStat, agent string) (bus.QueueStat, bool) {
 	for _, q := range qs {

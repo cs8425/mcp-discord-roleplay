@@ -35,7 +35,6 @@ type Deps struct {
 	MediaSweep *media.Report  // what the startup cache sweep did; nil when it did not run
 	Stopping   chan struct{}  // closed as soon as shutdown begins
 	StartedAt  time.Time
-	Version    string
 	Log        *slog.Logger // operator-facing bookkeeping; nil falls back to a sink
 
 	toolNames []string // filled in by RegisterAll, reported by discord_status

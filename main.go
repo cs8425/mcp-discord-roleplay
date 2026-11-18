@@ -33,8 +33,13 @@ import (
 	"mcp-discord-roleplay/internal/tz"
 )
 
-// version is stamped per milestone; keep it in sync with tools.BuildMilestone.
-const version = "0.1.0-M2c"
+// version is this build's one identity: it answers -version, it rides the
+// startup log line, and main hands it to the MCP server as serverInfo.version
+// (initialize/discover). That is a *server* version and has nothing to do with
+// the protocol revisions negotiated in mcptransport/rpc.go, which must not move.
+// A var so a later CI build can stamp it with -ldflags -X main.version=…
+// without touching the code; until then it says "dev", which is what it is.
+var version = "0.1.0-dev"
 
 func main() {
 	os.Exit(run(os.Args[1:]))
@@ -60,6 +65,7 @@ func run(args []string) int {
 		return 2
 	}
 	slog.SetDefault(logger)
+	logger.Info("starting", "version", version, "agent", cfg.AgentID, "transport", cfg.Transport)
 	// Config never fails on a soft finding (an entry in both allow and deny), but
 	// it must not stay invisible either.
 	for _, w := range cfg.Warnings {
@@ -118,7 +124,6 @@ func run(args []string) int {
 		MediaSweep: &sweep,
 		Stopping:   shutting,
 		StartedAt:  time.Now(),
-		Version:    version,
 		Log:        logger,
 	}
 	if err := tools.RegisterAll(reg, deps); err != nil {
@@ -195,7 +200,7 @@ func selftest(cfg *config.Config, rt *router.Router, logger *slog.Logger) int {
 		fmt.Fprintf(out, "FAIL %s\n", fmt.Sprintf(format, args...))
 	}
 
-	fmt.Fprintf(out, "%s %s selftest (milestone %s)\n", config.Module, version, tools.BuildMilestone)
+	fmt.Fprintf(out, "%s %s selftest\n", config.Module, version)
 	fmt.Fprintf(out, "time now: %s\n\n", tz.Format(tz.Now()))
 
 	if cfg.Token == "" {
@@ -361,7 +366,6 @@ func selftest(cfg *config.Config, rt *router.Router, logger *slog.Logger) int {
 		Files:     files.New(cfg, logger),
 		Stopping:  make(chan struct{}),
 		StartedAt: time.Now(),
-		Version:   version,
 		Log:       logger,
 	}
 	if err := tools.RegisterAll(reg, deps); err != nil {
