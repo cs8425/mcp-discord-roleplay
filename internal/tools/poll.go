@@ -4,7 +4,7 @@
 // agent's queue until a poll drains them; taking them out IS the acknowledgment,
 // so there is no cursor to remember, no ack to send, and nothing to replay. A
 // restart empties the queue (by design, see internal/bus), which is why
-// catching up on older messages is discord_history's job, not poll's.
+// catching up on older messages is the history tool's job (M3), not poll's.
 //
 // Two limits keep a reply inside a model context window:
 //
@@ -837,7 +837,7 @@ func fitMessage(m *pollMessage, room int, st *drainState) {
 	if m.TextTruncated && len(m.Text) < orig {
 		st.notes = append(st.notes, "這一則超過 poll 的位元組預算，文字裁到 "+
 			strconv.Itoa(len(m.Text))+" bytes（原本 "+strconv.Itoa(full)+
-			" bytes）；要看完整內容等 discord_history")
+			" bytes）；這裡只有開頭")
 	}
 
 	// 2. Still too big: list fewer attachments and count what is left out.
