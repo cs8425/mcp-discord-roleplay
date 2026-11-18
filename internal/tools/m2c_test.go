@@ -73,9 +73,7 @@ func TestSendRefusesWildcardAlias(t *testing.T) {
 	}
 
 	buf := withDebugLog(t, d)
-	if o := sendOK(t, d, `{"to":"dm:555444333222111000","text":"hi"}`); o["ok"] != true {
-		t.Fatalf("default widened dms and should send: %v", o)
-	}
+	sendOK(t, d, `{"to":"dm:555444333222111000","text":"hi"}`) // default widened dms and should send
 	sentTo(t, buf, "kind=dm", "target=dms", "channel_id=dry-run-dm:555444333222111000")
 }
 

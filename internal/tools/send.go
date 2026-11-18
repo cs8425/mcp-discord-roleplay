@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	mcp "mcptransport"
@@ -236,7 +237,7 @@ func (d *Deps) handleSend(ctx context.Context, call *mcp.Call) (*mcp.ToolResult,
 		lastRes = res
 	}
 
-	w := sendWire{OK: true}
+	w := sendWire{}
 	if len(parts) > 1 {
 		w.PartsSent = len(ids)
 	}
@@ -253,23 +254,39 @@ func (d *Deps) handleSend(ctx context.Context, call *mcp.Call) (*mcp.ToolResult,
 	if len(warn) > 0 {
 		w.Warnings = warn
 	}
+	// What is waiting on the way back, and the server's clock: the two things an
+	// agent that has just spoken usually wants to know, for free.
+	size, capacity, oldest := d.queueCell(p.AgentID)
+	w.Queue = queueRatio(size, capacity)
+	if oldest != nil {
+		w.OldestS = round1(time.Since(oldest.Ts).Seconds())
+	}
+	w.Now = tz.Format(time.Now())
+
 	d.logSend(p, ru, chanID, ids, lastRes)
 	return jsonResult(w), nil
 }
 
 // sendWire is the successful answer, and it is deliberately almost nothing: the
 // text is on Discord now, so the agent only needs the facts that could change
-// what it does next — did one message go out or five, what became of the files,
-// and is this run not really sending. Which alias was picked, which channel it
-// landed in, and the message ids Discord handed back are for the operator, so
-// they went to the log.
+// what it does next: did one message go out or five, what became of the files,
+// is this run not really sending, and what is waiting for it on the way back.
+// Which alias was picked, which channel it landed in, and the message ids
+// Discord handed back are for the operator, so they went to the log.
 type sendWire struct {
-	OK          bool       `json:"ok"`
 	PartsSent   int        `json:"parts_sent,omitempty"`
 	Attachments []sentFile `json:"attachments,omitempty"`
 	URLCount    int        `json:"url_count,omitempty"`
 	DryRun      bool       `json:"dry_run,omitempty"`
 	Warnings    []string   `json:"warnings,omitempty"`
+
+	// The room's state, so a send doubles as a heartbeat: "unread/capacity" for
+	// this agent's queue, how long the oldest of it has waited (absent when the
+	// queue is empty), and the server clock formatted exactly like the "ts" a
+	// poll reports, so the two can be compared without a translation step.
+	Queue   string  `json:"queue,omitempty"`
+	OldestS float64 `json:"oldest_s,omitempty"`
+	Now     string  `json:"now"`
 }
 
 // logSend records what a send actually did: which alias resolved to which

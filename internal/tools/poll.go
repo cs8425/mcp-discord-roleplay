@@ -911,11 +911,12 @@ type pollMeta struct {
 	dropped   uint64
 }
 
-// pollWire is the envelope, and it is the whole budget: a quiet poll costs two
-// keys — the one thing a poll has to answer, plus whether it succeeded — and
-// every other field only earns its place by being non-empty.
+// pollWire is the envelope, and it is the whole budget: a quiet poll costs one
+// key -- reason, which is also what says whether anything arrived -- and every
+// other field only earns its place by being non-empty. Success is not a field:
+// a call that failed never reaches this struct, it goes out as an errResult
+// with isError set.
 type pollWire struct {
-	OK        bool      `json:"ok"`
 	Reason    string    `json:"reason"`
 	Messages  []msgWire `json:"messages,omitempty"`
 	Remaining int       `json:"remaining,omitempty"` // absent means caught up
@@ -935,7 +936,7 @@ func (d *Deps) pollEnvelope(m pollMeta) pollWire {
 		// shutdown keep their own words: they say what ended the wait.
 		reason = "disconnected"
 	}
-	w := pollWire{OK: true, Reason: reason}
+	w := pollWire{Reason: reason}
 	// Everything below rides with messages only: a queue that handed over
 	// nothing has nothing left, nothing trimmed and nothing to explain.
 	if m.count > 0 {

@@ -204,9 +204,11 @@ func jsonResult(v any) *mcp.ToolResult {
 }
 
 // errResult builds an isError result carrying a machine-readable code plus a
-// hint the model can act on.
+// hint the model can act on. There is no "ok": the tool result's own isError
+// already says whether the call worked, and neither pollWire nor sendWire
+// repeats it -- one fact does not need two bits.
 func errResult(code, hint string, extra map[string]any) *mcp.ToolResult {
-	m := map[string]any{"ok": false, "error": code}
+	m := map[string]any{"error": code}
 	if hint != "" {
 		m["hint"] = hint
 	}

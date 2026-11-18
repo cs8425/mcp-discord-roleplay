@@ -344,3 +344,36 @@ func TestClassifyMedia(t *testing.T) {
 		}
 	}
 }
+
+// Oldest is the peek that lets a send report how long the front of the queue has
+// waited. It must never consume: a peek that cost a message would quietly eat
+// the caller's inbox, and the number would then disagree with the next poll.
+func TestOldestIsAPeek(t *testing.T) {
+	q := NewQueue(4)
+	if got := q.Oldest(); got != nil {
+		t.Fatalf("an empty queue has no oldest, got %+v", got)
+	}
+
+	first := &Event{Kind: "message", Target: "boss", Text: "a", Ts: time.Now().Add(-30 * time.Second)}
+	q.Push(first)
+	q.Push(&Event{Kind: "message", Target: "boss", Text: "b", Ts: time.Now()})
+
+	if got := q.Oldest(); got != first {
+		t.Fatalf("oldest = %+v, want the first push", got)
+	}
+	if s := q.Stats(); s.Size != 2 {
+		t.Errorf("a peek must not change the size: %+v", s)
+	}
+
+	// Take the front and the next one is oldest: this is exactly what a poll
+	// would deliver next, so the two views can never disagree.
+	q.Drain(func(e *Event) Verdict {
+		if e.Text == "a" {
+			return Take
+		}
+		return Stop
+	})
+	if got := q.Oldest(); got == nil || got.Text != "b" {
+		t.Errorf("oldest after taking a = %+v, want b", got)
+	}
+}

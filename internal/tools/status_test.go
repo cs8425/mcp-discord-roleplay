@@ -315,3 +315,13 @@ func TestStatusPrettyShowsBothViews(t *testing.T) {
 		}
 	}
 }
+
+// The panel is operator-facing, but it must not keep a vocabulary the wire gave
+// up: `ok` was retired everywhere because the tool result's own isError already
+// carries that bit, and a stale key in the log is how a second truth survives.
+func TestFullPanelRetiredOkToo(t *testing.T) {
+	d := newDeps(t, routingCfg(t))
+	if _, dead := d.fullPanel(router.Principal{AgentID: d.Cfg.AgentID})["ok"]; dead {
+		t.Error("fullPanel still reports ok; the wire stopped repeating isError, so must the log")
+	}
+}

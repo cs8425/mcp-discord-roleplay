@@ -284,6 +284,19 @@ func (q *Queue) Latest(f func(*Event) bool, limit int) []*Event {
 	return out
 }
 
+// Oldest returns the event that has waited longest, or nil when the queue is
+// empty. It is a peek: nothing is removed and no wake-up signal is consumed, so
+// looking costs the caller no message. The ring's front is index 0 (atLocked
+// numbers oldest-first), which is exactly the next thing a poll would deliver.
+func (q *Queue) Oldest() *Event {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.size == 0 {
+		return nil
+	}
+	return q.atLocked(0)
+}
+
 // Stats reports current queue state.
 func (q *Queue) Stats() Stats {
 	q.mu.Lock()

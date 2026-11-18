@@ -131,8 +131,17 @@ func sendOK(t *testing.T, d *Deps, args string) map[string]any {
 		t.Fatalf("expected success, got error answer: %s", res.Content[0].Text)
 	}
 	out := decode(t, res)
-	if out["ok"] != true {
-		t.Fatalf("ok != true: %v", out)
+	if _, bad := out["error"]; bad {
+		t.Fatalf("a success answer must not carry an error code: %v", out)
+	}
+	if _, dead := out["ok"]; dead {
+		t.Fatalf("`ok` is off the wire, isError carries it: %v", out)
+	}
+	if q, _ := out["queue"].(string); q == "" {
+		t.Fatalf("a send must report the queue cell (unread/capacity): %v", out)
+	}
+	if n, _ := out["now"].(string); n == "" {
+		t.Fatalf("a send must report the server clock: %v", out)
 	}
 	return out
 }
@@ -146,8 +155,8 @@ func sendErr(t *testing.T, d *Deps, args string) map[string]any {
 		t.Fatalf("expected an isError answer, got success: %s", res.Content[0].Text)
 	}
 	out := decode(t, res)
-	if out["ok"] != false {
-		t.Errorf("a failure must say ok:false, got %v", out["ok"])
+	if _, dead := out["ok"]; dead {
+		t.Errorf("a failure must not repeat isError as ok: %v", out)
 	}
 	if s, _ := out["error"].(string); s == "" {
 		t.Errorf("a failure must carry an error code: %v", out)
@@ -192,16 +201,61 @@ func TestSendDryRunEnvelope(t *testing.T) {
 	if out["dry_run"] != true {
 		t.Error("dry-run must say so, or the model will believe it posted")
 	}
-	// One part, no attachments: the whole answer is that it worked, that this was
-	// a rehearsal, and the warning that says what a rehearsal means. A fourth key
-	// has to be argued for here.
-	if got := keySet(out); got != "dry_run,ok,warnings" {
-		t.Errorf("a plain dry-run send costs the model three keys, got %v", out)
+	// One part, no attachments: the answer is that this was a rehearsal, the
+	// warning that says what a rehearsal means, and the two ambient facts every
+	// send now carries (the queue cell and the server clock). `oldest_s` is
+	// absent, which is what an empty queue looks like. A fifth key has to be
+	// argued for here.
+	if got := keySet(out); got != "dry_run,now,queue,warnings" {
+		t.Errorf("a plain dry-run send costs the model four keys, got %v", out)
 	}
 	// Everything else is still decided and still recorded, only not on the wire:
 	// which alias resolved to which channel, and what Discord called the message.
 	sentTo(t, buf, "target=boss", "kind=channel", "channel_id=111222333444555666",
 		"message_ids=[dry-run]", "delivered=111222333444555666")
+}
+
+// A send is also a heartbeat: it hands back the caller's queue cell, how long
+// the oldest thing in it has waited, and the server clock. `ok` used to sit
+// where these three facts now do, and it could only ever say true.
+func TestSendReportsQueueState(t *testing.T) {
+	d := newDeps(t, routingCfg(t))
+
+	// Nothing waiting: the cell says so, and there is no age to report.
+	out := sendOK(t, d, `{"to":"boss","text":"hi"}`)
+	if q, _ := out["queue"].(string); !strings.HasPrefix(q, "0/") {
+		t.Errorf("queue = %q, want an empty cell over the capacity", q)
+	}
+	if _, bad := out["oldest_s"]; bad {
+		t.Errorf("an empty queue has no oldest message to age: %v", out)
+	}
+
+	push(t, d, "default", &bus.Event{Kind: "message", Ts: time.Now().Add(-90 * time.Second),
+		Target: "channel:111222333444555666", Text: "waiting"})
+
+	out = sendOK(t, d, `{"to":"boss","text":"again"}`)
+	if q, _ := out["queue"].(string); !strings.HasPrefix(q, "1/") {
+		t.Errorf("queue = %q, want the one message still unread", q)
+	}
+	age, _ := out["oldest_s"].(float64)
+	if age < 89 || age > 120 {
+		t.Errorf("oldest_s = %v, want the ~90 seconds the front event has waited", age)
+	}
+
+	// The clock is spelled exactly like the `ts` a poll reports, so a caller can
+	// place its own timestamps next to ours without a translation step.
+	now, _ := out["now"].(string)
+	if _, err := time.Parse(time.RFC3339, now); err != nil {
+		t.Errorf("now = %q, want RFC3339 like a polled ts: %v", now, err)
+	}
+
+	// Peeking must not consume: the message is still queued for the next poll,
+	// and this is the property E-6's ghost is measured with.
+	q, _ := out["queue"].(string)
+	out = sendOK(t, d, `{"to":"boss","text":"third"}`)
+	if again, _ := out["queue"].(string); again != q {
+		t.Errorf("queue moved from %q to %q: a send must not drain anything", q, again)
+	}
 }
 
 func TestSendByEveryTargetForm(t *testing.T) {
@@ -223,10 +277,7 @@ func TestSendByEveryTargetForm(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.to, func(t *testing.T) {
 			buf := withDebugLog(t, d)
-			out := sendOK(t, d, `{"to":`+jsonString(tc.to)+`,"text":"hi"}`)
-			if out["ok"] != true {
-				t.Fatalf("out = %v", out)
-			}
+			sendOK(t, d, `{"to":`+jsonString(tc.to)+`,"text":"hi"}`)
 			sentTo(t, buf, "target="+tc.alias, "kind="+tc.kind,
 				"channel_id="+tc.ch, "delivered="+tc.ch)
 		})
@@ -244,10 +295,7 @@ func TestSendByEveryTargetForm(t *testing.T) {
 func TestAdHocBareSnowflake(t *testing.T) {
 	d := newDeps(t, toolCfg(t))
 	buf := withDebugLog(t, d)
-	out := sendOK(t, d, `{"to":"444555666777888999","text":"hi"}`)
-	if out["ok"] != true {
-		t.Fatalf("out = %v", out)
-	}
+	sendOK(t, d, `{"to":"444555666777888999","text":"hi"}`)
 	sentTo(t, buf, "channel_id=444555666777888999", "kind=channel")
 }
 
@@ -261,9 +309,7 @@ func TestAdHocDenyDMWildcard(t *testing.T) {
 		t.Error("an allow-list refusal is the operator's call, listing aliases would invite probing")
 	}
 	buf := withDebugLog(t, d)
-	if o := sendOK(t, d, `{"to":"444555666777888999","text":"hi"}`); o["ok"] != true {
-		t.Fatalf("denying dm:* must leave guild channels alone: %v", o)
-	}
+	sendOK(t, d, `{"to":"444555666777888999","text":"hi"}`) // denying dm:* must leave guild channels alone
 	sentTo(t, buf, "kind=channel", "channel_id=444555666777888999")
 }
 
@@ -364,9 +410,7 @@ func TestLastTargetRoundTripAndIsolation(t *testing.T) {
 		t.Error("no_last_target should offer the aliases it could use instead")
 	}
 
-	if o := sendOK(t, d, `{"to":"ami","text":"first"}`); o["ok"] != true {
-		t.Fatalf("setup send failed: %v", o)
-	}
+	sendOK(t, d, `{"to":"ami","text":"first"}`) // setup
 	buf := withDebugLog(t, d)
 	sendOK(t, d, `{"to":"LAST","text":"follow-up"}`)
 	sentTo(t, buf, "target=ami", "channel_id=dry-run-dm:222333444555666777")
@@ -381,11 +425,11 @@ func TestLastTargetRoundTripAndIsolation(t *testing.T) {
 
 	// ... and its own send creates its own pointer.
 	soloCtx := router.WithPrincipal(context.Background(), router.Principal{AgentID: "solo"})
-	if o := decode(t, call(t, d, soloCtx, `{"to":"boss","text":"hi"}`)); o["ok"] != true {
+	if o := decode(t, call(t, d, soloCtx, `{"to":"boss","text":"hi"}`)); o["error"] != nil {
 		t.Fatalf("solo send failed: %v", o)
 	}
 	buf = withDebugLog(t, d)
-	if o := decode(t, call(t, d, soloCtx, `{"to":"last","text":"again"}`)); o["ok"] != true {
+	if o := decode(t, call(t, d, soloCtx, `{"to":"last","text":"again"}`)); o["error"] != nil {
 		t.Fatalf("solo 'last' send failed: %v", o)
 	}
 	sentTo(t, buf, "target=boss")
@@ -409,9 +453,7 @@ func TestLastSurvivesTargetRemoval(t *testing.T) {
 		t.Fatal(err)
 	}
 	d := newDeps(t, toolCfg(t, "-config="+path))
-	if o := sendOK(t, d, `{"to":"log","text":"while allowed"}`); o["ok"] != true {
-		t.Fatalf("setup: %v", o)
-	}
+	sendOK(t, d, `{"to":"log","text":"while allowed"}`) // setup
 
 	// Same alias, now read-only, and a router rebuilt from it.
 	off := routingJSON
@@ -691,7 +733,7 @@ func TestPathEscapeIsRefused(t *testing.T) {
 		"ok.txt", "/ok.txt", "./ok.txt", "//ok.txt", "ok.txt/",
 		"/../ok.txt", "sub/../ok.txt", "/./sub/../ok.txt", "sub/deep.txt", "/sub/../sub/deep.txt",
 	} {
-		if out := sendOK(t, d, `{"to":"boss","files":[{"path":`+jsonString(p)+`}]}`); out["ok"] != true {
+		if out := sendOK(t, d, `{"to":"boss","files":[{"path":`+jsonString(p)+`}]}`); out["attachments"] == nil {
 			t.Errorf("Open(%q) failed: %v", p, out)
 		}
 	}

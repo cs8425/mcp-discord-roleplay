@@ -220,8 +220,11 @@ func TestPollTimeoutIsSuccessAndTiny(t *testing.T) {
 		t.Errorf("returned after %v, should have waited the full second", el)
 	}
 	wantStr(t, out, "reason", "timeout")
-	if len(out) != 2 {
+	if len(out) != 1 {
 		t.Errorf("an empty answer must stay small, got %d keys: %v", len(out), out)
+	}
+	if _, dead := out["ok"]; dead {
+		t.Error("poll must not repeat the tool result's isError as ok")
 	}
 	if _, bad := out["messages"]; bad {
 		t.Error("no messages, no messages key")
@@ -238,8 +241,8 @@ func TestPollDisconnectedIsNotTimeout(t *testing.T) {
 	d := newDeps(t, routingCfg(t, "-poll-min-wait=1", "-poll-default-wait=1", "-poll-jitter-pct=0"))
 	out := pollOK(t, d, `{}`) // the fixture's client was never started
 	wantStr(t, out, "reason", "disconnected")
-	if len(out) != 2 {
-		t.Errorf("still two keys, just a different word: %v", out)
+	if len(out) != 1 {
+		t.Errorf("still one key, just a different word: %v", out)
 	}
 }
 
@@ -488,8 +491,8 @@ func TestPollWireKeysAreExactlyThese(t *testing.T) {
 	push(t, d, "default", e)
 
 	out := pollOK(t, d, `{"max_wait":1}`)
-	if got := keySet(out); got != "messages,ok,reason" {
-		t.Errorf("envelope keys = %s, want exactly the three that change what the agent does", got)
+	if got := keySet(out); got != "messages,reason" {
+		t.Errorf("envelope keys = %s, want exactly the two that change what the agent does", got)
 	}
 
 	m := firstMsg(t, out)

@@ -97,6 +97,39 @@ func gatewayState(snap discord.Snapshot, stopping bool) string {
 	}
 }
 
+// queueRatio renders a queue as the one string this server reports it in:
+// "unread/capacity". status and send share it, so the two can never drift into
+// two spellings of the same number.
+func queueRatio(size, capacity int) string {
+	return strconv.Itoa(size) + "/" + strconv.Itoa(capacity)
+}
+
+// queueCell is what one agent's queue looks like right now: how much is waiting,
+// the capacity to report against, and the event that has waited longest (nil
+// when nothing is). Send calls it so a reply is also a heartbeat: the caller
+// learns whether anyone spoke while it was talking, without spending a status
+// call on it.
+func (d *Deps) queueCell(agentID string) (size, capacity int, oldest *bus.Event) {
+	if d.Hub == nil {
+		return 0, d.Cfg.BusCapacity, nil
+	}
+	q, ok := d.Hub.Queue(agentID)
+	if !ok {
+		// The same fallback status uses: an agent with no queue of its own sees
+		// the process default's numbers rather than a phantom zero.
+		q, ok = d.Hub.Queue(d.Cfg.AgentID)
+	}
+	if !ok {
+		return 0, d.Cfg.BusCapacity, nil
+	}
+	st := q.Stats()
+	capacity = st.Capacity
+	if capacity <= 0 {
+		capacity = d.Cfg.BusCapacity
+	}
+	return st.Size, capacity, q.Oldest()
+}
+
 // statusWireOf reads live state, so it deliberately reads as little of it as it
 // can: the answer is supposed to be cheap enough to call before every exchange.
 func (d *Deps) statusWireOf(p router.Principal) statusWire {
@@ -114,7 +147,7 @@ func (d *Deps) statusWireOf(p router.Principal) statusWire {
 	}
 	w := statusWire{
 		Gateway:   gatewayState(snap, closed(d.Stopping)),
-		Queue:     strconv.Itoa(own.Size) + "/" + strconv.Itoa(capacity),
+		Queue:     queueRatio(own.Size, capacity),
 		Dropped:   own.Dropped,
 		LastError: snap.LastError,
 	}
@@ -204,8 +237,6 @@ func (d *Deps) fullPanel(p router.Principal) map[string]any {
 	}
 
 	out := map[string]any{
-		"ok": true,
-
 		// --- connection ---------------------------------------------------
 		"connection": map[string]any{
 			"connected":        snap.Connected,
