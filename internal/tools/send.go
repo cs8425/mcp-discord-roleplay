@@ -146,11 +146,10 @@ func (d *Deps) handleSend(ctx context.Context, call *mcp.Call) (*mcp.ToolResult,
 		case strings.TrimSpace(f.Path) != "":
 			o, err := d.Files.OpenRef(f)
 			if err != nil {
-				ex := idx
-				if files.CodeOf(err) == files.CodeNotFound {
-					ex["file_roots"] = d.Cfg.FileRoots
-				}
-				return errResult(files.CodeOf(err), err.Error(), ex), nil
+				// The roots are already in the sentence ("...under the file roots
+				// (dir)"): a second copy as a field is one more host path in front
+				// of a model that cannot type it.
+				return errResult(files.CodeOf(err), err.Error(), idx), nil
 			}
 			opened = append(opened, o)
 		default:

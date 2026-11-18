@@ -1,22 +1,33 @@
 // status.go exposes the one tool whose entire job is "what happened to my
-// messages". The answer is split by concern — connection / send / receive /
-// limits / routing — so an agent that is debugging a failed send is not made to
-// wade through the inbound queues, and so each block can be extended without
-// breaking the others.
+// messages". Two views answer that, and they are deliberately not the same size.
 //
-// The receive block describes ONE queue: the caller's. Since M2 each agent has
-// its own queue and taking a message out is the acknowledgement, so there is no
-// sequence number and no cursor to report — M1's baseline_cursor/head_cursor are
-// gone, replaced by depth, drops and how long ago that agent last polled.
-// Another agent's unread messages are deliberately not visible here.
+// The WIRE view (statusWire, six keys) is what a model gets: a state table it can
+// read and decide from — gateway, queue depth against its capacity, cumulative
+// drops, why it is not connected, and the aliases it may speak to. No hints and
+// no next_action: "1500/2000" already says poll soon, and "down" already says do
+// not send. The judgement is left to the caller; the server only states facts.
+// Static truths about this deployment (intent off, --dry-run) ride in the tool
+// descriptions, which travel once per session instead of once per call.
+//
+// The PANEL view (fullPanel) keeps everything an operator might want: connection
+// internals, send bookkeeping, every agent's queue, the configured limits and the
+// routing file. It reaches nobody unless the debug log is on or --selftest prints
+// it. Host paths (file roots, media save dir) survive only there, because a model
+// cannot type them — its own file box is addressed by the mcpdr- handle.
+//
+// Both views describe ONE queue: the caller's. Since M2 each agent has its own
+// queue and taking a message out is the acknowledgement, so there is no sequence
+// number and no cursor to report — M1's baseline_cursor/head_cursor are gone,
+// replaced by depth, drops and how long ago that agent last polled. Another
+// agent's unread messages are deliberately not visible here.
 
 package tools
 
 import (
 	"context"
-	"path/filepath"
+	"encoding/json"
+	"log/slog"
 	"strconv"
-	"strings"
 	"time"
 
 	mcp "mcptransport"
@@ -40,7 +51,12 @@ func statusTool(prefix string) *mcp.Tool {
 		Title: "Discord bridge health and your queue",
 		Description: "Report connection health, this agent's message queue, " +
 			"recent errors and the configured limits. Call it before anything else " +
-			"when something seems wrong, or when you need a target alias.",
+			"when something seems wrong, or when you need a target alias. " +
+			"gateway is ready|starting|down|stopping; queue is unread/capacity, so a " +
+			"high ratio means poll before the oldest messages are dropped; dropped " +
+			"counts messages overwritten while nobody polled, since startup; targets " +
+			"are the aliases this caller may send to and read_only the ones it " +
+			"receives but cannot answer.",
 		InputSchema: mcp.Schema{
 			Type:        mcp.TypeObject,
 			Description: "Discord roleplay bridge status snapshot",
@@ -51,18 +67,129 @@ func statusTool(prefix string) *mcp.Tool {
 	}
 }
 
-// handleStatus answers the status query. The caller's agent id (from
-// _meta.agentId) scopes which routing rules and which queue are "theirs".
-func (d *Deps) handleStatus(ctx context.Context, call *mcp.Call) (*mcp.ToolResult, error) {
-	// A Deps without a client is legal (selftest, unit tests): answer honestly
-	// with "gateway never started" instead of panicking on a nil pointer.
-	var snap discord.Snapshot
-	if d.DC != nil {
-		snap = d.DC.Snapshot()
+// statusWire is the whole answer discord_status gives a model. Six keys, all of
+// them state rather than advice, because a caller that can read a ratio does not
+// need a sentence telling it to poll. Everything else this process knows lives in
+// fullPanel and only travels to the debug log or --selftest.
+type statusWire struct {
+	Gateway   string   `json:"gateway"`              // ready | starting | down | stopping
+	Queue     string   `json:"queue"`                // "unread/capacity", always present
+	Dropped   uint64   `json:"dropped,omitempty"`    // ring overwrites since startup, this agent only
+	LastError string   `json:"last_error,omitempty"` // why the gateway is unusable, when it is
+	Targets   []string `json:"targets,omitempty"`    // aliases send accepts from this caller
+	ReadOnly  []string `json:"read_only,omitempty"`  // received, but refused on send
+}
+
+// gatewayState folds four booleans (started / connected / ready / stopping) into
+// the one word that decides whether a caller should act at all. A client that was
+// never started and a socket that died are the same thing to a model: sending
+// would fail either way, and the panel keeps the difference.
+func gatewayState(snap discord.Snapshot, stopping bool) string {
+	switch {
+	case stopping:
+		return "stopping"
+	case !snap.Started || !snap.Connected:
+		return "down"
+	case !snap.Ready:
+		return "starting"
+	default:
+		return "ready"
 	}
+}
+
+// statusWireOf reads live state, so it deliberately reads as little of it as it
+// can: the answer is supposed to be cheap enough to call before every exchange.
+func (d *Deps) statusWireOf(p router.Principal) statusWire {
+	snap := d.gatewaySnapshot()
+	qs := d.Hub.Stats()
+	own, hasQueue := findQueueStat(qs, p.AgentID)
+	if !hasQueue {
+		// An agent with no queue of its own yet: report the numbers the process
+		// default would see, so the ratio still means something.
+		own, _ = findQueueStat(qs, d.Cfg.AgentID)
+	}
+	capacity := own.Capacity
+	if capacity <= 0 {
+		capacity = d.Cfg.BusCapacity
+	}
+	w := statusWire{
+		Gateway:   gatewayState(snap, closed(d.Stopping)),
+		Queue:     strconv.Itoa(own.Size) + "/" + strconv.Itoa(capacity),
+		Dropped:   own.Dropped,
+		LastError: snap.LastError,
+	}
+	w.Targets, w.ReadOnly = d.targetAliases(p)
+	return w
+}
+
+// targetAliases answers, in the words the caller has to type, what it may send to
+// and what it only hears. A wildcard rule ("dm:*") is a POLICY and not an
+// address: send refuses to:"dms", so listing it as if it were one would only
+// invite a failure. It stays visible in routing.json, the debug log and selftest.
+// A rule this agent may neither read nor write is left out of both lists.
+func (d *Deps) targetAliases(p router.Principal) (writable, readOnly []string) {
+	for _, ru := range d.Router.Targets(p) {
+		if ru.Wildcard {
+			continue
+		}
+		switch {
+		case ru.Write:
+			writable = append(writable, ru.Alias)
+		case ru.Read:
+			readOnly = append(readOnly, ru.Alias)
+		}
+	}
+	return writable, readOnly
+}
+
+// logStatus writes the whole panel as one debug line, and only when the operator
+// actually asked for debug output — that guard is what keeps the expensive view
+// from costing anything on the way to the cheap one.
+func (d *Deps) logStatus(ctx context.Context, p router.Principal) {
+	lg := d.debug()
+	if !lg.Enabled(ctx, slog.LevelDebug) {
+		return
+	}
+	b, err := json.Marshal(d.fullPanel(p))
+	if err != nil {
+		lg.Debug("status", "agent", p.AgentID, "error", err.Error())
+		return
+	}
+	lg.Debug("status", "agent", p.AgentID, "panel", string(b))
+}
+
+// StatusPretty renders the status answer the way an operator wants it: the wire
+// first, because that is literally what the model will see, then the full panel
+// behind it. Only --selftest calls it, so its size costs no context.
+func StatusPretty(d *Deps) string {
+	p := d.principal(context.Background())
+	w := d.statusWireOf(p)
+	bw, err := json.Marshal(&w)
+	if err != nil {
+		bw = []byte("{wire unavailable: " + err.Error() + "}")
+	}
+	bp, err := json.MarshalIndent(d.fullPanel(p), "", "  ")
+	if err != nil {
+		bp = []byte("{panel unavailable: " + err.Error() + "}")
+	}
+	return "wire:  " + string(bw) + "\npanel:\n" + string(bp) + "\n"
+}
+
+// handleStatus answers the query with the wire shape and nothing else.
+func (d *Deps) handleStatus(ctx context.Context, call *mcp.Call) (*mcp.ToolResult, error) {
+	p := d.principal(ctx)
+	w := d.statusWireOf(p)
+	d.logStatus(ctx, p)
+	return jsonResult(&w), nil
+}
+
+// fullPanel is everything this process knows, in the six blocks an operator reads
+// when something is wrong. Built on demand: the poll/send/status handlers do not
+// pay for it unless the debug log wants it.
+func (d *Deps) fullPanel(p router.Principal) map[string]any {
+	snap := d.gatewaySnapshot()
 	qs := d.Hub.Stats()
 
-	p := d.principal(ctx)
 	own, hasQueue := findQueueStat(qs, p.AgentID)
 	if !hasQueue {
 		// Report the numbers the process default would see rather than zeros,
@@ -167,8 +294,6 @@ func (d *Deps) handleStatus(ctx context.Context, call *mcp.Call) (*mcp.ToolResul
 			"uptime_s":         int64(time.Since(d.uptimeBase()).Seconds()),
 			"started_at":       tz.Format(d.uptimeBase()),
 			"registered_tools": d.toolNames,
-			"next_action":      d.nextAction(snap, qs, p),
-			"warnings":         d.warnings(snap, qs, p),
 		},
 	}
 
@@ -180,7 +305,7 @@ func (d *Deps) handleStatus(ctx context.Context, call *mcp.Call) (*mcp.ToolResul
 	if lim.RetryAfterMS > 0 {
 		out["send"].(map[string]any)["retry_after_ms"] = lim.RetryAfterMS
 	}
-	return jsonResult(out), nil
+	return out
 }
 
 // uptimeBase is when this process came up: Deps.StartedAt when main set it,
@@ -291,96 +416,4 @@ func (d *Deps) lastPollAgeS(agent string) any {
 		return nil
 	}
 	return int64(time.Since(t).Seconds())
-}
-
-func joinAgents(agents []string) string { return strings.Join(agents, ", ") }
-
-// nextAction is a single recommendation string. LLM callers act on prose far
-// more reliably than on a table of booleans, so the judgement is done server
-// side and shipped as one imperative line.
-func (d *Deps) nextAction(snap discord.Snapshot, qs []bus.QueueStat, p router.Principal) string {
-	switch {
-	case !snap.Started:
-		return "run the server without --selftest to connect"
-	case !snap.Connected:
-		return "wait for the gateway to reconnect before sending; check the token and that the bot is in the guild"
-	case !snap.Ready:
-		return "wait a moment for READY, then call " + d.toolStatus() + " again"
-	case len(d.Router.Targets(p)) == 0:
-		return "no visible targets for this agent: check routing.json or --allow-channels"
-	case queueSizeTotal(qs) > 0:
-		return "call " + d.toolPoll() + ": there are unread messages waiting"
-	default:
-		return "connected and idle; send a message or call " + d.toolPoll() + " to wait for one"
-	}
-}
-
-// warnings collects the things that are silently wrong: no gateway, no queue
-// for this caller, events nobody may read, dropped messages, an open breaker.
-// An empty slice means "nothing to complain about"; do not fold it into a
-// single ok flag, the caller needs the list to decide what to do.
-func (d *Deps) warnings(snap discord.Snapshot, qs []bus.QueueStat, p router.Principal) []string {
-	var w []string
-
-	if !snap.Started {
-		w = append(w, "gateway never started (--selftest mode): nothing will be received or sent")
-	} else if !snap.Connected || !snap.Ready {
-		w = append(w, "gateway is not ready: "+d.toolSend()+" will fail until the websocket handshake completes")
-	}
-	if snap.SelfID == "" && snap.Started {
-		w = append(w, "the bot identity is still unknown — READY has not arrived yet, so mentions_self cannot be computed")
-	}
-	if !d.Cfg.MessageContentEnabled() {
-		w = append(w, "the Message Content intent is off (--no-message-content): incoming 'text' is always empty, "+
-			"so a poll proves that something arrived, not what was said; mentions, attachments and embeds still work")
-	}
-
-	if d.Router.HasRouting() && d.Router.DeclaresAgent(p.AgentID) {
-		// fine: the caller is named in routing.json
-	} else if d.Router.HasRouting() {
-		w = append(w, "caller "+p.AgentID+" is not listed in routing.json: it only sees unassigned targets")
-	}
-
-	q, ok := findQueueStat(qs, p.AgentID)
-	switch {
-	case len(qs) == 0:
-		w = append(w, "no queues exist: no agent may read any incoming message")
-	case !ok:
-		w = append(w, "caller "+p.AgentID+" has no queue: "+d.toolPoll()+" will return empty results for it")
-	case q.Dropped > 0:
-		w = append(w, strconv.FormatUint(q.Dropped, 10)+
-			" event(s) were dropped from this agent's queue (cap "+strconv.Itoa(q.Capacity)+
-			"); nobody polled it often enough")
-	case q.Size*4 >= q.Capacity*3:
-		w = append(w, "this agent's queue is "+strconv.Itoa(q.Size)+"/"+strconv.Itoa(q.Capacity)+
-			" full: poll it before more messages arrive or the oldest will be dropped")
-	}
-
-	if total := queueDroppedTotal(qs); total > 0 && q.Dropped == 0 {
-		w = append(w, strconv.FormatUint(total, 10)+
-			" event(s) dropped across other agents' queues")
-	}
-	if n := d.Hub.Skipped(); n > 0 {
-		w = append(w, strconv.FormatUint(n, 10)+
-			" inbound event(s) had no audience and were discarded; check --allow-*/routing.json")
-	}
-	if !d.Cfg.SaveEnabled() && !d.Cfg.CanInline() {
-		w = append(w, "inbound attachments are all skipped: no file content will reach the model, only url and metadata")
-	}
-	if d.Cfg.DryRun {
-		w = append(w, "dry-run mode: "+d.toolSend()+" is not delivering to Discord")
-	}
-	for _, root := range d.Cfg.FileRoots {
-		if root == "." || root == string(filepath.Separator) {
-			w = append(w, "file root is the whole filesystem or the working directory: reads are not confined")
-			break
-		}
-	}
-	if d.DC != nil {
-		if lim := d.DC.Stats(); lim.BreakerOpen {
-			w = append(w, "send circuit breaker is open: sends fail fast for "+
-				strconv.FormatInt(lim.RetryAfterMS, 10)+" ms")
-		}
-	}
-	return w
 }

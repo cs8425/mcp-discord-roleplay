@@ -56,6 +56,11 @@ type Deps struct {
 	// DC, which is what production does; a test injects its own answer, because a
 	// client that was never started is indistinguishable from one that died.
 	up func() bool
+
+	// snapshot is the same escape hatch for discord_status, which needs more than
+	// a yes/no: its gateway state reads started, connected and ready separately.
+	// nil means ask DC, which is what production does.
+	snapshot func() discord.Snapshot
 }
 
 // gatewayUp is the only place that reads the connection state for an answer:
@@ -66,6 +71,20 @@ func (d *Deps) gatewayUp() bool {
 		return d.up()
 	}
 	return d.DC != nil && d.DC.Connected()
+}
+
+// gatewaySnapshot is discord_status' one access path to the gateway state: the
+// wire and the panel must never disagree about what they saw. A Deps without a
+// client (selftest, unit tests) gets the zero value, which the state machine
+// reads as "down" rather than panicking over a nil pointer.
+func (d *Deps) gatewaySnapshot() discord.Snapshot {
+	if d.snapshot != nil {
+		return d.snapshot()
+	}
+	if d.DC == nil {
+		return discord.Snapshot{}
+	}
+	return d.DC.Snapshot()
 }
 
 // ToolName is how a tool is actually called: the bare kind plus --tool-prefix,
@@ -93,6 +112,12 @@ func (d *Deps) toolSend() string   { return ToolName(d.prefix(), "send") }
 // its bare name and picks up --tool-prefix from the registry; the constructors
 // are handed the same prefix so the text they write names the tools the way the
 // caller has to type them.
+//
+// A fact about THIS process that a model cannot read off its own answers (the
+// Message Content intent is off; sends are dry-run) is appended to the one tool
+// that has to live with it. It belongs to the description, not to every answer:
+// the description travels once per session, while a warning in the payload would
+// be paid for again on every single call.
 func RegisterAll(reg *mcp.Registry, d *Deps) error {
 	d.toolNames = nil
 	plan := []struct {
@@ -105,6 +130,11 @@ func RegisterAll(reg *mcp.Registry, d *Deps) error {
 		// M3: {historyTool(d.prefix()), d.handleHistory}, {channelsTool(d.prefix()), d.handleChannels}
 	}
 	for _, p := range plan {
+		// Names are still bare at this point -- the registry prefixes them as it
+		// registers -- which is what deploymentNote keys on.
+		if extra := d.deploymentNote(p.tool.Name); extra != "" {
+			p.tool.Description += " " + extra
+		}
 		if err := reg.Register(p.tool, p.fn); err != nil {
 			return fmt.Errorf("register %s: %w", p.tool.Name, err)
 		}
@@ -112,6 +142,28 @@ func RegisterAll(reg *mcp.Registry, d *Deps) error {
 	}
 	sort.Strings(d.toolNames)
 	return nil
+}
+
+// deploymentNote states, for one tool, the single thing about this process that
+// changes how its answers must be read. "" means nothing to add, which is the
+// common case: a build with the intent on and delivery real needs no caveat.
+func (d *Deps) deploymentNote(name string) string {
+	if d == nil || d.Cfg == nil {
+		return ""
+	}
+	switch name {
+	case "poll":
+		if !d.Cfg.MessageContentEnabled() {
+			return "In this deployment the Message Content intent is off, so incoming " +
+				"text is always empty: a poll proves that something arrived, not what " +
+				"was said -- mentions, attachments and embeds still work."
+		}
+	case "send":
+		if d.Cfg.DryRun {
+			return "This process runs with --dry-run: sends are logged, not delivered to Discord."
+		}
+	}
+	return ""
 }
 
 // principal returns the caller identity, defaulting to the process agent so a

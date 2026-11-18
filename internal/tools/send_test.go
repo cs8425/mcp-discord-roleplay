@@ -648,9 +648,14 @@ func TestMissingFileSaysWhereItLooked(t *testing.T) {
 	d := newDeps(t, routingCfg(t, "-file-root", dir))
 	out := sendErr(t, d, `{"to":"boss","files":[{"path":"nope.png"}]}`)
 	wantCode(t, out, files.CodeNotFound)
-	roots, ok := out["file_roots"].([]any)
-	if !ok || len(roots) != 1 || roots[0] != dir {
-		t.Errorf("file_roots = %v, want the one root so the operator can see the mismatch", out["file_roots"])
+	// The roots belong in the sentence the model reads, not in a second field that
+	// repeats them: one host path per refusal is enough, and that one has to be
+	// there or a wrong path is a mystery.
+	if h, _ := out["hint"].(string); !strings.Contains(h, dir) {
+		t.Errorf("hint = %q, want it to name the file root it looked under", h)
+	}
+	if _, present := out["file_roots"]; present {
+		t.Errorf("file_roots must not be a second copy of the same path: %v", out)
 	}
 }
 
@@ -693,8 +698,9 @@ func TestPathEscapeIsRefused(t *testing.T) {
 	}
 
 	// A leading '/' is only cosmetic, so an absolute host path is a lookup that
-	// misses — inside the sandbox, with the roots named in the answer so the
-	// operator can see the mismatch. Never a bypass, never a false alarm.
+	// misses — inside the sandbox, and the answer names the roots it looked under
+	// (in the sentence, not in a second field) so a wrong path stays diagnosable.
+	// Never a bypass, never a false alarm.
 	misses := []string{"/etc/passwd", "/nope.txt"}
 	if runtime.GOOS != "windows" {
 		misses = append(misses, filepath.Join(dir, "..secret"))
@@ -702,8 +708,8 @@ func TestPathEscapeIsRefused(t *testing.T) {
 	for _, p := range misses {
 		out := sendErr(t, d, `{"to":"boss","files":[{"path":`+jsonString(p)+`}]}`)
 		wantCode(t, out, files.CodeNotFound)
-		if _, ok := out["file_roots"].([]any); !ok {
-			t.Errorf("%q should come back with the roots it was looked up in: %v", p, out)
+		if h, _ := out["hint"].(string); !strings.Contains(h, dir) {
+			t.Errorf("%q should come back naming the root it was looked up in (%s): %v", p, dir, out)
 		}
 	}
 }
@@ -829,17 +835,12 @@ func TestProseNamesFollowToolPrefix(t *testing.T) {
 		if status != prefix+"status" || poll != prefix+"poll" || send != prefix+"send" {
 			t.Fatalf("prefix %q produced %q/%q/%q", prefix, status, poll, send)
 		}
-		ready := discord.Snapshot{Started: true, Connected: true, Ready: true, SelfID: "bot1"}
-		qs := []bus.QueueStat{{Agent: "default", Size: 1, Capacity: 10}}
-		p := router.Principal{AgentID: "default"}
 		cases := map[string]string{
 			"advice(circuit)": d.sendAdvice(&discord.SendError{Code: discord.CodeCircuitOpen}),
 			"advice(no-conn)": d.sendAdvice(&discord.SendError{Code: discord.CodeNotConnected}),
 			"advice(unknown)": d.sendAdvice(&discord.SendError{Code: discord.CodeUnknownChannel}),
 			"advice(other)":   d.sendAdvice(&discord.SendError{Code: "something_unexpected"}),
 			"hint(empty)":     d.targetHint("empty_target"),
-			"next(ready)":     d.nextAction(ready, qs, p),
-			"warnings":        strings.Join(d.warnings(ready, qs, p), " | "),
 			"send tool":       sendTool(prefix).Description + " " + sendTool(prefix).InputSchema.Properties["to"].Description,
 			"poll tool":       pollTool(prefix).InputSchema.Properties["targets"].Description,
 		}

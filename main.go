@@ -376,6 +376,14 @@ func selftest(cfg *config.Config, rt *router.Router, logger *slog.Logger) int {
 		fail("no tools registered")
 	}
 
+	// The status answer in both views: the handful of keys a model actually gets,
+	// then the panel an operator debugs from. selftest output never reaches a
+	// model, so this is where the whole thing can be printed without anyone
+	// paying for it. The gateway reads "down" here because selftest never starts
+	// the client -- which is also the state machine's smoke test.
+	fmt.Fprintf(out, "\n--- %s ---\n", tools.ToolName(cfg.ToolPrefix, "status"))
+	fmt.Print(tools.StatusPretty(deps))
+
 	if failures > 0 {
 		plural := "s"
 		if failures == 1 {
