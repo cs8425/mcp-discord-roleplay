@@ -533,10 +533,41 @@ func (c *Client) gatewayLog(msgL, caller int, format string, a ...interface{}) {
 			c.log.Warn("gateway reconnect attempt", "msg", msg)
 			return
 		}
+		if strings.HasPrefix(msg, "First Packet:") {
+			// discordgo %#v-dumps the whole first event, and RawData is the READY
+			// payload - every guild we share with the bot, spelled out as byte
+			// literals - so this single line runs to several KB. At info the head is
+			// enough to see what arrived (Operation/Sequence/Type); the full dump is
+			// only for -log-level=debug. It stays a logged line instead of being
+			// dropped, so a message that merely happens to share this prefix loses
+			// at most its tail.
+			if c.log.Enabled(context.Background(), slog.LevelDebug) {
+				c.log.Debug("discordgo", "msg", msg)
+				return
+			}
+			c.log.Info("discordgo", "msg", headLog(msg, dgoFirstPacketHead))
+			return
+		}
 		c.log.Info("discordgo", "msg", msg)
 	default:
 		c.log.Debug("discordgo", "msg", msg)
 	}
+}
+
+// dgoFirstPacketHead is how much of discordgo's "First Packet" dump survives at
+// info level. See gatewayLog.
+const dgoFirstPacketHead = 160
+
+// headLog keeps the first n bytes of s - never cutting inside a UTF-8 sequence
+// - and reports how much was dropped.
+func headLog(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && s[n]&0xc0 == 0x80 {
+		n--
+	}
+	return s[:n] + fmt.Sprintf("…(+%d bytes)", len(s)-n)
 }
 
 func (c *Client) noteError(msg string) {
