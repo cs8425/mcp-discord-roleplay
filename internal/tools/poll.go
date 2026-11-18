@@ -70,7 +70,7 @@ const pollMaxLimit = 100
 // pollDefaultLimit is what a caller gets when it does not say.
 const pollDefaultLimit = 20
 
-func pollTool() *mcp.Tool {
+func pollTool(prefix string) *mcp.Tool {
 	return &mcp.Tool{
 		Name:  "poll",
 		Title: "Wait for new Discord messages",
@@ -103,8 +103,8 @@ func pollTool() *mcp.Tool {
 				"targets": {
 					Type:  mcp.TypeArray,
 					Items: &mcp.Schema{Type: mcp.TypeString},
-					Description: "Only messages from these aliases (see discord_status routing.targets). " +
-						"Omit to accept every target this agent may read.",
+					Description: "Only messages from these aliases (see " + ToolName(prefix, "status") +
+						" routing.targets). Omit to accept every target this agent may read.",
 				},
 				"channels": {
 					Type:        mcp.TypeArray,
@@ -451,7 +451,7 @@ func (d *Deps) applyMedia(ctx context.Context, msgs []pollMessage, kept []*bus.E
 
 	var notes []string
 	if saved > 0 {
-		notes = append(notes, "有附件存進了媒體快取：local_path 可以直接餵回 discord_send 的 files[].path，"+
+		notes = append(notes, "有附件存進了媒體快取：local_path 可以直接餵回 "+d.toolSend()+" 的 files[].path，"+
 			"同一個附件再 poll 不會重抓")
 	}
 	if skipped > 0 {

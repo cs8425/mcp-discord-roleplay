@@ -305,7 +305,8 @@ func selftest(cfg *config.Config, rt *router.Router, logger *slog.Logger) int {
 		report(true, "media cache: %s (keep %s, max %d MiB, %d bytes/attachment; relative = under the cwd)",
 			cfg.MediaOut, cfg.MediaKeep, cfg.MediaMaxMB, cfg.MediaSaveMaxBytes)
 		if p := cfg.LocalPathPrefix(); p != "" {
-			report(true, "local_path: saved files are reported to the agent as %s/<name>, which is what it hands back to discord_send", p)
+			report(true, "local_path: saved files are reported to the agent as %s/<name>, "+
+				"which is what it hands back to %s", p, tools.ToolName(cfg.ToolPrefix, "send"))
 			if len(cfg.FileRoots) == 0 {
 				report(false, "save mode is on but there is no --file-root: the agent can be told about a saved file and still be refused when it tries to send it back")
 			}
@@ -404,15 +405,20 @@ func toolNames(reg *mcp.Registry) []string {
 }
 
 func instructions(cfg *config.Config, names []string) string {
+	// The names in this text are the ones the caller can actually invoke: a
+	// sentence telling the model to "call discord_status" is a dead end when
+	// --tool-prefix says otherwise.
+	status := tools.ToolName(cfg.ToolPrefix, "status")
+	poll := tools.ToolName(cfg.ToolPrefix, "poll")
 	return "Discord bridge for roleplay. Available tools: " + strings.Join(names, ", ") + ". " +
-		"Call discord_status first to learn which target aliases you may use. " +
+		"Call " + status + " first to learn which target aliases you may use. " +
 		"Targets are given as an alias, channel:<id>, dm:<id> (a DM is addressed by the PEER's user id), #name, me or last. " +
 		"You never send binary data: reference local files by a path under the server's --file-root (a leading '/' means that root), " +
 		"and put links in files[].url - they are pasted, not fetched. " +
 		"Text over 2000 characters is split for you. " +
-		"discord_poll holds the call open until something arrives or max_wait passes; an empty answer is ok:true, not a failure. " +
+		poll + " holds the call open until something arrives or max_wait passes; an empty answer is ok:true, not a failure. " +
 		"Messages you have taken are gone from your queue - there is nothing to acknowledge and nothing to remember. " +
-		"If an answer says remaining:N, that many messages are still queued - call discord_poll again right away. " +
+		"If an answer says remaining:N, that many messages are still queued - call " + poll + " again right away. " +
 		"If dropped is present, messages were overwritten while nobody polled; poll more often. " +
 		"Set your client's request timeout to at least max_wait, or the call is cancelled while waiting and the answer is lost. " +
 		"This process serves agent '" + cfg.AgentID + "'."

@@ -808,7 +808,7 @@ func TestJitterOnlyExtends(t *testing.T) {
 // The schema has to describe the bounds the handler actually enforces, so a
 // model cannot guess itself out of bad_max_wait.
 func TestPollToolSchema(t *testing.T) {
-	tool := pollTool()
+	tool := pollTool("discord_")
 	if tool.Name != "poll" {
 		t.Fatalf("name = %q", tool.Name)
 	}
@@ -829,6 +829,12 @@ func TestPollToolSchema(t *testing.T) {
 	}
 	if d := tool.InputSchema.Properties["max_wait"].Description; !strings.Contains(d, "poll-min-wait") {
 		t.Error("max_wait must document where its bounds come from")
+	}
+	// The declared name stays bare (the registry adds the prefix), but prose that
+	// points at ANOTHER tool must already carry it, or the model is sent looking
+	// for a tool that does not exist under that name.
+	if d := tool.InputSchema.Properties["targets"].Description; !strings.Contains(d, "discord_status") {
+		t.Errorf("targets must point at the status tool by its registered name, got %q", d)
 	}
 }
 

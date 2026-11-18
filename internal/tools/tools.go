@@ -68,18 +68,41 @@ func (d *Deps) gatewayUp() bool {
 	return d.DC != nil && d.DC.Connected()
 }
 
-// RegisterAll registers the tools available in this build onto reg (which is
-// expected to carry the "discord_" prefix).
+// ToolName is how a tool is actually called: the bare kind plus --tool-prefix,
+// exactly as the registry registered it. Every sentence this server shows the
+// model runs through here, because a model follows those words -- prose that
+// hard-codes "discord_status" sends it looking for a tool it may not have.
+func ToolName(prefix, kind string) string { return prefix + kind }
+
+// prefix is --tool-prefix as the registry sees it; empty means bare names.
+func (d *Deps) prefix() string {
+	if d == nil || d.Cfg == nil {
+		return ""
+	}
+	return d.Cfg.ToolPrefix
+}
+
+// toolStatus, toolPoll and toolSend name the three tools for prose. Three named
+// helpers rather than d.tool("status") so a typo cannot compile into advice that
+// points at a tool nobody registered.
+func (d *Deps) toolStatus() string { return ToolName(d.prefix(), "status") }
+func (d *Deps) toolPoll() string   { return ToolName(d.prefix(), "poll") }
+func (d *Deps) toolSend() string   { return ToolName(d.prefix(), "send") }
+
+// RegisterAll registers the tools available in this build. Each is declared with
+// its bare name and picks up --tool-prefix from the registry; the constructors
+// are handed the same prefix so the text they write names the tools the way the
+// caller has to type them.
 func RegisterAll(reg *mcp.Registry, d *Deps) error {
 	d.toolNames = nil
 	plan := []struct {
 		tool *mcp.Tool
 		fn   mcp.Handler
 	}{
-		{statusTool(), d.handleStatus},
-		{sendTool(), d.handleSend},
-		{pollTool(), d.handlePoll},
-		// M3: {historyTool(), d.handleHistory}, {channelsTool(), d.handleChannels}
+		{statusTool(d.prefix()), d.handleStatus},
+		{sendTool(d.prefix()), d.handleSend},
+		{pollTool(d.prefix()), d.handlePoll},
+		// M3: {historyTool(d.prefix()), d.handleHistory}, {channelsTool(d.prefix()), d.handleChannels}
 	}
 	for _, p := range plan {
 		if err := reg.Register(p.tool, p.fn); err != nil {

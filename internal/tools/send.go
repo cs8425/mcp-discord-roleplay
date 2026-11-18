@@ -38,12 +38,12 @@ import (
 // should hand over a file instead of flooding the channel.
 const maxSendParts = 20
 
-func sendTool() *mcp.Tool {
+func sendTool(prefix string) *mcp.Tool {
 	return &mcp.Tool{
 		Name:  "send",
 		Title: "Send a message to Discord",
 		Description: "Send text and/or attachments to exactly one Discord target. " +
-			"to: an alias listed by discord_status, 'channel:<id>', 'dm:<id>', '#name', '@name', a bare channel id, " +
+			"to: an alias listed by " + ToolName(prefix, "status") + ", 'channel:<id>', 'dm:<id>', '#name', '@name', a bare channel id, " +
 			"'me' (a DM to the bot itself), or 'last' (the target this agent spoke to most recently). " +
 			"A body longer than 2000 characters is split into several messages sent in order. " +
 			"files[].path is read on the server from the --file-root directories and uploaded as a real attachment: " +
@@ -56,8 +56,9 @@ func sendTool() *mcp.Tool {
 			Description: "to is required; text, files or both.",
 			Properties: map[string]mcp.Schema{
 				"to": {
-					Type:        mcp.TypeString,
-					Description: "alias from discord_status | channel:<id> | dm:<id> | #name | @name | <bare channel id> | me | last",
+					Type: mcp.TypeString,
+					Description: "alias from " + ToolName(prefix, "status") +
+						" | channel:<id> | dm:<id> | #name | @name | <bare channel id> | me | last",
 				},
 				"text": {
 					Type:        mcp.TypeString,
@@ -331,7 +332,7 @@ func (d *Deps) channelFor(ctx context.Context, ru *router.Rule) (string, *discor
 		self := d.DC.SelfID()
 		if self == "" {
 			return "", &discord.SendError{Code: discord.CodeNotConnected,
-				Msg: "'me' needs the bot's own id and READY has not arrived yet: call discord_status again in a second"}
+				Msg: "'me' needs the bot's own id and READY has not arrived yet: call " + d.toolStatus() + " again in a second"}
 		}
 		id, err := d.DC.DMChannel(ctx, self)
 		if err != nil {
@@ -348,7 +349,7 @@ func (d *Deps) channelFor(ctx context.Context, ru *router.Rule) (string, *discor
 func (d *Deps) targetHint(reason string) string {
 	switch reason {
 	case "empty_target":
-		return "to is required: an alias from discord_status, channel:<id>, dm:<id>, #name, me or last"
+		return "to is required: an alias from " + d.toolStatus() + ", channel:<id>, dm:<id>, #name, me or last"
 	case "no_last_target":
 		return "this agent has not sent anything yet, so 'last' has nothing to point at; name a target"
 	case "unknown_target":
@@ -482,10 +483,13 @@ func (d *Deps) sendFailure(se *discord.SendError, extra map[string]any) *mcp.Too
 	if d.Cfg.DryRun {
 		m["dry_run"] = true
 	}
-	return errResult(se.Code, sendAdvice(se), m)
+	return errResult(se.Code, d.sendAdvice(se), m)
 }
 
-func sendAdvice(se *discord.SendError) string {
+// sendAdvice is a method rather than a helper because half of these sentences
+// tell the model which other tool to consult, and that name is --tool-prefix
+// dependent.
+func (d *Deps) sendAdvice(se *discord.SendError) string {
 	switch se.Code {
 	case discord.CodeRateLimited:
 		if se.BreakerOpen {
@@ -493,17 +497,17 @@ func sendAdvice(se *discord.SendError) string {
 		}
 		return "wait retry_after_ms, then send again; if this repeats, send fewer, shorter messages"
 	case discord.CodeCircuitOpen:
-		return "sending is paused after repeated 429s; wait retry_after_ms (discord_status shows the countdown)"
+		return "sending is paused after repeated 429s; wait retry_after_ms (" + d.toolStatus() + " shows the countdown)"
 	case discord.CodeBudgetExhausted:
 		return "this process spent its per-minute send budget; wait retry_after_ms or raise --max-sends-per-min"
 	case discord.CodeNotConnected:
-		return "no gateway session: check discord_status (bad token, or the gateway refused us)"
+		return "no gateway session: check " + d.toolStatus() + " (bad token, or the gateway refused us)"
 	case discord.CodeUnauthorized:
 		return "discord rejected the token; only the operator can fix that (rotate it in the env file)"
 	case discord.CodeForbidden:
 		return "the bot may not speak here, or this user does not accept DMs from bots"
 	case discord.CodeUnknownChannel:
-		return "no such channel or guild: re-check the id, or pick an alias from discord_status"
+		return "no such channel or guild: re-check the id, or pick an alias from " + d.toolStatus()
 	case discord.CodeCannotSend:
 		return "the channel exists but we cannot write to it (deleted, or a thread that is locked)"
 	case discord.CodeBadRequest:
@@ -520,7 +524,7 @@ func sendAdvice(se *discord.SendError) string {
 		if se.Msg != "" {
 			return se.Msg
 		}
-		return "the send failed; check discord_status"
+		return "the send failed; check " + d.toolStatus()
 	}
 }
 

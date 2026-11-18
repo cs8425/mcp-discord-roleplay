@@ -32,8 +32,9 @@ import (
 // (unit tests); main always passes Deps.StartedAt.
 var startedAt = time.Now()
 
-// statusTool returns the discord_status registration.
-func statusTool() *mcp.Tool {
+// statusTool returns the status tool's registration; prefix is --tool-prefix, so
+// the name it advertises is the name the caller has to type.
+func statusTool(prefix string) *mcp.Tool {
 	return &mcp.Tool{
 		Name:  "status",
 		Title: "Discord bridge health and your queue",
@@ -304,13 +305,13 @@ func (d *Deps) nextAction(snap discord.Snapshot, qs []bus.QueueStat, p router.Pr
 	case !snap.Connected:
 		return "wait for the gateway to reconnect before sending; check the token and that the bot is in the guild"
 	case !snap.Ready:
-		return "wait a moment for READY, then call discord_status again"
+		return "wait a moment for READY, then call " + d.toolStatus() + " again"
 	case len(d.Router.Targets(p)) == 0:
-		return "no visible targets for this agent: check routing.json or --allow-channel"
+		return "no visible targets for this agent: check routing.json or --allow-channels"
 	case queueSizeTotal(qs) > 0:
-		return "call discord_poll: there are unread messages waiting"
+		return "call " + d.toolPoll() + ": there are unread messages waiting"
 	default:
-		return "connected and idle; send a message or call discord_poll to wait for one"
+		return "connected and idle; send a message or call " + d.toolPoll() + " to wait for one"
 	}
 }
 
@@ -324,7 +325,7 @@ func (d *Deps) warnings(snap discord.Snapshot, qs []bus.QueueStat, p router.Prin
 	if !snap.Started {
 		w = append(w, "gateway never started (--selftest mode): nothing will be received or sent")
 	} else if !snap.Connected || !snap.Ready {
-		w = append(w, "gateway is not ready: discord_send will fail until the websocket handshake completes")
+		w = append(w, "gateway is not ready: "+d.toolSend()+" will fail until the websocket handshake completes")
 	}
 	if snap.SelfID == "" && snap.Started {
 		w = append(w, "the bot identity is still unknown — READY has not arrived yet, so mentions_self cannot be computed")
@@ -345,7 +346,7 @@ func (d *Deps) warnings(snap discord.Snapshot, qs []bus.QueueStat, p router.Prin
 	case len(qs) == 0:
 		w = append(w, "no queues exist: no agent may read any incoming message")
 	case !ok:
-		w = append(w, "caller "+p.AgentID+" has no queue: discord_poll will return empty results for it")
+		w = append(w, "caller "+p.AgentID+" has no queue: "+d.toolPoll()+" will return empty results for it")
 	case q.Dropped > 0:
 		w = append(w, strconv.FormatUint(q.Dropped, 10)+
 			" event(s) were dropped from this agent's queue (cap "+strconv.Itoa(q.Capacity)+
@@ -367,7 +368,7 @@ func (d *Deps) warnings(snap discord.Snapshot, qs []bus.QueueStat, p router.Prin
 		w = append(w, "inbound attachments are all skipped: no file content will reach the model, only url and metadata")
 	}
 	if d.Cfg.DryRun {
-		w = append(w, "dry-run mode: discord_send is not delivering to Discord")
+		w = append(w, "dry-run mode: "+d.toolSend()+" is not delivering to Discord")
 	}
 	for _, root := range d.Cfg.FileRoots {
 		if root == "." || root == string(filepath.Separator) {

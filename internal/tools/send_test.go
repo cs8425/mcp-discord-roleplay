@@ -804,6 +804,7 @@ func TestPartialDeliveryIsSpelledOut(t *testing.T) {
 }
 
 func TestAdviceExistsForEveryCode(t *testing.T) {
+	d := newDeps(t, toolCfg(t))
 	codes := []string{
 		discord.CodeRateLimited, discord.CodeCircuitOpen, discord.CodeBudgetExhausted,
 		discord.CodeNotConnected, discord.CodeUnauthorized, discord.CodeForbidden,
@@ -812,8 +813,44 @@ func TestAdviceExistsForEveryCode(t *testing.T) {
 		discord.CodeDMFailed, discord.CodeFileFailed, "something_unexpected",
 	}
 	for _, c := range codes {
-		if h := sendAdvice(&discord.SendError{Code: c}); h == "" {
+		if h := d.sendAdvice(&discord.SendError{Code: c}); h == "" {
 			t.Errorf("no advice for %s", c)
+		}
+	}
+}
+
+// Every sentence we show the model has to name the tools the way --tool-prefix
+// registered them: prose that says "discord_status" while the tool answers to
+// "status" sends the model after a tool it does not have.
+func TestProseNamesFollowToolPrefix(t *testing.T) {
+	for _, prefix := range []string{"", "discord_", "dc_"} {
+		d := newDeps(t, routingCfg(t, "-tool-prefix="+prefix))
+		status, poll, send := d.toolStatus(), d.toolPoll(), d.toolSend()
+		if status != prefix+"status" || poll != prefix+"poll" || send != prefix+"send" {
+			t.Fatalf("prefix %q produced %q/%q/%q", prefix, status, poll, send)
+		}
+		ready := discord.Snapshot{Started: true, Connected: true, Ready: true, SelfID: "bot1"}
+		qs := []bus.QueueStat{{Agent: "default", Size: 1, Capacity: 10}}
+		p := router.Principal{AgentID: "default"}
+		cases := map[string]string{
+			"advice(circuit)": d.sendAdvice(&discord.SendError{Code: discord.CodeCircuitOpen}),
+			"advice(no-conn)": d.sendAdvice(&discord.SendError{Code: discord.CodeNotConnected}),
+			"advice(unknown)": d.sendAdvice(&discord.SendError{Code: discord.CodeUnknownChannel}),
+			"advice(other)":   d.sendAdvice(&discord.SendError{Code: "something_unexpected"}),
+			"hint(empty)":     d.targetHint("empty_target"),
+			"next(ready)":     d.nextAction(ready, qs, p),
+			"warnings":        strings.Join(d.warnings(ready, qs, p), " | "),
+			"send tool":       sendTool(prefix).Description + " " + sendTool(prefix).InputSchema.Properties["to"].Description,
+			"poll tool":       pollTool(prefix).InputSchema.Properties["targets"].Description,
+		}
+		for name, text := range cases {
+			if !strings.Contains(text, status) && !strings.Contains(text, poll) && !strings.Contains(text, send) {
+				t.Errorf("%s (%q) names no tool of this server: %q", name, prefix, text)
+			}
+			if prefix == "" && (strings.Contains(text, "discord_status") ||
+				strings.Contains(text, "discord_poll") || strings.Contains(text, "discord_send")) {
+				t.Errorf("%s still hard-codes a discord_* name: %q", name, text)
+			}
 		}
 	}
 }
