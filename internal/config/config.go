@@ -31,10 +31,10 @@ const Module = "mcp-discord-roleplay"
 const (
 	DefaultMediaOut = "mcpdr-media"
 
-	// DefaultPollMaxBytes caps how much discord_poll returns in one call. The
-	// queue can hold far more than a model context window likes, so a poll stops
-	// taking events once its answer would be big and the rest wait for the next
-	// poll (in order).
+	// DefaultPollMaxBytes caps how much text discord_poll ships in one call: the
+	// sum of the `text` byte lengths, not the JSON reply. The queue can hold far
+	// more than a model context window likes, so a poll stops taking events once
+	// the text budget is used and the rest wait for the next poll (in order).
 	DefaultPollMaxBytes = 16384
 
 	// DefaultMediaSaveMaxBytes caps a single saved attachment. Discord lets a
@@ -95,7 +95,7 @@ type Config struct {
 
 	// --- bus / state ----------------------------------------------------------
 	BusCapacity  int
-	PollMaxBytes int // reply budget for one discord_poll call; -1 = unlimited (0 is a rejected typo)
+	PollMaxBytes int // text-byte budget for one discord_poll call; -1 = unlimited (0 is a rejected typo)
 	TextMaxRunes int
 
 	// --- inbound media policy -------------------------------------------------
@@ -209,7 +209,7 @@ func Load(args []string) (*Config, error) {
 	fs.IntVar(&c.PollJitterPct, "poll-jitter-pct", 15, "percent jitter added to the poll deadline only")
 
 	fs.IntVar(&c.BusCapacity, "bus-capacity", 2000, "per-agent in-memory queue size (messages); the oldest is dropped when full")
-	fs.IntVar(&c.PollMaxBytes, "poll-max-bytes", DefaultPollMaxBytes, "largest reply discord_poll builds (bytes); -1 removes the cap")
+	fs.IntVar(&c.PollMaxBytes, "poll-max-bytes", DefaultPollMaxBytes, "budget for one poll, counted in the bytes of message text only (not JSON); -1 removes the cap")
 	fs.IntVar(&c.TextMaxRunes, "text-max-runes", 4000, "truncate stored message text beyond this many runes")
 
 	fs.StringVar(&c.mImage, "media-image", "inline", "policy for inbound images: inline|save|skip")

@@ -337,9 +337,9 @@ func selftest(cfg *config.Config, rt *router.Router, logger *slog.Logger) int {
 		}
 	}
 	if config.Unlimited(cfg.PollMaxBytes) {
-		report(false, "poll reply budget is uncapped: one poll can hand back the whole queue in one answer")
+		report(false, "poll text budget is uncapped: one poll can hand back the whole queue in one answer")
 	} else {
-		report(true, "poll reply budget: %d bytes per discord_poll answer; the rest stays queued for the next call",
+		report(true, "poll text budget: %d bytes of message text per discord_poll answer (JSON overhead is not counted); the rest stays queued",
 			cfg.PollMaxBytes)
 	}
 	report(true, "send budget: %d/min, %d ms gap per channel, breaker after %d rate-limit errors",

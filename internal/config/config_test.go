@@ -242,7 +242,7 @@ func TestWrittenPathsStayRelativeToCwd(t *testing.T) {
 	}
 }
 
-// The poll reply budget: default 16 KiB, -1 means uncapped, and 0 is refused --
+// The poll text budget (bytes of `text` only): default 16 KiB, -1 means uncapped, and 0 is refused --
 // it used to be a second way to say "uncapped" while every other byte flag reads
 // 0 as "this mode is off", which is exactly the kind of ambiguity an operator
 // types wrong. How small or large a real budget is stays their business.

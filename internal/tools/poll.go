@@ -13,13 +13,20 @@
 //     the first event that would not fit, so the leftovers wait for the next poll
 //     IN ORDER (bus.Stop). Nothing is skipped over and nothing is lost.
 //
-// If a single event is bigger than the whole budget it would sit at the head of
-// the queue forever. Instead it is trimmed into the budget: the text keeps its
-// head and a note says how big it really was; if that is still not enough,
-// trailing attachments are counted out, again by note. What reaches the model is
-// only what it needs in order to answer (see msgWire): target, author, the
-// author's Discord id, text, timestamps, attachment urls. The author id is the
-// one id that earns its bytes: it is what a to:"dm:<id>" reply is built from.
+// The byte budget is a fuse, not a meter: it counts exactly one thing, the bytes
+// of the `text` fields this call ships. JSON overhead (keys, author, urls, notes)
+// is deliberately not counted, so a reply can come back somewhat larger than the
+// number; what it can never do is drop a 10 KB message straight into a harness
+// that has no trimming of its own and blow the session up.
+//
+// A single event whose text is bigger than the whole budget would otherwise sit
+// at the head of the queue forever, so its text is cut to the budget keeping the
+// head, and a note says how big it really was. Nothing else is negotiable:
+// attachments and embeds are never dropped over budget, which is what used to
+// ship a message as an empty shell.
+//
+// What reaches the model is only what it needs in order to answer (see msgWire):
+// target, author, the author's Discord id, text, timestamps, attachment urls.
 // Everything else went to the log.
 //
 // Media runs in a second phase, after the drain. Queue.Drain calls the verdict
@@ -27,13 +34,12 @@
 // gateway would stop being able to Push. So the budget decides which messages
 // and which attachments this call keeps from metadata alone, and only those are
 // fetched afterwards. Base64 consequently never shows up in the JSON answer (it
-// lives in the result's content array, not in this JSON); the room it will take
-// in the model's context is held back by the per-attachment estimate instead.
+// lives in the result's content array, not in this JSON), and no byte estimate
+// pretends to price it: a model charges an image in tokens, not in JSON bytes.
 package tools
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"math"
@@ -42,6 +48,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	mcp "mcptransport"
 
@@ -49,18 +56,6 @@ import (
 	"mcp-discord-roleplay/internal/config"
 	"mcp-discord-roleplay/internal/media"
 	"mcp-discord-roleplay/internal/router"
-)
-
-// Attachment cost estimates. A poll cannot know an inline image's real base64
-// size before the fetcher downloads it, so it reserves a placeholder for every
-// attachment the policy would inline and a smaller one for a metadata-only
-// listing. The actual payload stays governed by --inline-max-count /
-// --inline-max-bytes-image / --inline-max-total-bytes; the two budgets are
-// separate on purpose.
-const (
-	estInlineAttachment = 1000
-	estMetaAttachment   = 300
-	estEmbed            = 200
 )
 
 // pollMaxLimit is a hard ceiling on limit so one call cannot drain everything
@@ -81,6 +76,7 @@ func pollTool(prefix string) *mcp.Tool {
 			"reason=cancelled/shutdown means this answer was not delivered. " +
 			"If remaining is present, that many messages are still queued — poll again right away. " +
 			"If dropped is present, messages were overwritten while nobody polled; poll more often. " +
+			"A long message text may be cut to fit the server's byte budget, and a note then says how big it really was; only text is ever cut, attachments are always listed. " +
 			"author_id is the speaker's Discord id: quote it as to:\"dm:<id>\" to answer that person in DMs even when they have no alias. " +
 			"Each attachment reports what it came as: media=base64 means the bytes are appended to this result as a content block (content_index names it), " +
 			"media=file means they were saved and local_path says where, media=url means metadata only and reason says why. " +
@@ -171,10 +167,8 @@ type pollMessage struct {
 
 	MentionsSelf bool `json:"mentions_self,omitempty"`
 
-	Attachments      []pollAttachment `json:"attachments,omitempty"`
-	AttachmentsTotal int              `json:"attachments_total,omitempty"`
-	AttachmentsOmit  int              `json:"attachments_omitted,omitempty"`
-	Embeds           []bus.Embed      `json:"embeds,omitempty"`
+	Attachments []pollAttachment `json:"attachments,omitempty"`
+	Embeds      []bus.Embed      `json:"embeds,omitempty"`
 }
 
 // pollAttachment is the per-call working view of an attachment: metadata plus
@@ -212,13 +206,6 @@ type pollAttachment struct {
 	// array. Index 0 is the JSON answer itself, so a real block is always >= 1;
 	// omitted when there is no block.
 	ContentIndex int `json:"content_index,omitempty"`
-
-	// est is the room this attachment holds back in the reply budget for the
-	// payload it may grow into (an inline image is not in the JSON, so the JSON
-	// length alone would under-count it). Per attachment on purpose: fitMessage
-	// drops attachments from the tail, and the room has to go with them.
-	// Unexported, so it never reaches the wire.
-	est int
 }
 
 func (d *Deps) handlePoll(ctx context.Context, call *mcp.Call) (*mcp.ToolResult, error) {
@@ -401,10 +388,10 @@ func (d *Deps) handlePoll(ctx context.Context, call *mcp.Call) (*mcp.ToolResult,
 //
 // kept is the drain's own record of which event produced which message, in the
 // same order, so kept[i].Attachments is where the bytes for
-// msgs[i].Attachments come from. fitMessage may have shortened that list, but
-// only from the tail, so the two line up on a prefix — which is the whole point
-// of splitting poll into two phases: an attachment trimmed out of the budget
-// never costs a download.
+// msgs[i].Attachments come from. Nothing trims the attachment lists any more
+// (the byte budget only negotiates text), so the two line up exactly — which is
+// still the point of splitting poll into two phases: a message left in the queue
+// for the next poll never costs a download now.
 func (d *Deps) applyMedia(ctx context.Context, msgs []pollMessage, kept []*bus.Event) ([]mcp.ContentPart, []string) {
 	if d.Media == nil || len(msgs) == 0 {
 		return nil, nil
@@ -692,7 +679,7 @@ func (st *drainState) want(d *Deps, p router.Principal, f *pollFilter) func(*bus
 // noteBudgetFull records, at most once per attempt, that the drain stopped
 // because of the byte budget rather than because the queue was empty.
 func (st *drainState) noteBudgetFull() {
-	const msg = "後面的訊息超過這次回覆的位元組預算，已留在佇列，下一次 poll 會先拿到"
+	const msg = "後面的訊息超過這次 poll 的 text 預算，已留在佇列，下一次 poll 會先拿到"
 	for _, n := range st.notes {
 		if n == msg {
 			return
@@ -742,19 +729,18 @@ func (d *Deps) targetLabel(p router.Principal, e *bus.Event) string {
 func (d *Deps) buildMessage(p router.Principal, e *bus.Event) pollMessage {
 	target := d.targetLabel(p, e)
 	m := pollMessage{
-		ID:               e.MessageID,
-		Target:           target,
-		ChannelID:        e.ChannelID,
-		ChannelName:      e.ChannelName,
-		DM:               e.DM,
-		From:             e.Author,
-		Ts:               e.Time,
-		Text:             e.Text,
-		TextTruncated:    e.Truncated,
-		MentionsSelf:     e.MentionsSelf,
-		Attachments:      make([]pollAttachment, 0, len(e.Attachments)),
-		AttachmentsTotal: len(e.Attachments),
-		Embeds:           e.Embeds,
+		ID:            e.MessageID,
+		Target:        target,
+		ChannelID:     e.ChannelID,
+		ChannelName:   e.ChannelName,
+		DM:            e.DM,
+		From:          e.Author,
+		Ts:            e.Time,
+		Text:          e.Text,
+		TextTruncated: e.Truncated,
+		MentionsSelf:  e.MentionsSelf,
+		Attachments:   make([]pollAttachment, 0, len(e.Attachments)),
+		Embeds:        e.Embeds,
 	}
 	if m.TextTruncated {
 		// Already shortened on the way in (--text-max-runes). Report the length
@@ -765,95 +751,49 @@ func (d *Deps) buildMessage(p router.Principal, e *bus.Event) pollMessage {
 		m.AgeS = round1(time.Since(e.Ts).Seconds())
 	}
 	for _, a := range e.Attachments {
-		// Hold back room for the payload the fetcher may attach to an inlinable
-		// kind, so a 4-image message cannot sneak past the byte budget. Saved and
-		// skipped attachments only grow by a path or a reason, which is what the
-		// smaller estimate covers.
-		est := estMetaAttachment
-		if policy := string(d.Cfg.MediaFor(a.Kind)); policy == string(config.MediaInline) &&
-			(a.Kind == bus.KindImage || a.Kind == bus.KindAudio) {
-			est = estInlineAttachment
-		}
 		m.Attachments = append(m.Attachments, pollAttachment{
 			ID: a.ID, Filename: a.Filename, MIME: a.ContentType, Kind: a.Kind,
 			Size: a.Size, Width: a.Width, Height: a.Height, DurationSecs: a.DurationSecs,
-			URL: a.URL, Media: media.MediaURL, est: est,
+			URL: a.URL, Media: media.MediaURL,
 		})
 	}
 	return m
 }
 
-// messageCost is what this message contributes to the reply: its JSON, plus the
-// payload room of the attachments it STILL lists, plus a flat cost per embed.
-// The room is derived from the slice instead of stored beside it, because
-// fitMessage shrinks that slice — an aggregate kept on the message would not
-// shrink with it, and a message carrying many inlinable files could then never
-// fit at all: every attachment omitted, not even one listed.
-func messageCost(m pollMessage) int {
-	b, err := json.Marshal(m.wire())
-	if err != nil {
-		// bus.Event is plain data, so this cannot realistically fail; be honest
-		// and treat an unencodable message as huge so it never crowds out others.
-		return math.MaxInt32
-	}
-	room := 0
-	for _, a := range m.Attachments {
-		room += a.est
-	}
-	return len(b) + room + len(m.Embeds)*estEmbed
-}
+// messageCost is what one message contributes to --poll-max-bytes: the bytes of
+// its `text`, nothing else. The flag is a fuse against a single oversized
+// message, not a size meter for the reply: JSON overhead, attachment entries and
+// base64 content blocks are priced elsewhere (--inline-max-count and friends).
+// Counting them here is what used to force a fresh Marshal per trimming step.
+func messageCost(m pollMessage) int { return len(m.Text) }
 
-// fitMessage shrinks m until it costs at most room bytes, in the order the
-// package doc describes: text first, then trailing attachments, then embeds.
-// Identifiers and URLs are never touched.
+// fitMessage cuts m.Text down to room bytes, keeping its head, and notes how
+// big the text really was. Only the first message of a drain can reach here (the
+// drain stops before every later one), and only the text is negotiable: dropping
+// attachments or embeds to save bytes was what let a message ship as an empty
+// shell. The cut lands on a rune boundary, so the reply never carries half a
+// UTF-8 character.
 func fitMessage(m *pollMessage, room int, st *drainState) {
-	if messageCost(*m) <= room {
+	if len(m.Text) <= room {
 		return
 	}
-	orig := len(m.Text)
-	full := orig
+	full := len(m.Text)
 	if m.TextFullBytes > full {
 		full = m.TextFullBytes
 	}
-
-	// 1. Cut the text, keeping its head, on a rune boundary so the reply never
-	// contains half a UTF-8 character.
-	for i := 0; i < 64 && messageCost(*m) > room; i++ {
-		r := []rune(m.Text)
-		if len(r) == 0 {
+	cut := 0
+	for cut < len(m.Text) {
+		_, size := utf8.DecodeRuneInString(m.Text[cut:])
+		if cut+size > room {
 			break
 		}
-		over := messageCost(*m) - room
-		// 6 bytes per rune is the worst JSON escape (\u003c); dividing by it
-		// makes the loop converge instead of shaving one character at a time.
-		cut := len(r) - over/6 - 1
-		if cut < 0 {
-			cut = 0
-		}
-		m.Text = string(r[:cut])
-		m.TextTruncated = true
-		m.TextFullBytes = full
+		cut += size
 	}
-	if m.TextTruncated && len(m.Text) < orig {
-		st.notes = append(st.notes, "這一則超過 poll 的位元組預算，文字裁到 "+
-			strconv.Itoa(len(m.Text))+" bytes（原本 "+strconv.Itoa(full)+
-			" bytes）；這裡只有開頭")
-	}
-
-	// 2. Still too big: list fewer attachments and count what is left out.
-	for len(m.Attachments) > 0 && messageCost(*m) > room {
-		m.Attachments = m.Attachments[:len(m.Attachments)-1]
-		m.AttachmentsOmit = m.AttachmentsTotal - len(m.Attachments)
-	}
-	if m.AttachmentsOmit > 0 {
-		st.notes = append(st.notes, "附件只列到預算內，少了 "+strconv.Itoa(m.AttachmentsOmit)+
-			" 個（附件本身仍在 Discord 上，url 沒被裁）")
-	}
-
-	// 3. Embeds are the least useful thing to keep when room is that tight.
-	for len(m.Embeds) > 0 && messageCost(*m) > room {
-		m.Embeds = m.Embeds[:len(m.Embeds)-1]
-	}
+	m.Text = m.Text[:cut]
+	m.TextTruncated = true
+	m.TextFullBytes = full
+	st.notes = append(st.notes, "這一則 text 太長（原本 "+strconv.Itoa(full)+
+		" bytes），裁到 "+strconv.Itoa(cut)+" bytes 只留開頭")
 }
 
 // --- wire shapes -----------------------------------------------------------
@@ -862,10 +802,9 @@ func fitMessage(m *pollMessage, room int, st *drainState) {
 // media verdict all live on it, and it keeps fields the model never sees (its
 // json tags are therefore dead weight kept only for readability). These types
 // below are the only thing that gets marshalled, which buys three things: the
-// budget cost of a message equals the bytes it actually ships (messageCost),
-// bus.Author/bus.Embed shapes can no longer leak onto the wire, and adding a
-// field to pollMessage costs the model nothing until it is deliberately added
-// here too.
+// model never sees a field nobody asked for, bus.Author/bus.Embed shapes can no
+// longer leak onto the wire, and adding a field to pollMessage costs the model
+// nothing until it is deliberately added here too.
 
 type embedWire struct {
 	Title       string `json:"title,omitempty"`

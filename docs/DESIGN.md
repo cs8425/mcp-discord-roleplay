@@ -1,8 +1,8 @@
 # mcp-discord-roleplay — 設計 **v3（定稿候選）**
 
 - 2026-11-16　v0→v1→v2→**v3**。v3：C1/C3/C4 拍定；**C2 我原先的說法是錯的，已改正**（4 MiB 是「入口」限制，出口 streaming 無上限）
-- 狀態：**設計定案（v3.1）＋ M2b 已實作、輸出已極簡化，`go vet` / `go test` 全綠並已接入 live**。本檔是實作的依據。
-- 實作進度：**M0 ✅**（config / router / bus / discord gateway client / `discord_status` / `--selftest`）、**M1 ✅**（`internal/files` 沙箱 + `discord_send` + 預算/間隔/斷路器 + 單測）、**M2a ✅**（per-agent Queue/Hub + `router.Audience` + `discord_poll`）、**M2b ✅**（media 三段式 inline/save/skip）、**M2c 🚧**（target 語法收斂：`dm:` 單一字首、`dm:*`/`channel:*` wildcard、per-agent `read`/`write` 預設可收可放、閘門剩 `--allow-channels`/`--deny-channels`/`--unknown-channel`，`--allow-dm`/`--unknown-dm` 刪除；程式碼與測試已落地，待 `go build/test` 驗證）、**輸出極簡化 ✅**（2026-11-18：LLM 只拿必要欄位，其餘進 debug log；見 §3 的 wire 結構與判定三閘）。第一輪 live smoke 已跑（紅項只有入站圖片的 ctx timeout，已修），M3 = history/channels，M4 = README。
+- 狀態：**設計定案（v3.1）＋ M2c 已實作、輸出已極簡化，`go vet` / `go test` 全綠並已接入 live**。本檔是實作的依據。
+- 實作進度：**M0 ✅**（config / router / bus / discord gateway client / `discord_status` / `--selftest`）、**M1 ✅**（`internal/files` 沙箱 + `discord_send` + 預算/間隔/斷路器 + 單測）、**M2a ✅**（per-agent Queue/Hub + `router.Audience` + `discord_poll`）、**M2b ✅**（media 三段式 inline/save/skip）、**M2c ✅**（target 語法收斂：`dm:` 單一字首、`dm:*`/`channel:*` wildcard、per-agent `read`/`write` 預設可收可放、閘門剩 `--allow-channels`/`--deny-channels`/`--unknown-channel`，`--allow-dm`/`--unknown-dm` 刪除）、**輸出極簡化 ✅**（2026-11-18：LLM 只拿必要欄位，其餘進 debug log；見 §3 的 wire 結構與判定三閘）、**`--tool-prefix` ✅**（2026-11-19：三個工具名由 prefix 組，預設裸名 `poll`/`send`/`status`；給模型看的 prose 也跟著走，由 `TestProseNamesFollowToolPrefix` 釘住）、**byte 旗標收斂 ✅**（2026-11-19：`--poll-max-bytes` `0` 報錯／`-1` 不設限，`--no-media-out` 刪除 ⇒ `--media-save-max-bytes=0` 是 save 的唯一開關）、**poll 預算改語意 ✅**（2026-11-20：`--poll-max-bytes` 只算 `text` 欄位的 byte（保險絲不是計費器）；附件與 embeds 永不因預算被丟（空殼 bug）；估價常數與 `attachments_total`/`attachments_omitted` 退場，`fitMessage` 不再重複 `json.Marshal`）。live smoke 已跑兩輪（紅項只有入站圖片的 ctx timeout，已修並 live 複驗），M3 = history/channels，M4 = README。
 - ⚠ **`-race` 仍未跑過**（`go build` / `go vet` / `go test` 已由 user 驗證全綠）。驗證紀錄 → `_state/build-notes.md`。
 - 建置驗證由 user 執行（sandbox 內無 shell / 無 go）：見 `_state/build-notes.md`。
 - 環境：**Go 1.27.4**（已確認）、單一 bot token、client = 自研 agent、測試由 user 直接把 token/指令接進 session
@@ -97,7 +97,7 @@ type Event struct {
 ---
 
 ## 3. `discord_poll`（M2a 定稿）
-**語義**：從**呼叫者自己的 queue** 一次取走最多 `limit` 則、且不超過 `--poll-max-bytes` 的訊息，**取走就從 queue 消失**（drain 語意 = ack，不需要游標）；queue 空就掛住，**任何一則符合條件的新訊息抵達的瞬間立刻回傳**（不累積、不等安靜期），最長等 `max_wait(+jitter)` 秒。
+**語義**：從**呼叫者自己的 queue** 一次取走最多 `limit` 則、text 總量不超過 `--poll-max-bytes`（只算 `text` 欄位的 byte，見下方 byte 預算）的訊息，**取走就從 queue 消失**（drain 語意 = ack，不需要游標）；queue 空就掛住，**任何一則符合條件的新訊息抵達的瞬間立刻回傳**（不累積、不等安靜期），最長等 `max_wait(+jitter)` 秒。
 （同一瞬間連發的多則，因為是「一次讀光 queue 頭」，自然會包在同一包裡回。）
 
 ```json
@@ -148,14 +148,14 @@ envelope（`omitempty` 的欄位只在有意義時出現；下面把常見的都
  "remaining":7,"dropped":1,"notes":["..."]}
 ```
 - **空結果恰好 2 個 key**：`{"ok":true,"reason":"timeout"}`（quiet server 是常態，而每一個 byte 都會進模型的 context）
-- 預算算的是**上面這個 wire 結構**的 JSON，不是工作結構：`messageCost` 量 `m.wire()` ＋（圖 1000 / 其他附件 300 / embed 200 的估價）。inline 的 base64 在 content block 裡、**不在這段 JSON 裡** ⇒ 不佔預算（舊版那個 `result_bytes` 固定點迴圈就是為了湊一個實際上沒人在用的數字，已整段拿掉）
+- **預算只算 `text` 欄位的 byte 數**（`messageCost(m) = len(m.Text)`）：它是**保險絲不是計費器**，目的只有一個：防止一次 tool result 把沒有裁切機制的 harness 的 context 直接灌爆、整個 session 掛掉。JSON 骨架（key、author、url、notes）刻意不計：實測一則訊息骨架 144 B、一個附件 entry 159 B，把它們折進預算就必須每裁一步重 `json.Marshal` 一次（舊版 `fitMessage` 主迴圈每圈 2 次、外加 `messageCost` 各一次），白瞎了 `encoding/json` v2 的底層設計。inline 的 base64 在 content block 裡、本來就不在這段 JSON 裡；模型是按 token 收錢（一張圖 ~1000 token），不是按 JSON byte ⇒ 也不佔預算（舊版那個 `result_bytes` 固定點迴圈就是為了湊一個實際上沒人在用的數字，已整段拿掉）
 - `reason` ∈ `messages|timeout|disconnected|cancelled|shutdown`；**timeout 是 ok:true**。沒有訊息且 gateway 不在聽時，`timeout` 會被改寫成 `disconnected`（對一條死線路說「沒人說話」是誤導）；`cancelled`/`shutdown` 保留自己的字，它們講的是「這一問其實沒送到你手上」
-- **byte 預算**（`--poll-max-bytes`，預設 16 KiB，`-1`＝不設限、`0` 報錯）：只算 messages 陣列的 JSON；每則成本 = 實際位元組 +（圖 1000 / 其他附件 300 / embed 200 的估價）。裝不下的整則留 queue。單條就超預算 → 先按 **rune 邊界**裁 `text`（標 `text_truncated:true`，原本的位元組數寫進 `notes`），再丟附件（少了幾個也寫進 `notes`），最後丟 embeds；估價**跟著留下的附件走**（丟掉的不再佔位，否則多圖訊息會一個都列不出來）；裁完還是超 → 不送空殼，整則留著
+- **超額的處理**：裝不下的整則留 queue（下次 poll 照原序先拿到，`notes` 講一聲）。單則 text 就超過整個預算 → 按 **rune 邊界**把 `text` 裁到整整預算（不預留骨架、不預留 note 空間），標 `text_truncated:true`，`notes` 寫「這一則 text 太長（原本 N bytes），裁到 M bytes 只留開頭」，該則**照樣送出**（反死鎖：queue 頭那一則若不裁就永遠卡住）。裁斷的那一則不會下一輪再出現（已被 Take 走），這是預期行為。附件與 embeds **永不因預算被丟** ⇒ 不會再出現只有 id 沒有內文的空殼訊息
 - `remaining`（**只在 >0 時出現**）＝ 佇列裡還有幾則 ⇒ **請立刻再 poll**；被 filter 掉而留下的不計在內，免得模型無限 poll。（舊版另有一個 `partial:true` 布林，語意跟這個數字重複，已刪；它進 log）
 - `dropped` 只在 >0 時出現：那是「沒人 poll 把 queue 擠爆、被覆蓋掉的舊訊息」，要直接告訴模型
 - `target` 標的是**這個 agent 認得的 alias**（`router.AliasForTarget` 在組裝時現算）；沒有 rule 收養它就留座標——DM 標 `dm:<peer>`（能直接回話的形式），其餘 `channel:<id>`。wildcard rule 的 alias（`dm:*` 的 `dms`）**不是地址**，所以也不拿去當前綴。同一個 Event 在兩條 queue 裡可以標不同名字，所以這個欄位只能長在 `pollMessage` 上
 - 作者壓成一條字串 `author:"阿明"`，名字取的是 **Discord 自己會顯示的那個**：`Message.Member.Nick`（群內暱稱）優先，沒有才退回 `User.DisplayName()`（`global_name` → `username`）——只讀 `DisplayName()` 的話，操作者改了群內暱稱而 agent 永遠叫錯人。`bus.Author` 的 `tag`（舊式 discriminator）對回話沒有增量 ⇒ 進 log；空名字才退回 `tag`，不給匿名台詞。唯一的 ID 例外是 `author_id`（見下方判定三閘）：它過第②閘，因為 `discord_send` 的 `to` 吃 `dm:<ID>` ⇒ 沒有它，agent 無法回 DM 給「剛講話那個人」，只能用 routing 檔裡的 alias；`buildEvent` 的佔位 `"?` 不上線（回 `to:"dm:?"` 是個陷阱）。
-- 「這條訊息本來有幾個附件、被預算擠掉幾個」不再是欄位：留下的都在 `attachments` 清單裡，少幾個由 `notes` 講。別跟 `dropped` 混：那是**整則訊息**被 queue 擠爆覆蓋掉
+- 舊版會「先裁 text、再從尾丟附件、最後丟 embeds」，並用 `attachments_total`／`attachments_omitted` 兩個欄位交代；現在只有 text 是變數，那兩個欄位與三條估價常數（圖 1000／其他 300／embed 200）一起退場。別跟 `dropped` 混：那是**整則訊息**被 queue 擠爆覆蓋掉
 - **附件在輸出裡只有三種形態**（`policy` 不上線，只告訴模型你**拿到**了什麼）：`media:"base64"` + `content_index`（≥1：`content[0]` 是這段 JSON，圖 block 接在後面）／`media:"file"` + `local_path`（可直接餵 `discord_send` 的 `files[].path`）／`media:"url"` + `reason`（見 §5 詞表）。附件在線上只有 `name`（原 `filename`）、`kind`、`url`、`media`，加條件欄位 `duration_secs`（僅音訊／視訊，那是唯一的內容描述）／`reason`／`local_path`／`content_index`；`id`、`mime`、`size`、像素邊長、實際交付位元組數全進 log
 - **上線欄位的判定三閘**（往後新增欄位一律先過這三閘）：①要用它回話 ②要據它決定下一步 ③是敘事的必要輸入。ID、時間戳、位元組數、像素尺寸、alias 背後的真實頻道名都是「誰在何時算了什麼」⇒ 那是 log 與 `discord_status` 的活（`discord_status` 就是這個面板本體，約 90 個 key，所以它是「偶爾呼叫」而不是每輪呼叫）。目前唯一的 ID 例外就是 `author_id`
 - 被搬走的欄位沒有蒸發：`-log-level=debug` 時 poll 打一條 `poll`（`agent`、`waited_ms`、`max_wait`、`connected`、`self`、`count`、`remaining`、`partial`、`bytes`、`dropped`、`notes`、`result=`整個 wire），send 打一條 `send`（`agent`、`target`、`kind`、`channel_id`、`parts`、`message_ids`、`delivered`、`created_at`）。預設 log level 下兩者都被 `Enabled(Debug)` 守門 ⇒ 零成本
@@ -293,7 +293,7 @@ user 裁示：「直接回 429 rate limit 跟時間讓 LLM 知道，然後 mcp s
 | `--transport` | `stdio`（`--http-addr` 127.0.0.1:8787、`--origin`、未來 `--auth` per-agent token） |
 | `--poll-min-wait / --poll-max-wait / --poll-default-wait / --poll-jitter-pct` | 5 / 600 / 45 / 15 |
 | `--bus-capacity` | 2000（**每個 agent 各一條**）|
-| `--poll-max-bytes` | `16384`（16 KiB；`-1`＝不設上限，**`0` 報錯**；數字不做範圍管制，太小是自己找的。只算 messages 的 JSON，附件按 §3 估價計入）|
+| `--poll-max-bytes` | `16384`（16 KiB；**只算各則 `text` 欄位的 byte 總和，不是 JSON 大小**，見 §3；`-1`＝不設上限，**`0` 報錯**；數字不做範圍管制，太小是自己找的）|
 | `--media-image / --media-audio / --media-video / --media-other` | `inline / skip / skip / skip` |
 | `--media-out` | `mcpdr-media`（**cwd 底下**）；留空只允許搭 `--media-save-max-bytes=0`，否則啟動報錯（忘記給路徑）|
 | `--local-path` | `""`＝由 `--media-out` 推。給 LLM 的 `local_path` 前綴：宣告「`--media-out` 這個目錄在 `--file-root` 眼裡叫什麼」，bind mount 也對得上 |
@@ -359,7 +359,7 @@ MVP 零修改（除非選 §6 的 (B)，改兩行常數 + 一個 config）。P2 
 | M4 | README（Portal/intents/routing/接入）、拔網線 30s 重連不漏不炸、多 agent 檔預演 | e2e |
 
 ## 12. 測試計畫（不需要 token 的部分都寫成單測）
-bus（ring 覆蓋 dropped/Notify 不漏/Drain-RequeueFront 原序/nil-Hub 防呆/唯讀契約）、audience（規則優先序、一 event 多 agent、stray、deny、unknown-channel）、router（規則優先序、ACL 拒發、unknown-channel、wildcard 退回、per-agent grant 覆寫）、target（`dm:`/`channel:`/alias/`#名`/`@名`/`me`/`last`；模糊名回候選不瞎猜）、files（路徑政策：先 `path.Clean` 再把開頭 `/` 當根（`./a/../b` == `b`）、`..` 倖存者/`~`/volume name 拒；symlink 逃出 root 被 `os.Root` 擋、根內可用；多 root 優先序；目錄/超大/數量上限；mime 四層優先序與 sniff 後 offset 歸零；`ValidateURL`）、send（seam 注入假 poster + 假時鐘：AllowedMentions.Parse 為空 slice、gap/預算/斷路器狀態機、小 `retry_after` 本地重試且**重試前有 Rewind**、 breaker open 時完全不碰 REST、half-open 只放 1、DryRun 不碰 REST 不佔額度、classify 全碼）、tools（`-dry-run` 端到端 envelope、各 `to` 拒因與 `targets` 候選、切段邊界 1999/2000/2001/CJK/附件僅末段、`text_too_long`、`last` per-agent 隔離、部分送達）、poll（假事件序列 → envelope 斷言、byte 預算截斷、裁切不切壞 UTF-8、queue 隔離、cancel 後訊息仍在、timeout 空答只有 2 個 key、**wire key 集合契約**（envelope/message/attachment/embed 四層各自釘死，新增欄位要先過 §3 三閘））、media（三段政策：inline 真的進 content block、save 一檔不重複下載、skip 零 request、超限不降級、**headers/body 分段交付也要讀得完**（E-8 回歸）、cleanup 年齡＋LRU）、`--selftest`（真連煙霧測試）
+bus（ring 覆蓋 dropped/Notify 不漏/Drain-RequeueFront 原序/nil-Hub 防呆/唯讀契約）、audience（規則優先序、一 event 多 agent、stray、deny、unknown-channel）、router（規則優先序、ACL 拒發、unknown-channel、wildcard 退回、per-agent grant 覆寫）、target（`dm:`/`channel:`/alias/`#名`/`@名`/`me`/`last`；模糊名回候選不瞎猜）、files（路徑政策：先 `path.Clean` 再把開頭 `/` 當根（`./a/../b` == `b`）、`..` 倖存者/`~`/volume name 拒；symlink 逃出 root 被 `os.Root` 擋、根內可用；多 root 優先序；目錄/超大/數量上限；mime 四層優先序與 sniff 後 offset 歸零；`ValidateURL`）、send（seam 注入假 poster + 假時鐘：AllowedMentions.Parse 為空 slice、gap/預算/斷路器狀態機、小 `retry_after` 本地重試且**重試前有 Rewind**、 breaker open 時完全不碰 REST、half-open 只放 1、DryRun 不碰 REST 不佔額度、classify 全碼）、tools（`-dry-run` 端到端 envelope、各 `to` 拒因與 `targets` 候選、切段邊界 1999/2000/2001/CJK/附件僅末段、`text_too_long`、`last` per-agent 隔離、部分送達）、poll（假事件序列 → envelope 斷言、text 預算裁斷（**附件永不因預算被丟**＝空殼回歸）、裁切不切壞 UTF-8、queue 隔離、cancel 後訊息仍在、timeout 空答只有 2 個 key、**wire key 集合契約**（envelope/message/attachment/embed 四層各自釘死，新增欄位要先過 §3 三閘））、media（三段政策：inline 真的進 content block、save 一檔不重複下載、skip 零 request、超限不降級、**headers/body 分段交付也要讀得完**（E-8 回歸）、cleanup 年齡＋LRU）、`--selftest`（真連煙霧測試）
 
 ---
 

@@ -366,10 +366,11 @@ func TestPollStopsAtByteBudget(t *testing.T) {
 		t.Fatalf("16384/5000 should fit 3 messages, got %d", n)
 	}
 	wantNum(t, out, "remaining", 2)
-	// The budget buys the messages array; the envelope's counters ride on top of
-	// it, so the answer as a whole may only drift past by that much.
-	if b := len(res.Content[0].Text); b > 16384+512 {
-		t.Errorf("answer is %d bytes, far past the 16384 budget", b)
+	// The budget counts text only, so the JSON answer drifts past it by the fixed
+	// per-message overhead (keys, author, timestamps). That drift is the point:
+	// nobody has to guess what a message's envelope costs to encode.
+	if b := len(res.Content[0].Text); b > 16384+2048 {
+		t.Errorf("answer is %d bytes, far past the 16384 text budget", b)
 	}
 	// The leftovers come back in order on the next poll.
 	out = pollOK(t, d, `{"max_wait":1}`)
@@ -379,8 +380,9 @@ func TestPollStopsAtByteBudget(t *testing.T) {
 	}
 }
 
-// A message bigger than the whole budget must not wedge the queue head: it is
-// trimmed, and the model is told how big it really was.
+// A message whose text is bigger than the whole budget must not wedge the queue
+// head: the text is cut to the budget on a rune boundary, and the model is told
+// how big it really was.
 func TestPollTrimsOversizedMessage(t *testing.T) {
 	d := newDeps(t, routingCfg(t, "-poll-max-bytes=8192"))
 	text := strings.Repeat("漢", 4000) // 12000 bytes of 3-byte runes
@@ -393,8 +395,11 @@ func TestPollTrimsOversizedMessage(t *testing.T) {
 	if !utf8.ValidString(got) {
 		t.Error("truncation split a UTF-8 rune")
 	}
-	if len(got) >= len(text) {
-		t.Fatalf("message was not trimmed into the budget: %d bytes", len(got))
+	if len(got) > 8192 {
+		t.Fatalf("text was not cut into the budget: %d bytes", len(got))
+	}
+	if len(got) != 8190 {
+		t.Errorf("the cut should land as close to the budget as a rune boundary allows: %d bytes", len(got))
 	}
 	if m["text_truncated"] != true {
 		t.Error("a trimmed text must say so")
@@ -404,7 +409,7 @@ func TestPollTrimsOversizedMessage(t *testing.T) {
 	if !hasNote(out, fmt.Sprintf("原本 %d bytes", len(text))) {
 		t.Errorf("the note must report the real size: %v", out["notes"])
 	}
-	if b := len(res.Content[0].Text); b > 8192+512 {
+	if b := len(res.Content[0].Text); b > 8192+2048 {
 		t.Errorf("answer is %d bytes, far past the 8192 budget", b)
 	}
 	if queueLen(t, d, "default") != 0 {
@@ -425,11 +430,14 @@ func TestPollBudgetMinusOneIsUncapped(t *testing.T) {
 	}
 }
 
-// When even the metadata does not fit, trailing attachments are counted out —
-// their URLs are never cut, only listed as omitted.
-func TestPollOmitsAttachmentsToFit(t *testing.T) {
-	d := newDeps(t, routingCfg(t, "-poll-max-bytes=4096"))
-	e := evMsg("m1", "")
+// The byte budget only negotiates text: an attachment is never dropped to make a
+// message fit, not even when the text beside it has to be cut. That is the old
+// empty-shell bug nailed shut — the previous order of operations trimmed the text
+// to zero, threw the attachments out with the room it had just freed, and shipped
+// a message with neither.
+func TestPollBudgetNeverDropsAttachments(t *testing.T) {
+	d := newDeps(t, routingCfg(t, "-poll-max-bytes=200"))
+	e := evMsg("m1", strings.Repeat("x", 400))
 	for i := 0; i < 20; i++ {
 		e.Attachments = append(e.Attachments, bus.Attachment{
 			ID: "a", Filename: "shot.png", Kind: bus.KindImage,
@@ -442,13 +450,17 @@ func TestPollOmitsAttachmentsToFit(t *testing.T) {
 	out := pollOK(t, d, `{"max_wait":1}`)
 	m := firstMsg(t, out)
 	list, _ := m["attachments"].([]any)
-	if len(list) == 0 || len(list) >= 20 {
-		t.Fatalf("some of the 20 attachments must be cut to fit, got %d listed", len(list))
+	if len(list) != 20 {
+		t.Fatalf("a text budget must never drop attachments, got %d of 20 listed", len(list))
 	}
-	// The numbers live in the note now: what the model has to act on is that the
-	// list it got is not the whole set, not the arithmetic.
-	if !hasNote(out, fmt.Sprintf("少了 %d 個", 20-len(list))) {
-		t.Errorf("the omission must be counted in notes: %v", out["notes"])
+	if txt, _ := m["text"].(string); len(txt) != 200 {
+		t.Errorf("the text should be cut to exactly the budget, got %d bytes", len(txt))
+	}
+	if m["text_truncated"] != true {
+		t.Error("a cut text must say so")
+	}
+	if _, bad := m["attachments_omitted"]; bad {
+		t.Error("attachments_omitted is gone from the wire: nothing omits attachments any more")
 	}
 	first := list[0].(map[string]any)
 	if s, _ := first["url"].(string); !strings.HasPrefix(s, "https://") {
