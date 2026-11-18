@@ -387,9 +387,18 @@ func (c *Client) normalize(s *discordgo.Session, m *discordgo.Message) *bus.Even
 
 	// author: webhook messages can carry a nil author
 	if m.Author != nil {
+		// Discord's guild display name is member.nick; only when there is no
+		// nickname does it fall back to global_name/username, which is all
+		// DisplayName() knows about. The MESSAGE_CREATE member object is partial,
+		// so an empty nick means "no nickname set" and DisplayName is then right;
+		// DMs carry no member at all and always take that path.
+		name := m.Author.DisplayName()
+		if m.Member != nil && m.Member.Nick != "" {
+			name = m.Member.Nick
+		}
 		ev.Author = bus.Author{
 			ID:   m.Author.ID,
-			Name: m.Author.DisplayName(),
+			Name: name,
 			Tag:  m.Author.String(),
 			Bot:  m.Author.Bot,
 			Self: m.Author.ID != "" && m.Author.ID == selfID,

@@ -139,7 +139,7 @@ poll 有**兩個結構**：工作結構 `pollMessage`／`pollAttachment`（欄�
 envelope（`omitempty` 的欄位只在有意義時出現；下面把常見的都列齊）：
 ```json
 {"ok":true,"reason":"messages",
- "messages":[{"target":"boss","author":"阿明","ts":"2026-11-16T19:20:31+08:00","age_s":12,
+ "messages":[{"target":"boss","author":"阿明","author_id":"222333444555666777","ts":"2026-11-16T19:20:31+08:00","age_s":12,
    "text":"晚安","mentions_self":true,
    "attachments":[{"name":"night.png","kind":"image","url":"https://cdn.discordapp.com/...",
       "media":"base64","content_index":1}],
@@ -153,11 +153,11 @@ envelope（`omitempty` 的欄位只在有意義時出現；下面把常見的都
 - `remaining`（**只在 >0 時出現**）＝ 佇列裡還有幾則 ⇒ **請立刻再 poll**；被 filter 掉而留下的不計在內，免得模型無限 poll。（舊版另有一個 `partial:true` 布林，語意跟這個數字重複，已刪；它進 log）
 - `dropped` 只在 >0 時出現：那是「沒人 poll 把 queue 擠爆、被覆蓋掉的舊訊息」，要直接告訴模型
 - `target` 標的是**這個 agent 認得的 alias**（`router.AliasForTarget` 在組裝時現算）；沒有 rule 收養它就留內部座標 `channel:<id>`。同一個 Event 在兩條 queue 裡可以標不同名字，所以這個欄位只能長在 `pollMessage` 上
-- 作者壓成一條字串 `author:"阿明"`：`bus.Author` 的 `id`（18 位 snowflake）與 `tag`（舊式 discriminator）對回話沒有增量 ⇒ 進 log；空名字才退回 `tag`，不給匿名台詞。`bot`／`self` 降為訊息層級的條件布林（只在 true 時出現），`dm` 同樣 `omitempty`
+- 作者壓成一條字串 `author:"阿明"`，名字取的是 **Discord 自己會顯示的那個**：`Message.Member.Nick`（群內暱稱）優先，沒有才退回 `User.DisplayName()`（`global_name` → `username`）——只讀 `DisplayName()` 的話，操作者改了群內暱稱而 agent 永遠叫錯人。`bus.Author` 的 `tag`（舊式 discriminator）對回話沒有增量 ⇒ 進 log；空名字才退回 `tag`，不給匿名台詞。唯一的 ID 例外是 `author_id`（見下方判定三閘）：它過第②閘，因為 `discord_send` 的 `to` 吃 `user:<ID>` ⇒ 沒有它，agent 無法回 DM 給「剛講話那個人」，只能用 routing 檔裡的 alias；`buildEvent` 的佔位 `"?` 不上線（回 `to:"user:?"` 是個陷阱）。
 - 「這條訊息本來有幾個附件、被預算擠掉幾個」不再是欄位：留下的都在 `attachments` 清單裡，少幾個由 `notes` 講。別跟 `dropped` 混：那是**整則訊息**被 queue 擠爆覆蓋掉
 - **附件在輸出裡只有三種形態**（`policy` 不上線，只告訴模型你**拿到**了什麼）：`media:"base64"` + `content_index`（≥1：`content[0]` 是這段 JSON，圖 block 接在後面）／`media:"file"` + `local_path`（可直接餵 `discord_send` 的 `files[].path`）／`media:"url"` + `reason`（見 §5 詞表）。附件在線上只有 `name`（原 `filename`）、`kind`、`url`、`media`，加條件欄位 `duration_secs`（僅音訊／視訊，那是唯一的內容描述）／`reason`／`local_path`／`content_index`；`id`、`mime`、`size`、像素邊長、實際交付位元組數全進 log
-- **上線欄位的判定三閘**（往後新增欄位一律先過這三閘）：①要用它回話 ②要據它決定下一步 ③是敘事的必要輸入。ID、時間戳、位元組數、像素尺寸、alias 背後的真實頻道名都是「誰在何時算了什麼」⇒ 那是 log 與 `discord_status` 的活（`discord_status` 就是這個面板本體，約 90 個 key，所以它是「偶爾呼叫」而不是每輪呼叫）
-- 被搬走的欄位沒有蒸發：`-log-level=debug` 時 poll 打一條 `poll`（`agent`、`waited_ms`、`max_wait`、`connected`、`self`、`count`、`remaining`、`partial`、`bytes`、`dropped`、`notes`、`result=`整个 wire），send 打一條 `send`（`agent`、`target`、`kind`、`channel_id`、`parts`、`message_ids`、`delivered`、`created_at`）。預設 log level 下兩者都被 `Enabled(Debug)` 守門 ⇒ 零成本
+- **上線欄位的判定三閘**（往後新增欄位一律先過這三閘）：①要用它回話 ②要據它決定下一步 ③是敘事的必要輸入。ID、時間戳、位元組數、像素尺寸、alias 背後的真實頻道名都是「誰在何時算了什麼」⇒ 那是 log 與 `discord_status` 的活（`discord_status` 就是這個面板本體，約 90 個 key，所以它是「偶爾呼叫」而不是每輪呼叫）。目前唯一的 ID 例外就是 `author_id`
+- 被搬走的欄位沒有蒸發：`-log-level=debug` 時 poll 打一條 `poll`（`agent`、`waited_ms`、`max_wait`、`connected`、`self`、`count`、`remaining`、`partial`、`bytes`、`dropped`、`notes`、`result=`整個 wire），send 打一條 `send`（`agent`、`target`、`kind`、`channel_id`、`parts`、`message_ids`、`delivered`、`created_at`）。預設 log level 下兩者都被 `Enabled(Debug)` 守門 ⇒ 零成本
 
 ---
 

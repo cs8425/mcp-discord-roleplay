@@ -17,8 +17,10 @@
 // the queue forever. Instead it is trimmed into the budget: the text keeps its
 // head and a note says how big it really was; if that is still not enough,
 // trailing attachments are counted out, again by note. What reaches the model is
-// only what it needs in order to answer (see msgWire): target, author, text,
-// timestamps, attachment urls. Identifiers and counters went to the log.
+// only what it needs in order to answer (see msgWire): target, author, the
+// author's Discord id, text, timestamps, attachment urls. The author id is the
+// one id that earns its bytes: it is what a to:"user:<id>" reply is built from.
+// Everything else went to the log.
 //
 // Media runs in a second phase, after the drain. Queue.Drain calls the verdict
 // function under the queue's lock, and a download must not hold that lock: the
@@ -79,6 +81,7 @@ func pollTool() *mcp.Tool {
 			"reason=cancelled/shutdown means this answer was not delivered. " +
 			"If remaining is present, that many messages are still queued — poll again right away. " +
 			"If dropped is present, messages were overwritten while nobody polled; poll more often. " +
+			"author_id is the speaker's Discord id: quote it as to:\"user:<id>\" to answer that person in DMs even when they have no alias. " +
 			"Each attachment reports what it came as: media=base64 means the bytes are appended to this result as a content block (content_index names it), " +
 			"media=file means they were saved and local_path says where, media=url means metadata only and reason says why. " +
 			"This call blocks up to max_wait seconds, so your client's request timeout must be at least that long.",
@@ -851,6 +854,7 @@ type attWire struct {
 type msgWire struct {
 	Target       string      `json:"target,omitempty"`
 	Author       string      `json:"author"`
+	AuthorID     string      `json:"author_id,omitempty"`
 	Bot          bool        `json:"bot,omitempty"`
 	Self         bool        `json:"self,omitempty"`
 	DM           bool        `json:"dm,omitempty"`
@@ -868,6 +872,7 @@ func (m pollMessage) wire() msgWire {
 	out := msgWire{
 		Target:       m.Target,
 		Author:       m.From.Name,
+		AuthorID:     m.From.ID,
 		Bot:          m.From.Bot,
 		Self:         m.From.Self,
 		DM:           m.DM,
@@ -881,6 +886,11 @@ func (m pollMessage) wire() msgWire {
 		// An unattributed line is worse than an ugly one: fall back to whatever
 		// tag Discord gave us rather than presenting anonymous text.
 		out.Author = m.From.Tag
+	}
+	if out.AuthorID == "?" {
+		// buildEvent's placeholder for an author Discord never named. It is not a
+		// usable id, and echoing it back as to:"user:?" would be a trap.
+		out.AuthorID = ""
 	}
 	if len(m.Attachments) > 0 {
 		out.Attachments = make([]attWire, 0, len(m.Attachments))

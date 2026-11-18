@@ -117,6 +117,42 @@ func TestGatewayLogReconnectStillCounts(t *testing.T) {
 	}
 }
 
+// Discord shows a member's guild nickname above global_name/username, and the
+// message payload carries the nickname only in Message.Member. Author.Name must
+// follow Discord, otherwise an operator renames someone in the server and the
+// agent keeps calling them by the old name forever.
+func TestNormalizePrefersGuildNickname(t *testing.T) {
+	c, _ := logClient(slog.LevelInfo)
+	c.cfg = testCfg(t)
+
+	msg := &discordgo.Message{
+		ID: "1", ChannelID: "2", GuildID: "g1", Content: "hi",
+		Author: &discordgo.User{ID: "u1", Username: "oldname", GlobalName: "olddisplay"},
+		Member: &discordgo.Member{Nick: "群內暱稱"},
+	}
+	ev := c.normalize(nil, msg)
+	if ev.Author.Name != "群內暱稱" {
+		t.Errorf("Name = %q, want the guild nickname", ev.Author.Name)
+	}
+	if ev.Author.ID != "u1" {
+		t.Errorf("ID = %q, want u1", ev.Author.ID)
+	}
+	if !strings.HasPrefix(ev.Author.Tag, "oldname") {
+		t.Errorf("Tag = %q, want it to keep the account name for the log", ev.Author.Tag)
+	}
+
+	// Empty nick in a partial member object means "no nickname": fall back.
+	msg.Member = &discordgo.Member{}
+	if got := c.normalize(nil, msg).Author.Name; got != "olddisplay" {
+		t.Errorf("empty nick: Name = %q, want global_name", got)
+	}
+	// DMs carry no member at all.
+	msg.Member = nil
+	if got := c.normalize(nil, msg).Author.Name; got != "olddisplay" {
+		t.Errorf("no member: Name = %q, want global_name", got)
+	}
+}
+
 func TestHeadLogKeepsUTF8AndShortStrings(t *testing.T) {
 	if got := headLog("abc", 10); got != "abc" {
 		t.Errorf("short string changed: %q", got)

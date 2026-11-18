@@ -481,7 +481,7 @@ func TestPollWireKeysAreExactlyThese(t *testing.T) {
 	}
 
 	m := firstMsg(t, out)
-	want := "age_s,attachments,author,embeds,target,text,ts"
+	want := "age_s,attachments,author,author_id,embeds,target,text,ts"
 	if got := keySet(m); got != want {
 		t.Errorf("message keys =\n  %s\nwant\n  %s", got, want)
 	}
@@ -496,6 +496,25 @@ func TestPollWireKeysAreExactlyThese(t *testing.T) {
 	if got := keySet(emb); got != "title" {
 		t.Errorf("embed keys = %s (only the ones present may appear)", got)
 	}
+	// The one id that earns its bytes: to:"user:<id>" is built from it.
+	wantStr(t, m, "author_id", "u1")
+}
+
+// A placeholder author id must not reach the wire: quoting it back as
+// to:"user:?" would send the reply nowhere useful.
+func TestPollOmitsPlaceholderAuthorID(t *testing.T) {
+	d := newDeps(t, routingCfg(t))
+	connected(d)
+	e := evMsg("m1", "hi")
+	e.Author = bus.Author{ID: "?", Name: "?"}
+	push(t, d, "default", e)
+
+	out := pollOK(t, d, `{"max_wait":1}`)
+	m := firstMsg(t, out)
+	if _, ok := m["author_id"]; ok {
+		t.Errorf(`author_id should be omitted for the "?" placeholder, got %v`, m["author_id"])
+	}
+	wantStr(t, m, "author", "?")
 }
 
 // keySet sorts an answer object's keys into one comparable string.
