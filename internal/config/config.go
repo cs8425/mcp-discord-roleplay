@@ -123,11 +123,17 @@ type Config struct {
 	SendRetryWaitMS int // largest retry_after we absorb locally instead of reporting
 
 	// --- access control -------------------------------------------------------
-	AllowGuilds   []string
-	AllowChannels []string
-	DenyChannels  []string
-	AllowDM       bool
-	UnknownDM     string // ignore | ring
+	// M2c: a DM is a channel, so there is one policy per kind. AllowChannels and
+	// DenyChannels hold aliases or target ids ("channel:123", "dm:456", "dm:*");
+	// deny wins over allow, and an entry in both is reported as a warning.
+	AllowGuilds    []string
+	AllowChannels  []string
+	DenyChannels   []string
+	UnknownChannel string // ignore | ring: a channel (of either kind) with no rule
+
+	// Warnings are non-fatal findings collected during finalize (an entry in both
+	// allow and deny). main logs them; nothing else acts on them.
+	Warnings []string
 
 	// --- files that feed the config -------------------------------------------
 	// Both paths are kept exactly as typed, even when the file turns out to be
@@ -232,10 +238,9 @@ func Load(args []string) (*Config, error) {
 	fs.IntVar(&c.SendRetryWaitMS, "send-retry-wait-ms", 1500, "largest Discord retry_after we absorb by waiting; anything longer is reported back to the caller")
 
 	fs.Var(&allowGuilds, "allow-guilds", "guild IDs to admit when routing.json is absent (repeatable; empty = unrestricted)")
-	fs.Var(&allowChannels, "allow-channels", "channel IDs to admit when routing.json is absent (repeatable)")
-	fs.Var(&denyChannels, "deny-channels", "channel IDs that are always excluded (repeatable; wins over allow)")
-	fs.BoolVar(&c.AllowDM, "allow-dm", true, "admit inbound DMs at all")
-	fs.StringVar(&c.UnknownDM, "unknown-dm", "ignore", "DMs that match no routing rule: ignore|ring")
+	fs.Var(&allowChannels, "allow-channels", "channel aliases or target ids to admit (repeatable; channel:123, dm:456, dm:*)")
+	fs.Var(&denyChannels, "deny-channels", "channel aliases or target ids that are always excluded, reading included (repeatable; wins over allow)")
+	fs.StringVar(&c.UnknownChannel, "unknown-channel", "ignore", "channels that match no routing rule, guild or DM: ignore|ring")
 
 	fs.StringVar(&c.EnvFile, "env-file", ".env", "dotenv file to load (silently skipped when absent)")
 	fs.StringVar(&c.RoutingFile, "config", "routing.json", "routing file (silently skipped when absent)")
@@ -404,9 +409,14 @@ func (c *Config) finalize() error {
 			}
 			c.Routing = r
 			c.RoutingLoaded = true
-			if r.UnknownDM != "" {
-				c.UnknownDM = strings.ToLower(r.UnknownDM)
+			if r.UnknownChannel != "" {
+				c.UnknownChannel = strings.ToLower(r.UnknownChannel)
 			}
+			// The two sources of the global gates merge (union), they do not replace
+			// each other: dropping a flag-listed channel because a routing file
+			// appeared would silently widen or narrow the blast radius.
+			c.AllowChannels = mergeTargets(c.AllowChannels, r.AllowChannels)
+			c.DenyChannels = mergeTargets(c.DenyChannels, r.DenyChannels)
 		} else {
 			c.Routing = &Routing{}
 		}
@@ -415,11 +425,11 @@ func (c *Config) finalize() error {
 	}
 
 	// 6. validate the rest
-	switch strings.ToLower(c.UnknownDM) {
+	switch strings.ToLower(c.UnknownChannel) {
 	case "ignore", "ring":
-		c.UnknownDM = strings.ToLower(c.UnknownDM)
+		c.UnknownChannel = strings.ToLower(c.UnknownChannel)
 	default:
-		return fmt.Errorf("--unknown-dm must be ignore|ring, got %q", c.UnknownDM)
+		return fmt.Errorf("--unknown-channel must be ignore|ring, got %q", c.UnknownChannel)
 	}
 	switch strings.ToLower(c.Transport) {
 	case "stdio":
@@ -494,7 +504,65 @@ func (c *Config) finalize() error {
 	default:
 		return fmt.Errorf("--log-level must be debug|info|warn|error, got %q", c.LogLevel)
 	}
+	c.checkACLOverlap()
 	return nil
+}
+
+// mergeTargets concatenates two alias-or-id lists, dropping blank entries and
+// duplicates while keeping order (flags first, then the routing file).
+func mergeTargets(flagVals, routing []string) []string {
+	out := make([]string, 0, len(flagVals)+len(routing))
+	seen := map[string]bool{}
+	for _, list := range [][]string{flagVals, routing} {
+		for _, s := range list {
+			s = strings.TrimSpace(s)
+			if s == "" || seen[s] {
+				continue
+			}
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// checkACLOverlap reports entries named by BOTH allow_channels and
+// deny_channels. Deny always wins, so this is a warning rather than an error --
+// but the two lists mean different things (allow = the rule exists, deny = it is
+// shut), so an entry in both almost certainly means the alias was written wrong
+// in one of them.
+func (c *Config) checkACLOverlap() {
+	if len(c.AllowChannels) == 0 || len(c.DenyChannels) == 0 {
+		return
+	}
+	// Aliases and ids describe the same target, so compare canonical forms.
+	byAlias := map[string]string{}
+	for i := range c.Routing.Targets {
+		t := &c.Routing.Targets[i]
+		if kind, id, err := NormalizeTargetID(t.ID); err == nil {
+			byAlias[strings.TrimSpace(t.Alias)] = CanonicalTarget(kind, id)
+		}
+	}
+	canon := func(s string) string {
+		s = strings.TrimSpace(s)
+		if v, ok := byAlias[s]; ok {
+			return v
+		}
+		if kind, id, err := NormalizeTargetID(s); err == nil {
+			return CanonicalTarget(kind, id)
+		}
+		return s
+	}
+	deny := map[string]bool{}
+	for _, s := range c.DenyChannels {
+		deny[canon(s)] = true
+	}
+	for _, s := range c.AllowChannels {
+		if k := canon(s); deny[k] {
+			c.Warnings = append(c.Warnings, fmt.Sprintf(
+				"%s is in both allow_channels and deny_channels; deny wins (it cannot be read either)", k))
+		}
+	}
 }
 
 // raw flag strings are read through c.rawRoots (set by Load).
@@ -676,7 +744,7 @@ func (c *Config) Audit() map[string]any {
 		},
 		"acl": map[string]any{
 			"allow_guilds": c.AllowGuilds, "allow_channels": c.AllowChannels,
-			"deny_channels": c.DenyChannels, "allow_dm": c.AllowDM, "unknown_dm": c.UnknownDM,
+			"deny_channels": c.DenyChannels, "unknown_channel": c.UnknownChannel,
 		},
 		"routing_file":   c.RoutingFile,
 		"routing_loaded": c.RoutingLoaded,

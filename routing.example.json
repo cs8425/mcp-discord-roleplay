@@ -2,7 +2,11 @@
   "agents": [
     {
       "id": "default",
-      "targets": ["boss", "dm:ami", "log"]
+      "targets": ["boss", "ami", "log", "dms"]
+    },
+    {
+      "id": "scribe",
+      "targets": [{ "alias": "dms", "write": true }]
     }
   ],
   "targets": [
@@ -14,16 +18,28 @@
       "write": true
     },
     {
-      "alias": "dm:ami",
-      "id": "user:222333444555666777",
-      "name": "Ami"
+      "alias": "ami",
+      "id": "dm:222333444555666777",
+      "name": "Ami",
+      "read": true,
+      "write": true
     },
     {
       "alias": "log",
       "id": "channel:333444555666777888",
+      "name": "#log (write:false by default: nobody answers here)",
+      "read": true,
+      "write": false
+    },
+    {
+      "alias": "dms",
+      "id": "dm:*",
+      "name": "any DM (read-only by default; only scribe overrides to write)",
       "read": true,
       "write": false
     }
   ],
-  "unknown_dm": "ignore"
+  "allow_channels": ["boss", "ami", "log", "dms"],
+  "deny_channels": [],
+  "unknown_channel": "ignore"
 }

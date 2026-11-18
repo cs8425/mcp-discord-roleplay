@@ -43,7 +43,7 @@ func sendTool() *mcp.Tool {
 		Name:  "send",
 		Title: "Send a message to Discord",
 		Description: "Send text and/or attachments to exactly one Discord target. " +
-			"to: an alias listed by discord_status, 'channel:<id>', 'user:<id>', '#name', '@name', a bare channel id, " +
+			"to: an alias listed by discord_status, 'channel:<id>', 'dm:<id>', '#name', '@name', a bare channel id, " +
 			"'me' (a DM to the bot itself), or 'last' (the target this agent spoke to most recently). " +
 			"A body longer than 2000 characters is split into several messages sent in order. " +
 			"files[].path is read on the server from the --file-root directories and uploaded as a real attachment: " +
@@ -57,7 +57,7 @@ func sendTool() *mcp.Tool {
 			Properties: map[string]mcp.Schema{
 				"to": {
 					Type:        mcp.TypeString,
-					Description: "alias from discord_status | channel:<id> | user:<id> | #name | @name | <bare channel id> | me | last",
+					Description: "alias from discord_status | channel:<id> | dm:<id> | #name | @name | <bare channel id> | me | last",
 				},
 				"text": {
 					Type:        mcp.TypeString,
@@ -312,7 +312,7 @@ func (d *Deps) routeSend(p router.Principal, ref string) (*router.Rule, string) 
 }
 
 // channelFor gives the REST layer a channel id: direct for a channel, created on
-// demand for a user or for "me".
+// demand for a DM peer or for "me".
 func (d *Deps) channelFor(ctx context.Context, ru *router.Rule) (string, *discord.SendError) {
 	switch ru.Kind {
 	case router.KindChannel:
@@ -321,7 +321,7 @@ func (d *Deps) channelFor(ctx context.Context, ru *router.Rule) (string, *discor
 				Msg: "the routing entry for " + ru.Alias + " has no channel id"}
 		}
 		return ru.ID, nil
-	case router.KindUser:
+	case router.KindDM:
 		id, err := d.DC.DMChannel(ctx, ru.ID)
 		if err != nil {
 			return "", asSendError(err)
@@ -348,17 +348,21 @@ func (d *Deps) channelFor(ctx context.Context, ru *router.Rule) (string, *discor
 func (d *Deps) targetHint(reason string) string {
 	switch reason {
 	case "empty_target":
-		return "to is required: an alias from discord_status, channel:<id>, user:<id>, #name, me or last"
+		return "to is required: an alias from discord_status, channel:<id>, dm:<id>, #name, me or last"
 	case "no_last_target":
 		return "this agent has not sent anything yet, so 'last' has nothing to point at; name a target"
 	case "unknown_target":
 		return "that name is not in routing.json; use one of the aliases listed in this result's targets"
 	case "not_allowlisted":
 		return "not covered by --allow-channels/--allow-guilds, or it is in --deny-channels; the operator decides"
+	case "denied_channel":
+		return "that channel is in the deny list, which is absolute: nobody may read or write it"
+	case "wildcard_target":
+		return "that alias is a wildcard rule (dm:* or channel:*), which is a policy, not an address: name the concrete peer, e.g. dm:<user_id>"
 	case "foreign_agent":
 		return "that target belongs to a different agent; run this server with --agent for the right persona"
 	case "write_denied":
-		return "the routing entry for that target sets write:false: it is read-only (use it with discord_poll)"
+		return "you may not speak here: this target is read-only for you (its write default, or your agent's override); the operator decides in routing.json"
 	default:
 		return "cannot resolve that target"
 	}
@@ -368,7 +372,7 @@ func (d *Deps) targetHint(reason string) string {
 // reasons, what the model could have named instead. Bounded, because a big
 // channel list in an error answer is pure token waste.
 func (d *Deps) targetList(reason string, p router.Principal) map[string]any {
-	if reason != "unknown_target" && reason != "no_last_target" && reason != "empty_target" {
+	if reason != "unknown_target" && reason != "no_last_target" && reason != "empty_target" && reason != "wildcard_target" {
 		return nil
 	}
 	names := d.writableTargets(p, 15)
@@ -381,7 +385,9 @@ func (d *Deps) targetList(reason string, p router.Principal) map[string]any {
 func (d *Deps) writableTargets(p router.Principal, limit int) []string {
 	out := make([]string, 0, limit)
 	for _, ru := range d.Router.Targets(p) {
-		if !ru.Write {
+		if !ru.Write || ru.Wildcard {
+			// A wildcard alias is not sendable as-is (it has no address), so
+			// suggesting it would only set the caller up for wildcard_target.
 			continue
 		}
 		out = append(out, ru.Alias)

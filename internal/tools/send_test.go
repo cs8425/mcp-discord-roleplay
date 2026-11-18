@@ -28,15 +28,15 @@ import (
 
 const routingJSON = `{
   "agents": [
-    {"id": "default", "targets": ["boss", "dm:ami", "log"]},
+    {"id": "default", "targets": ["boss", "ami", "log"]},
     {"id": "solo", "targets": ["boss"]}
   ],
   "targets": [
     {"alias": "boss", "id": "channel:111222333444555666", "name": "#rp-main", "read": true, "write": true},
-    {"alias": "dm:ami", "id": "user:222333444555666777", "name": "Ami"},
+    {"alias": "ami", "id": "dm:222333444555666777", "name": "Ami"},
     {"alias": "log", "id": "channel:333444555666777888", "read": true, "write": false}
   ],
-  "unknown_dm": "ignore"
+  "unknown_channel": "ignore"
 }`
 
 func toolCfg(t *testing.T, extra ...string) *config.Config {
@@ -217,9 +217,9 @@ func TestSendByEveryTargetForm(t *testing.T) {
 		{"BOSS", "boss", "channel", "111222333444555666"}, // aliases are case-insensitive
 		{"channel:111222333444555666", "boss", "channel", "111222333444555666"},
 		{"#rp-main", "boss", "channel", "111222333444555666"},
-		{"user:222333444555666777", "dm:ami", "user", "dry-run-dm:222333444555666777"},
-		{"ami", "dm:ami", "user", "dry-run-dm:222333444555666777"},
-		{"@ami", "dm:ami", "user", "dry-run-dm:222333444555666777"},
+		{"dm:222333444555666777", "ami", "dm", "dry-run-dm:222333444555666777"},
+		{"ami", "ami", "dm", "dry-run-dm:222333444555666777"},
+		{"@ami", "ami", "dm", "dry-run-dm:222333444555666777"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.to, func(t *testing.T) {
@@ -231,6 +231,12 @@ func TestSendByEveryTargetForm(t *testing.T) {
 			sentTo(t, buf, "target="+tc.alias, "kind="+tc.kind,
 				"channel_id="+tc.ch, "delivered="+tc.ch)
 		})
+	}
+
+	// M2c: "user:" is no longer a spelling of a target. Rejecting it beats
+	// accepting it silently, which would keep two vocabularies alive.
+	if out := sendErr(t, d, `{"to":"user:222333444555666777","text":"hi"}`); out["error"] != "unknown_target" {
+		t.Fatalf("user: must be gone, got %v", out)
 	}
 }
 
@@ -246,13 +252,20 @@ func TestAdHocBareSnowflake(t *testing.T) {
 	sentTo(t, buf, "channel_id=444555666777888999", "kind=channel")
 }
 
-func TestAdHocUserNeedsAllowDM(t *testing.T) {
-	rt := newDeps(t, toolCfg(t, "-allow-dm=false"))
-	out := sendErr(t, rt, `{"to":"user:222333444555666777","text":"hi"}`)
+// Closing DMs is the deny list talking about a kind, not a flag of its own --
+// a DM is a channel, so it gets the same fence every channel gets.
+func TestAdHocDenyDMWildcard(t *testing.T) {
+	d := newDeps(t, toolCfg(t, "-deny-channels=dm:*"))
+	out := sendErr(t, d, `{"to":"dm:222333444555666777","text":"hi"}`)
 	wantCode(t, out, "not_allowlisted")
 	if _, bad := out["targets"]; bad {
 		t.Error("an allow-list refusal is the operator's call, listing aliases would invite probing")
 	}
+	buf := withDebugLog(t, d)
+	if o := sendOK(t, d, `{"to":"444555666777888999","text":"hi"}`); o["ok"] != true {
+		t.Fatalf("denying dm:* must leave guild channels alone: %v", o)
+	}
+	sentTo(t, buf, "kind=channel", "channel_id=444555666777888999")
 }
 
 func TestRoutingFileRejectsUnlistedTarget(t *testing.T) {
@@ -352,12 +365,12 @@ func TestLastTargetRoundTripAndIsolation(t *testing.T) {
 		t.Error("no_last_target should offer the aliases it could use instead")
 	}
 
-	if o := sendOK(t, d, `{"to":"dm:ami","text":"first"}`); o["ok"] != true {
+	if o := sendOK(t, d, `{"to":"ami","text":"first"}`); o["ok"] != true {
 		t.Fatalf("setup send failed: %v", o)
 	}
 	buf := withDebugLog(t, d)
 	sendOK(t, d, `{"to":"LAST","text":"follow-up"}`)
-	sentTo(t, buf, "target=dm:ami", "channel_id=dry-run-dm:222333444555666777")
+	sentTo(t, buf, "target=ami", "channel_id=dry-run-dm:222333444555666777")
 
 	// A different agent on the same process must not inherit it.
 	ctx := router.WithPrincipal(context.Background(), router.Principal{AgentID: "solo"})
@@ -380,7 +393,7 @@ func TestLastTargetRoundTripAndIsolation(t *testing.T) {
 	// The default agent still points at its own conversation.
 	buf = withDebugLog(t, d)
 	sendOK(t, d, `{"to":"last","text":"mine"}`)
-	sentTo(t, buf, "target=dm:ami")
+	sentTo(t, buf, "target=ami")
 }
 
 func TestLastSurvivesTargetRemoval(t *testing.T) {

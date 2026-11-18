@@ -57,7 +57,7 @@ func TestAudienceSingleOwnerPerRule(t *testing.T) {
 		{"boss channel", "g1", "1112223334445556", false, nil, "a1@boss"},
 		{"side channel", "g1", "999888777666555444", false, nil, "a2@side"},
 		{"dm by recipient", "", "777888999000111222", true,
-			[]string{"333444555666777888"}, "a2@dm:333"},
+			[]string{"333444555666777888"}, "a2@ami"},
 		// sealed is read:false: matched but nobody may read it, and it must NOT
 		// fall through to the stray branch (that would leak it to the default).
 		{"sealed channel", "g1", "333444555666777888", false, nil, ""},
@@ -72,15 +72,15 @@ func TestAudienceSingleOwnerPerRule(t *testing.T) {
 	}
 }
 
-// The single-value indexes (byChan/byUser) keep ONE rule per id, so a group DM
+// The single-value indexes (byChan/byDM) keep ONE rule per id, so a group DM
 // whose recipients are owned by two different agents would reach exactly one of
 // them through the index. Audience walks every rule instead.
 func TestAudienceReturnsEveryMatchingRule(t *testing.T) {
 	body := `{
 	  "agents": [{"id": "a1", "targets": ["ami"]}, {"id": "a2", "targets": ["bo"]}],
 	  "targets": [
-	    {"alias": "ami", "id": "user:333444555666777888", "name": "ami"},
-	    {"alias": "bo",  "id": "user:444555666777888999", "name": "bo"}
+	    {"alias": "ami", "id": "dm:333444555666777888", "name": "ami"},
+	    {"alias": "bo",  "id": "dm:444555666777888999", "name": "bo"}
 	  ]
 	}`
 	rt := newRouter(t, body)
@@ -123,29 +123,44 @@ func TestAudienceTargetOwnedByAgent(t *testing.T) {
 	}
 }
 
-func TestAudienceDenyAndDMDisabled(t *testing.T) {
+func TestAudienceDeny(t *testing.T) {
 	rt := newRouter(t, scopedRouting, "-deny-channels=1112223334445556")
 	if aud := rt.Audience("g1", "1112223334445556", false, nil); len(aud) != 0 {
 		t.Fatalf("denied channel must reach nobody, got %q", names(aud))
 	}
 
-	rt = newRouter(t, scopedRouting, "-allow-dm=false")
-	aud := rt.Audience("", "777888999000111222", true, []string{"333444555666777888"})
-	if len(aud) != 0 {
-		t.Fatalf("DMs disabled must reach nobody, got %q", names(aud))
+	// deny by ALIAS works too, which is why the deny check runs after matching.
+	rt = newRouter(t, scopedRouting, "-deny-channels=boss")
+	if aud := rt.Audience("g1", "1112223334445556", false, nil); len(aud) != 0 {
+		t.Fatalf("denied alias must reach nobody, got %q", names(aud))
+	}
+
+	// "dm:*" in deny is the replacement for --allow-dm=false.
+	rt = newRouter(t, scopedRouting, "-deny-channels=dm:*")
+	if aud := rt.Audience("", "777888999000111222", true, []string{"333444555666777888"}); len(aud) != 0 {
+		t.Fatalf("dm:* denied must reach nobody, got %q", names(aud))
+	}
+	if got := names(rt.Audience("g1", "1112223334445556", false, nil)); got != "a1@boss" {
+		t.Fatalf("dm:* must not close guild channels, got %q", got)
 	}
 }
 
 // An event no rule owns but policy admits goes to the default agent only, with
-// an empty alias (there is no rule to name it by).
+// an empty alias (there is no rule to name it by). M2c: "policy admits" now
+// requires unknown_channel=ring (or an allow-list entry) -- ignore is the
+// default, and an unlisted guild channel is dropped like an unlisted DM.
 func TestAudienceStrayGuildChannelGoesToDefault(t *testing.T) {
-	rt := newRouter(t, scopedRouting)
+	rt := newRouter(t, scopedRouting, "-unknown-channel=ring")
 	aud := rt.Audience("g1", "444555666777888999", false, nil)
 	if len(aud) != 1 {
 		t.Fatalf("want exactly the default agent, got %q", names(aud))
 	}
 	if aud[0].Agent != "default" || aud[0].Alias != "" || aud[0].Target != "channel:444555666777888999" {
 		t.Fatalf("stray audience = %+v", aud[0])
+	}
+
+	if aud := newRouter(t, scopedRouting).Audience("g1", "444555666777888999", false, nil); len(aud) != 0 {
+		t.Fatalf("ignore must drop an unlisted guild channel, got %q", names(aud))
 	}
 }
 
@@ -167,14 +182,14 @@ func TestAudienceStrayHonoursAllowLists(t *testing.T) {
 	}
 }
 
-func TestAudienceUnknownDM(t *testing.T) {
+func TestAudienceUnknownChannel(t *testing.T) {
 	// ignore (the default): nobody rings for a stranger.
 	rt := newRouter(t, scopedRouting)
 	if aud := rt.Audience("", "777888999000111222", true, []string{"999999999888888777"}); len(aud) != 0 {
 		t.Fatalf("unknown DM should be ignored, got %q", names(aud))
 	}
 
-	rt = newRouter(t, scopedRouting, "-unknown-dm=ring")
+	rt = newRouter(t, scopedRouting, "-unknown-channel=ring")
 	aud := rt.Audience("", "777888999000111222", true, []string{"999999999888888777"})
 	if len(aud) != 1 || aud[0].Agent != "default" {
 		t.Fatalf("ring should wake the default agent, got %q", names(aud))
@@ -182,9 +197,10 @@ func TestAudienceUnknownDM(t *testing.T) {
 }
 
 // Without routing.json every declared agent queue question collapses to the
-// process default, so a single-agent install keeps working unchanged.
+// process default, so a single-agent install keeps working unchanged -- with
+// ring mode, which is what "I want everything" means without routing.json.
 func TestAudienceWithoutRouting(t *testing.T) {
-	rt := openRouter(t)
+	rt := openRouter(t, "-unknown-channel=ring")
 	aud := rt.Audience("g1", "1112223334445556", false, nil)
 	if got := names(aud); got != "default@-" {
 		t.Fatalf("open mode audience = %q want default@-", got)
@@ -222,7 +238,7 @@ func TestAliasForTarget(t *testing.T) {
 	if got := rt.AliasForTarget(Principal{AgentID: "a2"}, "channel:1112223334445556"); got != "" {
 		t.Errorf("a2 must not learn a1's alias, got %q", got)
 	}
-	if got := rt.AliasForTarget(Principal{AgentID: "a1"}, "user:333444555666777888"); got != "" {
+	if got := rt.AliasForTarget(Principal{AgentID: "a1"}, "dm:333444555666777888"); got != "" {
 		t.Errorf("a2's dm must stay unnamed for a1, got %q", got)
 	}
 	if got := rt.AliasForTarget(Principal{AgentID: "a1"}, "", "channel:333444555666777888"); got != "" {

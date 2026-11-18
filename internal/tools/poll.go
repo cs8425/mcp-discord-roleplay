@@ -19,7 +19,7 @@
 // trailing attachments are counted out, again by note. What reaches the model is
 // only what it needs in order to answer (see msgWire): target, author, the
 // author's Discord id, text, timestamps, attachment urls. The author id is the
-// one id that earns its bytes: it is what a to:"user:<id>" reply is built from.
+// one id that earns its bytes: it is what a to:"dm:<id>" reply is built from.
 // Everything else went to the log.
 //
 // Media runs in a second phase, after the drain. Queue.Drain calls the verdict
@@ -81,7 +81,7 @@ func pollTool() *mcp.Tool {
 			"reason=cancelled/shutdown means this answer was not delivered. " +
 			"If remaining is present, that many messages are still queued — poll again right away. " +
 			"If dropped is present, messages were overwritten while nobody polled; poll more often. " +
-			"author_id is the speaker's Discord id: quote it as to:\"user:<id>\" to answer that person in DMs even when they have no alias. " +
+			"author_id is the speaker's Discord id: quote it as to:\"dm:<id>\" to answer that person in DMs even when they have no alias. " +
 			"Each attachment reports what it came as: media=base64 means the bytes are appended to this result as a content block (content_index names it), " +
 			"media=file means they were saved and local_path says where, media=url means metadata only and reason says why. " +
 			"This call blocks up to max_wait seconds, so your client's request timeout must be at least that long.",
@@ -474,6 +474,7 @@ func (d *Deps) applyMedia(ctx context.Context, msgs []pollMessage, kept []*bus.E
 
 type pollFilter struct {
 	targets     map[string]bool
+	kinds       map[string]bool // kinds opened by a wildcard rule ("dm:*", "channel:*")
 	channels    map[string]bool
 	from        map[string]bool
 	mentions    bool
@@ -484,6 +485,7 @@ type pollFilter struct {
 func (d *Deps) newFilter(p router.Principal, a *pollArgs) (*pollFilter, error) {
 	f := &pollFilter{
 		targets:    map[string]bool{},
+		kinds:      map[string]bool{},
 		channels:   map[string]bool{},
 		from:       map[string]bool{},
 		ignoreBots: true,
@@ -515,8 +517,13 @@ func (d *Deps) newFilter(p router.Principal, a *pollArgs) (*pollFilter, error) {
 			f.targets[strings.ToLower(s)] = true
 			continue
 		}
-		if !ru.Read {
-			return nil, fmt.Errorf("target %q is read=false: this agent may not poll it", ref)
+		if !d.Router.MayRead(p, ru) {
+			return nil, fmt.Errorf("target %q is read-only for this agent: it cannot be polled", ref)
+		}
+		if ru.Wildcard {
+			// "dm:*" names a class, not a channel: match by kind, because no event
+			// is ever addressed to a channel called "*".
+			f.kinds[ru.Kind] = true
 		}
 		f.targets[strings.ToLower(ru.Target)] = true
 		f.targets[strings.ToLower(ru.Alias)] = true
@@ -548,13 +555,22 @@ func eventTargets(e *bus.Event) []string {
 	}
 	if e.DM {
 		if peer := e.Extra["peer"]; peer != "" {
-			out = append(out, "user:"+strings.ToLower(peer))
+			out = append(out, "dm:"+strings.ToLower(peer))
 		}
 	}
 	if e.ChannelName != "" {
 		out = append(out, strings.ToLower(e.ChannelName))
 	}
 	return out
+}
+
+// eventKind names the target kind an event belongs to, which is what a wildcard
+// filter ("dm:*") matches on.
+func eventKind(e *bus.Event) string {
+	if e.DM {
+		return router.KindDM
+	}
+	return router.KindChannel
 }
 
 func (f *pollFilter) keep(e *bus.Event) bool {
@@ -567,13 +583,16 @@ func (f *pollFilter) keep(e *bus.Event) bool {
 	if f.mentions && !e.MentionsSelf {
 		return false
 	}
-	if len(f.targets) > 0 {
+	if len(f.targets) > 0 || len(f.kinds) > 0 {
 		hit := false
 		for _, t := range eventTargets(e) {
 			if f.targets[t] {
 				hit = true
 				break
 			}
+		}
+		if !hit && f.kinds[eventKind(e)] {
+			hit = true
 		}
 		if !hit {
 			return false
@@ -693,6 +712,25 @@ func (st *drainState) noteLimit() {
 	st.notes = append(st.notes, msg)
 }
 
+// targetLabel names the conversation this principal may answer with. An alias
+// wins because a model should not have to remember snowflakes; when no rule
+// claims the event -- or only a WILDCARD rule does, whose alias is a policy and
+// not an address -- it falls back to a concrete target id that discord_send
+// accepts unchanged: dm:<peer> for a DM, otherwise the event's own label.
+func (d *Deps) targetLabel(p router.Principal, e *bus.Event) string {
+	if d.Router != nil {
+		if alias := d.Router.AliasForTarget(p, eventTargets(e)...); alias != "" {
+			return alias
+		}
+	}
+	if e.DM {
+		if peer := e.Extra["peer"]; peer != "" {
+			return "dm:" + strings.ToLower(peer)
+		}
+	}
+	return e.Target
+}
+
 // --- rendering -------------------------------------------------------------
 
 // buildMessage turns a queued event into its wire form for this call.
@@ -702,12 +740,7 @@ func (st *drainState) noteLimit() {
 // snowflakes. bus.Event itself is never touched: the same pointer sits in other
 // agents' queues, and their alias may be different (or none).
 func (d *Deps) buildMessage(p router.Principal, e *bus.Event) pollMessage {
-	target := e.Target
-	if d.Router != nil {
-		if alias := d.Router.AliasForTarget(p, eventTargets(e)...); alias != "" {
-			target = alias
-		}
-	}
+	target := d.targetLabel(p, e)
 	m := pollMessage{
 		ID:               e.MessageID,
 		Target:           target,
@@ -889,7 +922,7 @@ func (m pollMessage) wire() msgWire {
 	}
 	if out.AuthorID == "?" {
 		// buildEvent's placeholder for an author Discord never named. It is not a
-		// usable id, and echoing it back as to:"user:?" would be a trap.
+		// usable id, and echoing it back as to:"dm:?" would be a trap.
 		out.AuthorID = ""
 	}
 	if len(m.Attachments) > 0 {

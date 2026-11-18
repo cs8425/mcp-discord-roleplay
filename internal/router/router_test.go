@@ -35,11 +35,11 @@ func newRouter(t *testing.T, body string, extraArgs ...string) *Router {
 const scopedRouting = `{
   "agents": [
     {"id": "a1", "targets": ["boss"]},
-    {"id": "a2", "targets": ["side", "dm:333"]}
+    {"id": "a2", "targets": ["side", "ami"]}
   ],
   "targets": [
     {"alias": "boss", "id": "channel:1112223334445556", "name": "#rp-main"},
-    {"alias": "dm:333", "id": "user:333444555666777888", "name": "ami"},
+    {"alias": "ami", "id": "dm:333444555666777888", "name": "ami"},
     {"alias": "side", "id": "channel:999888777666555444"},
     {"alias": "spectate", "id": "channel:222333444555666777", "write": false},
     {"alias": "sealed", "id": "channel:333444555666777888", "read": false, "write": false}
@@ -60,8 +60,8 @@ func TestResolveForms(t *testing.T) {
 		{"1112223334445556", "boss", "channel:1112223334445556"},
 		{"#rp-main", "boss", "channel:1112223334445556"},
 		{"rp-main", "boss", "channel:1112223334445556"},
-		{"dm:333", "dm:333", "user:333444555666777888"},
-		{"user:333444555666777888", "dm:333", "user:333444555666777888"},
+		{"ami", "ami", "dm:333444555666777888"},
+		{"dm:333444555666777888", "ami", "dm:333444555666777888"},
 	}
 	for _, c := range cases {
 		ru, ok := rt.Resolve(c.ref)
@@ -108,8 +108,8 @@ func TestAgentScopingAndWriteACL(t *testing.T) {
 	if _, reason := rt.SendTarget(Principal{AgentID: "nobody"}, "spectate"); reason != "foreign_agent" {
 		t.Errorf("unlisted agent must be scoped out, got %q", reason)
 	}
-	if _, reason := rt.SendTarget(a2, "dm:333"); reason != "" {
-		t.Errorf("a2 may write dm:333, got %q", reason)
+	if _, reason := rt.SendTarget(a2, "ami"); reason != "" {
+		t.Errorf("a2 may write ami, got %q", reason)
 	}
 }
 
@@ -158,24 +158,28 @@ func TestAdmitInbound(t *testing.T) {
 		t.Errorf("sealed should be read_denied, got %q", reason)
 	}
 	// DM matching a rule by recipient
-	if ru, reason := rt.AdmitInbound("", "777888999000111222", true, []string{"333444555666777888"}); reason != AdmitOK || ru == nil || ru.Alias != "dm:333" {
-		t.Errorf("DM by recipient should match dm:333, got %v/%q", ru, reason)
+	if ru, reason := rt.AdmitInbound("", "777888999000111222", true, []string{"333444555666777888"}); reason != AdmitOK || ru == nil || ru.Alias != "ami" {
+		t.Errorf("DM by recipient should match ami, got %v/%q", ru, reason)
 	}
 	// unknown DM with the default ignore policy
 	if _, reason := rt.AdmitInbound("", "777888999000111222", true, []string{"999999999888888777"}); reason != AdmitNoRuleIgnor {
 		t.Errorf("unknown DM should be ignored, got %q", reason)
 	}
-	// unlisted guild channel with no allow-list → admitted (open mode)
-	if _, reason := rt.AdmitInbound("g1", "444555666777888999", false, nil); reason != AdmitOK {
-		t.Errorf("routing never restricts guild channels, got %q", reason)
+	// unlisted guild channel: M2c made it behave exactly like a DM, so the
+	// unknown_channel policy (default ignore) answers, not open mode.
+	if _, reason := rt.AdmitInbound("g1", "444555666777888999", false, nil); reason != AdmitNoRuleIgnor {
+		t.Errorf("unlisted guild channel should be ignored, got %q", reason)
 	}
 }
 
-func TestAdmitInboundUnknownDMRing(t *testing.T) {
-	rt := newRouter(t, scopedRouting, "-unknown-dm=ring")
+func TestAdmitInboundUnknownChannelRing(t *testing.T) {
+	rt := newRouter(t, scopedRouting, "-unknown-channel=ring")
 	ru, reason := rt.AdmitInbound("", "777888999000111222", true, []string{"999999999888888777"})
 	if reason != AdmitOK || ru != nil {
 		t.Fatalf("ring mode should admit with no rule, got %v/%q", ru, reason)
+	}
+	if _, reason := rt.AdmitInbound("g1", "444555666777888999", false, nil); reason != AdmitOK {
+		t.Fatalf("ring mode admits an unlisted guild channel too, got %q", reason)
 	}
 }
 
@@ -214,10 +218,18 @@ func TestAdmitInboundDenyAndAllowLists(t *testing.T) {
 	}
 }
 
-func TestAllowDMFalseBlocksDMs(t *testing.T) {
-	rt := newRouter(t, scopedRouting, "-allow-dm=false")
-	if _, reason := rt.AdmitInbound("", "777888999000111222", true, []string{"333444555666777888"}); reason != AdmitDMDisabled {
-		t.Fatalf("want dm_disabled, got %q", reason)
+// TestDenyDMWildcard is the replacement for --allow-dm=false: one wildcard in
+// the deny list closes DMs, and only them.
+func TestDenyDMWildcard(t *testing.T) {
+	rt := newRouter(t, scopedRouting, "-deny-channels=dm:*")
+	if _, reason := rt.AdmitInbound("", "777888999000111222", true, []string{"333444555666777888"}); reason != AdmitDenied {
+		t.Fatalf("dm:* in deny must close the DM even when a rule owns it, got %q", reason)
+	}
+	if _, reason := rt.AdmitInbound("g1", "1112223334445556", false, nil); reason != AdmitOK {
+		t.Fatalf("a guild channel is not a DM, got %q", reason)
+	}
+	if _, reason := rt.SendTarget(Principal{AgentID: "a2"}, "ami"); reason != "denied_channel" {
+		t.Fatalf("deny blocks sending too, got %q", reason)
 	}
 }
 

@@ -39,13 +39,18 @@ func TestNormalizeTargetID(t *testing.T) {
 		kind, id string
 		ok       bool
 	}{
-		{"channel:1112223334445556", "channel", "1112223334445556", true},
-		{"user:333444555666777888", "user", "333444555666777888", true},
-		{"dm:333444555666777888", "user", "333444555666777888", true},
-		{"1112223334445556", "channel", "1112223334445556", true},
+		{"channel:1112223334445556", TargetChannel, "1112223334445556", true},
+		{"dm:333444555666777888", TargetDM, "333444555666777888", true},
+		{"DM:333444555666777888", TargetDM, "333444555666777888", true},
+		{"dm:*", TargetDM, WildcardID, true},
+		{"channel:*", TargetChannel, WildcardID, true},
+		{"1112223334445556", TargetChannel, "1112223334445556", true},
 		{"boss", "", "", false},
 		{"channel:abc", "", "", false},
-		{"user:12", "", "", false},
+		{"dm:12", "", "", false},
+		// M2c collapsed the entity model: "user:" is no longer a spelling of a
+		// target, and accepting it silently would keep two vocabularies alive.
+		{"user:333444555666777888", "", "", false},
 		{"", "", "", false},
 	}
 	for _, c := range cases {
@@ -135,7 +140,7 @@ func TestLoadValidations(t *testing.T) {
 		{"-selftest", "-no-file-root", "-poll-default-wait=9999"},
 		{"-selftest", "-no-file-root", "-poll-max-wait=1"},
 		{"-selftest", "-no-file-root", "-media-image=bogus"},
-		{"-selftest", "-no-file-root", "-unknown-dm=queue"},
+		{"-selftest", "-no-file-root", "-unknown-channel=queue"},
 		{"-selftest", "-no-file-root", "-transport=http"},
 		{"-selftest", "-no-file-root", "-bus-capacity=2"},
 		{"-selftest", "-file-root=/nonexistent/dir/here"},

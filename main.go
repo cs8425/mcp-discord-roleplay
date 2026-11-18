@@ -34,7 +34,7 @@ import (
 )
 
 // version is stamped per milestone; keep it in sync with tools.BuildMilestone.
-const version = "0.1.0-M2"
+const version = "0.1.0-M2c"
 
 func main() {
 	os.Exit(run(os.Args[1:]))
@@ -60,6 +60,11 @@ func run(args []string) int {
 		return 2
 	}
 	slog.SetDefault(logger)
+	// Config never fails on a soft finding (an entry in both allow and deny), but
+	// it must not stay invisible either.
+	for _, w := range cfg.Warnings {
+		logger.Warn("config warning", "detail", w)
+	}
 
 	rt, err := router.New(cfg)
 	if err != nil {
@@ -262,7 +267,13 @@ func selftest(cfg *config.Config, rt *router.Router, logger *slog.Logger) int {
 		// No early return: the rest of the report is still worth reading.
 		fail("agent %q is not declared in routing.json: it would see zero targets and every send would be refused as foreign_agent", cfg.AgentID)
 	}
-	report(true, "unknown DM policy=%s allow_dm=%v", cfg.UnknownDM, cfg.AllowDM)
+	report(true, "unrouted channels: unknown_channel=%s (ignore drops them, ring admits them to the default agent)",
+		cfg.UnknownChannel)
+	report(true, "gates: allow_channels=%v deny_channels=%v (an entry is an alias or a target id; dm:* and channel:* are the wildcards, deny wins)",
+		cfg.AllowChannels, cfg.DenyChannels)
+	for _, w := range cfg.Warnings {
+		report(false, "config warning: %s", w)
+	}
 
 	// Built here rather than at the bottom so the queue list can be reported next
 	// to the poll settings an operator is tuning. nil logger: the report itself
@@ -395,13 +406,14 @@ func toolNames(reg *mcp.Registry) []string {
 func instructions(cfg *config.Config, names []string) string {
 	return "Discord bridge for roleplay. Available tools: " + strings.Join(names, ", ") + ". " +
 		"Call discord_status first to learn which target aliases you may use. " +
-		"Targets are given as an alias, channel:<id>, user:<id>, #name, me or last. " +
+		"Targets are given as an alias, channel:<id>, dm:<id> (a DM is addressed by the PEER's user id), #name, me or last. " +
 		"You never send binary data: reference local files by a path under the server's --file-root (a leading '/' means that root), " +
 		"and put links in files[].url - they are pasted, not fetched. " +
 		"Text over 2000 characters is split for you. " +
 		"discord_poll holds the call open until something arrives or max_wait passes; an empty answer is ok:true, not a failure. " +
 		"Messages you have taken are gone from your queue - there is nothing to acknowledge and nothing to remember. " +
-		"If an answer says partial:true, call discord_poll again immediately: more messages are already waiting. " +
+		"If an answer says remaining:N, that many messages are still queued - call discord_poll again right away. " +
+		"If dropped is present, messages were overwritten while nobody polled; poll more often. " +
 		"Set your client's request timeout to at least max_wait, or the call is cancelled while waiting and the answer is lost. " +
 		"This process serves agent '" + cfg.AgentID + "'."
 }

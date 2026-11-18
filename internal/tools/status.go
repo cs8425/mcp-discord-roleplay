@@ -151,8 +151,7 @@ func (d *Deps) handleStatus(ctx context.Context, call *mcp.Call) (*mcp.ToolResul
 			"max_files_per_msg":      d.Cfg.MaxFilesPerMsg,
 			"max_sends_per_min":      d.Cfg.MaxSendsPerMin,
 			"send_gap_ms":            d.Cfg.SendGapMS,
-			"allow_dm":               d.Cfg.AllowDM,
-			"unknown_dm":             d.Cfg.UnknownDM,
+			"unknown_channel":        d.Cfg.UnknownChannel,
 		},
 		"routing": d.Router.Summary(p),
 
@@ -256,7 +255,7 @@ func (d *Deps) mediaSummary() map[string]any {
 
 // BuildMilestone is stamped into discord_status so a log or screenshot always
 // says which build produced it. Bump it per milestone.
-const BuildMilestone = "M2"
+const BuildMilestone = "M2c"
 
 func findQueueStat(qs []bus.QueueStat, agent string) (bus.QueueStat, bool) {
 	for _, q := range qs {

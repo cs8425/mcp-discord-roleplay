@@ -2,7 +2,7 @@
 
 - 2026-11-16　v0→v1→v2→**v3**。v3：C1/C3/C4 拍定；**C2 我原先的說法是錯的，已改正**（4 MiB 是「入口」限制，出口 streaming 無上限）
 - 狀態：**設計定案（v3.1）＋ M2b 已實作、輸出已極簡化，`go vet` / `go test` 全綠並已接入 live**。本檔是實作的依據。
-- 實作進度：**M0 ✅**（config / router / bus / discord gateway client / `discord_status` / `--selftest`）、**M1 ✅**（`internal/files` 沙箱 + `discord_send` + 預算/間隔/斷路器 + 單測）、**M2a ✅**（per-agent Queue/Hub + `router.Audience` + `discord_poll`）、**M2b ✅**（media 三段式 inline/save/skip）、**輸出極簡化 ✅**（2026-11-18：LLM 只拿必要欄位，其餘進 debug log；見 §3 的 wire 結構與判定三閘）。第一輪 live smoke 已跑（紅項只有入站圖片的 ctx timeout，已修），M3 = history/channels，M4 = README。
+- 實作進度：**M0 ✅**（config / router / bus / discord gateway client / `discord_status` / `--selftest`）、**M1 ✅**（`internal/files` 沙箱 + `discord_send` + 預算/間隔/斷路器 + 單測）、**M2a ✅**（per-agent Queue/Hub + `router.Audience` + `discord_poll`）、**M2b ✅**（media 三段式 inline/save/skip）、**M2c 🚧**（target 語法收斂：`dm:` 單一字首、`dm:*`/`channel:*` wildcard、per-agent `read`/`write` 預設可收可放、閘門剩 `--allow-channels`/`--deny-channels`/`--unknown-channel`，`--allow-dm`/`--unknown-dm` 刪除；程式碼與測試已落地，待 `go build/test` 驗證）、**輸出極簡化 ✅**（2026-11-18：LLM 只拿必要欄位，其餘進 debug log；見 §3 的 wire 結構與判定三閘）。第一輪 live smoke 已跑（紅項只有入站圖片的 ctx timeout，已修），M3 = history/channels，M4 = README。
 - ⚠ **`-race` 仍未跑過**（`go build` / `go vet` / `go test` 已由 user 驗證全綠）。驗證紀錄 → `_state/build-notes.md`。
 - 建置驗證由 user 執行（sandbox 內無 shell / 無 go）：見 `_state/build-notes.md`。
 - 環境：**Go 1.27.4**（已確認）、單一 bot token、client = 自研 agent、測試由 user 直接把 token/指令接進 session
@@ -19,7 +19,8 @@
 | 多 agent | 終局走 **HTTP + per-agent token**（`/mcp/<agent>` + Bearer）；unix socket 視情況（1:1 免 token）。同 token 只能一條 gateway ⇒ 單 process 多 agent。MVP 走 stdio 單 agent，但 `Principal{AgentID}` 從 M0 就在 ctx 裡 |
 | 介面契約 | **LLM 只送文字**（path / url / ID / 內文）；**二進位全部 server 端處理**：出口由 server 從 `--file-root` 開檔上傳、入口由 server inline 或落地回 path。無 `base64` 入參 |
 | 附件 | **config 驅動三段式**：`inline` / `save`(落 fs 回 path) / `skip`(不下載只列 URL+meta)。**定案預設：image=inline、audio=skip、video=skip、other=skip** |
-| 未匹配路由的 DM | **定案：ignore**（完全不進 ring，也不建 target）；保留 `--unknown-dm` 以便日後改 policy |
+| 未匹配路由的頻道（**guild 與 DM 同一套**，M2c） | **定案：ignore**（完全不進 ring，也不建 target）；`--unknown-channel=ring` 才收，且只進預設 agent、以 raw channel id 登記 |
+| Target 語法（M2c） | **只剩 `channel:<ID>` 與 `dm:<ID>`**；`dm:` 的 ID 是**對方 user id**（不是 DM 頻道 id）。Wildcard：`dm:*`＝所有 DM、`channel:*`＝所有 guild 頻道（**不含** DM ⇒ 兩條不重疊）。`user:` 前綴與 `--allow-dm`／`--unknown-dm` 整個刪除（不留 deprecation）：DM 就是一條頻道，柵欄也共用同一套 |
 | 環境檔 | 支援 **`.env`**（自己寫 10 行 loader，不引外部依賴；`--env-file` 預設 cwd 的 `.env`，存在才載） |
 | persona | 不做 |
 | 本機檔讀取 | `os.OpenRoot` / `*os.Root` 當沙箱根；只用 `/` 當分隔符，開頭 `/` 等於根（`/x.png` == `x.png`）；剩餘照 `filepath.IsLocal`（`..`/`~`/volume name 拒），多 `--file-root` 依宣告順序第一個命中（不做 mount 語法） |
@@ -61,7 +62,7 @@ mcp-discord-roleplay/
 ├── main.go                 # 裝配；--transport stdio|http；--selftest；graceful shutdown
 ├── internal/
 │   ├── config/             # Config + 驗證 + redact + routing.json
-│   ├── router/             # Rule/Alias/Principal/ACL/unknown-dm 政策
+│   ├── router/             # Rule/Alias/Principal/ACL/unknown-channel 政策
 │   ├── bus/                # Event + 每 agent 一條 Queue（ring）+ Hub 派發/統計
 │   ├── discord/            # client.go events.go send.go target.go media.go
 │   ├── media/              # 三段式附件處理：inline / save / skip；dedupe；os.Root 寫入（**不縮放**，超大就 skip）
@@ -102,7 +103,7 @@ type Event struct {
 ```json
 {"type":"object","properties":{
  "max_wait":{"type":"number","description":"等待秒數，合法範圍 5..600，預設 45。期間一有新訊息就立刻回傳；超過時間則回傳空結果(reason=timeout)。實際值會加 +0..15% 隨機抖動（只往後，不會縮到 client timeout 以下）"},
- "targets":{"type":"array","items":{"type":"string"},"description":"只收這些路由 alias 或 channel:<ID> / user:<ID>；省略=本 agent 全部可讀 target。命中 filter 但沒送出去的訊息會留在 queue 裡下次再取"},
+ "targets":{"type":"array","items":{"type":"string"},"description":"只收這些路由 alias 或 channel:<ID> / dm:<ID>；省略=本 agent 全部可讀 target。命中 filter 但沒送出去的訊息會留在 queue 裡下次再取"},
  "channels":{"type":"array","items":{"type":"string"},"description":"進階：直接指定頻道/DM/使用者 ID（仍需過 ACL）"},
  "limit":{"type":"integer","description":"單次回傳事件上限，預設 20，hard cap 100（其餘留 queue 下次讀）"},
  "mentions_only":{"type":"boolean","description":"true=只回 @我 或直接 DM"},
@@ -152,8 +153,8 @@ envelope（`omitempty` 的欄位只在有意義時出現；下面把常見的都
 - **byte 預算**（`--poll-max-bytes`，預設 16 KiB，0=不設限）：只算 messages 陣列的 JSON；每則成本 = 實際位元組 +（圖 1000 / 其他附件 300 / embed 200 的估價）。裝不下的整則留 queue。單條就超預算 → 先按 **rune 邊界**裁 `text`（標 `text_truncated:true`，原本的位元組數寫進 `notes`），再丟附件（少了幾個也寫進 `notes`），最後丟 embeds；估價**跟著留下的附件走**（丟掉的不再佔位，否則多圖訊息會一個都列不出來）；裁完還是超 → 不送空殼，整則留著
 - `remaining`（**只在 >0 時出現**）＝ 佇列裡還有幾則 ⇒ **請立刻再 poll**；被 filter 掉而留下的不計在內，免得模型無限 poll。（舊版另有一個 `partial:true` 布林，語意跟這個數字重複，已刪；它進 log）
 - `dropped` 只在 >0 時出現：那是「沒人 poll 把 queue 擠爆、被覆蓋掉的舊訊息」，要直接告訴模型
-- `target` 標的是**這個 agent 認得的 alias**（`router.AliasForTarget` 在組裝時現算）；沒有 rule 收養它就留內部座標 `channel:<id>`。同一個 Event 在兩條 queue 裡可以標不同名字，所以這個欄位只能長在 `pollMessage` 上
-- 作者壓成一條字串 `author:"阿明"`，名字取的是 **Discord 自己會顯示的那個**：`Message.Member.Nick`（群內暱稱）優先，沒有才退回 `User.DisplayName()`（`global_name` → `username`）——只讀 `DisplayName()` 的話，操作者改了群內暱稱而 agent 永遠叫錯人。`bus.Author` 的 `tag`（舊式 discriminator）對回話沒有增量 ⇒ 進 log；空名字才退回 `tag`，不給匿名台詞。唯一的 ID 例外是 `author_id`（見下方判定三閘）：它過第②閘，因為 `discord_send` 的 `to` 吃 `user:<ID>` ⇒ 沒有它，agent 無法回 DM 給「剛講話那個人」，只能用 routing 檔裡的 alias；`buildEvent` 的佔位 `"?` 不上線（回 `to:"user:?"` 是個陷阱）。
+- `target` 標的是**這個 agent 認得的 alias**（`router.AliasForTarget` 在組裝時現算）；沒有 rule 收養它就留座標——DM 標 `dm:<peer>`（能直接回話的形式），其餘 `channel:<id>`。wildcard rule 的 alias（`dm:*` 的 `dms`）**不是地址**，所以也不拿去當前綴。同一個 Event 在兩條 queue 裡可以標不同名字，所以這個欄位只能長在 `pollMessage` 上
+- 作者壓成一條字串 `author:"阿明"`，名字取的是 **Discord 自己會顯示的那個**：`Message.Member.Nick`（群內暱稱）優先，沒有才退回 `User.DisplayName()`（`global_name` → `username`）——只讀 `DisplayName()` 的話，操作者改了群內暱稱而 agent 永遠叫錯人。`bus.Author` 的 `tag`（舊式 discriminator）對回話沒有增量 ⇒ 進 log；空名字才退回 `tag`，不給匿名台詞。唯一的 ID 例外是 `author_id`（見下方判定三閘）：它過第②閘，因為 `discord_send` 的 `to` 吃 `dm:<ID>` ⇒ 沒有它，agent 無法回 DM 給「剛講話那個人」，只能用 routing 檔裡的 alias；`buildEvent` 的佔位 `"?` 不上線（回 `to:"dm:?"` 是個陷阱）。
 - 「這條訊息本來有幾個附件、被預算擠掉幾個」不再是欄位：留下的都在 `attachments` 清單裡，少幾個由 `notes` 講。別跟 `dropped` 混：那是**整則訊息**被 queue 擠爆覆蓋掉
 - **附件在輸出裡只有三種形態**（`policy` 不上線，只告訴模型你**拿到**了什麼）：`media:"base64"` + `content_index`（≥1：`content[0]` 是這段 JSON，圖 block 接在後面）／`media:"file"` + `local_path`（可直接餵 `discord_send` 的 `files[].path`）／`media:"url"` + `reason`（見 §5 詞表）。附件在線上只有 `name`（原 `filename`）、`kind`、`url`、`media`，加條件欄位 `duration_secs`（僅音訊／視訊，那是唯一的內容描述）／`reason`／`local_path`／`content_index`；`id`、`mime`、`size`、像素邊長、實際交付位元組數全進 log
 - **上線欄位的判定三閘**（往後新增欄位一律先過這三閘）：①要用它回話 ②要據它決定下一步 ③是敘事的必要輸入。ID、時間戳、位元組數、像素尺寸、alias 背後的真實頻道名都是「誰在何時算了什麼」⇒ 那是 log 與 `discord_status` 的活（`discord_status` 就是這個面板本體，約 90 個 key，所以它是「偶爾呼叫」而不是每輪呼叫）。目前唯一的 ID 例外就是 `author_id`
@@ -165,7 +166,7 @@ envelope（`omitempty` 的欄位只在有意義時出現；下面把常見的都
 ```json
 {"type":"object","required":["to"],
  "properties":{
-  "to":{"type":"string","description":"目標：alias（路由表）/ channel:<ID> / user:<ID> / #名稱 / @名稱 / me(傳给自己的 DM) / last(本 agent 最近說話的 target)"},
+  "to":{"type":"string","description":"目標：alias（路由表）/ channel:<ID> / dm:<ID> / #名稱 / @名稱 / me(傳给自己的 DM) / last(本 agent 最近說話的 target)"},
   "text":{"type":"string","description":"內文；超過 2000 字元自動切多則依序送出"},
   "files":{"type":"array","items":{"type":"object","properties":{
     "name":{"type":"string","description":"Discord 顯示的檔名；省略取 path 的 basename"},
@@ -224,10 +225,10 @@ user 裁示：「直接回 429 rate limit 跟時間讓 LLM 知道，然後 mcp s
 失敗（`isError:true`）：`{"ok":false,"error":"<code>","hint":"<下一步>","retry_after_ms":...,"http_status":...,"discord_code":"...","breaker_open":true,"target":"boss","kind":"channel","channel_id":"...","parts_sent":1,"message_ids":[...],"part_failed":2,"delivered_before_failure":1}`
 - 部分送達時 `hint` 內會寫「N of M part(s) landed … continue from part N+1」，**不要整則重傳**。
 - **成功時話少是對的**：訊息已經在 Discord 上了，今天的工具沒有任何一個會 consume `message_ids`／`last_message_id`（將來 react/edit/delete 落地時它要回來，那時候它是「據以決定下一步」的欄位）。被搬進 log 的：`target`（LLM 自己填的）、`kind`、`channel_id`（alias 背後的真實 id）、`delivered`、`created_at`、`message_ids`。
-- 代碼：`not_connected / circuit_open / budget_exhausted / rate_limited / cancelled / unauthorized / forbidden / unknown_channel / cannot_send_to_channel / bad_request / server_error / network_error / api_error / attachment_failed / dm_channel_failed`，加上路由層的 `empty_target / unknown_target / not_allowlisted / foreign_agent / write_denied / no_last_target` 與檔案層的 9 個碼。
+- 代碼：`not_connected / circuit_open / budget_exhausted / rate_limited / cancelled / unauthorized / forbidden / unknown_channel / cannot_send_to_channel / bad_request / server_error / network_error / api_error / attachment_failed / dm_channel_failed`，加上路由層的 `empty_target / unknown_target / not_allowlisted / denied_channel / foreign_agent / write_denied / wildcard_target / no_last_target` 與檔案層的 9 個碼。
 - `AllowedMentions{Parse: []}` 硬編碼（**空 slice 而非 nil**：`Parse` 不帶 `omitempty`，nil 會被整欄不送＝Discord 預設全解析 → @everyone 可被 ping）。無 flag 可關。
 - 不回 `link`：訊息連結需要 guild id，我們不保證有；要對帳的話 `message_ids` 在 debug log 裡。
-- DM target：`user:<id>` 走 `UserChannelCreate`（快取於 `Client.dm`，DM 頻道 id 穩定故不須失效）；`me` 用 `SelfID()`，尚未 READY → `not_connected`。
+- DM target：`dm:<id>`（id 是**對方 user id**）走 `UserChannelCreate`（快取於 `Client.dm`，DM 頻道 id 穩定故不須失效）；`me` 用 `SelfID()`，尚未 READY → `not_connected`。
 - `--dry-run`：不佔額度、不碰 REST、不建 DM；仍走完路由/沙箱/切段並在結果標 `dry_run:true`。
 
 
@@ -300,8 +301,8 @@ user 裁示：「直接回 429 rate limit 跟時間讓 LLM 知道，然後 mcp s
 | inline 尺寸政策 | 見 §6（`--inline-max-bytes-image 4MiB` 等）|
 | `--max-arg-base64-bytes` | **不需要**（LLM 不送 base64；見 §6 入口/出口分工）|
 | `--env-file` | `.env`（存在才載；自己寫 loader，不引依賴）|
-| `--allow-guilds / --allow-channels / --deny-channels / --allow-dm` | 空=不限制 / true（沒 routing.json 時的簡化 allowlist，建議一律填） |
-| `--unknown-dm` | `ignore`（定案；不進入任何 queue；`ring` 給預設 agent）|
+| `--allow-guilds / --allow-channels / --deny-channels` | 空=不限制（沒 routing.json 時的簡化 allowlist，建議一律填）。名單元素**吃 alias 或 target id，先查 alias**；`channel:*` / `dm:*`＝這個 kind 全部 |
+| `--unknown-channel` | `ignore`（定案；沒有 rule 收養、又不在 allowlist 的頻道——guild 與 DM 同一套——完全不進 ring；`ring` 給預設 agent）|
 | `--max-sends-per-min / --send-gap-ms / --breaker-errors` | 20 / 250 / 3（斷路 60s） |
 | `--file-root`（可重複）/ `--no-file-root` | cwd / off |
 | `--max-upload-bytes / --max-files-per-msg` | 8 MiB / 10 |
@@ -313,13 +314,23 @@ user 裁示：「直接回 429 rate limit 跟時間讓 LLM 知道，然後 mcp s
 
 routing.json（未來多 agent 直接長在這裡）：
 ```json
-{"agents":[{"id":"a1","targets":["boss","dm:333"]}],
+{"agents":[{"id":"a1","targets":["boss",{"alias":"dms","write":true}]}],
  "targets":[
    {"alias":"boss","id":"channel:111222333","agent":"a1","read":true,"write":true,"name":"#rp-main"},
-   {"alias":"dm:333","id":"user:333","agent":"a1"}
+   {"alias":"dms","id":"dm:*","read":true,"write":false}
  ],
- "unknown_dm":"ignore"}
+ "allow_channels":["boss","dm:888"],
+ "deny_channels":["channel:999"],
+ "unknown_channel":"ignore"}
 ```
+
+分工（M2c 定案，三層不要混）：
+- `agents[].targets`＝**誰收到**（per-agent fan-out）。元素是**字串 alias**（沿用 target 自己的預設）或**物件** `{alias,read,write}`＝這個 agent 的**覆寫**，**可收緊也可放寬**。
+- target 上的 `read`/`write`＝**預設值**（不是上限）。理由：典型用法是「多數 agent 唯讀、只留一隻能寫」⇒ 預設方向必須 fail-closed。
+- `allow_channels`/`deny_channels`＝**這條規則存不存在**（全域）；`deny` 是絕對上限（連讀都擋），`--deny-channels=dm:*` 就是過去 `--allow-dm=false` 的意思。
+- **allow ∩ deny 同時命中** ⇒ 啟動 warning（`--selftest` 與 log 都看得到）＋ **deny 贏**。
+- fan-out 去重：一個 event 同時被 exact rule 與 wildcard 命中時，**每個 agent 各自挑它持有最具體的那條** ⇒ 不會收到兩份，也不會因為別隻 agent 聲明了 exact 而漏接。
+- wildcard 的 alias（例 `dms`）是**政策不是地址**：`discord_send` 拿它當 `to` 會回 `wildcard_target`；poll 也不會拿它當 `target` 標籤，改標 `dm:<peer>`。
 
 安全：token 不落地 argv；發送 ACL；`os.Root` 沙箱（讀與 save 寫）；URL 下載解析後驗 IP（擋 private/link-local/localhost）；限流+斷路器；intents 最小化；README 寫「沒開 Message Content intent → content 為空字串」這個最常見的坑。
 
@@ -347,7 +358,7 @@ MVP 零修改（除非選 §6 的 (B)，改兩行常數 + 一個 config）。P2 
 | M4 | README（Portal/intents/routing/接入）、拔網線 30s 重連不漏不炸、多 agent 檔預演 | e2e |
 
 ## 12. 測試計畫（不需要 token 的部分都寫成單測）
-bus（ring 覆蓋 dropped/Notify 不漏/Drain-RequeueFront 原序/nil-Hub 防呆/唯讀契約）、audience（規則優先序、一 event 多 agent、stray、deny、DM 政策）、router（規則優先序、ACL 拒發、unknown-dm）、target（`user:`/`channel:`/alias/`#名`/`@名`/`me`/`last`；模糊名回候選不瞎猜）、files（路徑政策：先 `path.Clean` 再把開頭 `/` 當根（`./a/../b` == `b`）、`..` 倖存者/`~`/volume name 拒；symlink 逃出 root 被 `os.Root` 擋、根內可用；多 root 優先序；目錄/超大/數量上限；mime 四層優先序與 sniff 後 offset 歸零；`ValidateURL`）、send（seam 注入假 poster + 假時鐘：AllowedMentions.Parse 為空 slice、gap/預算/斷路器狀態機、小 `retry_after` 本地重試且**重試前有 Rewind**、 breaker open 時完全不碰 REST、half-open 只放 1、DryRun 不碰 REST 不佔額度、classify 全碼）、tools（`-dry-run` 端到端 envelope、各 `to` 拒因與 `targets` 候選、切段邊界 1999/2000/2001/CJK/附件僅末段、`text_too_long`、`last` per-agent 隔離、部分送達）、poll（假事件序列 → envelope 斷言、byte 預算截斷、裁切不切壞 UTF-8、queue 隔離、cancel 後訊息仍在、timeout 空答只有 2 個 key、**wire key 集合契約**（envelope/message/attachment/embed 四層各自釘死，新增欄位要先過 §3 三閘））、media（三段政策：inline 真的進 content block、save 一檔不重複下載、skip 零 request、超限不降級、**headers/body 分段交付也要讀得完**（E-8 回歸）、cleanup 年齡＋LRU）、`--selftest`（真連煙霧測試）
+bus（ring 覆蓋 dropped/Notify 不漏/Drain-RequeueFront 原序/nil-Hub 防呆/唯讀契約）、audience（規則優先序、一 event 多 agent、stray、deny、unknown-channel）、router（規則優先序、ACL 拒發、unknown-channel、wildcard 退回、per-agent grant 覆寫）、target（`dm:`/`channel:`/alias/`#名`/`@名`/`me`/`last`；模糊名回候選不瞎猜）、files（路徑政策：先 `path.Clean` 再把開頭 `/` 當根（`./a/../b` == `b`）、`..` 倖存者/`~`/volume name 拒；symlink 逃出 root 被 `os.Root` 擋、根內可用；多 root 優先序；目錄/超大/數量上限；mime 四層優先序與 sniff 後 offset 歸零；`ValidateURL`）、send（seam 注入假 poster + 假時鐘：AllowedMentions.Parse 為空 slice、gap/預算/斷路器狀態機、小 `retry_after` 本地重試且**重試前有 Rewind**、 breaker open 時完全不碰 REST、half-open 只放 1、DryRun 不碰 REST 不佔額度、classify 全碼）、tools（`-dry-run` 端到端 envelope、各 `to` 拒因與 `targets` 候選、切段邊界 1999/2000/2001/CJK/附件僅末段、`text_too_long`、`last` per-agent 隔離、部分送達）、poll（假事件序列 → envelope 斷言、byte 預算截斷、裁切不切壞 UTF-8、queue 隔離、cancel 後訊息仍在、timeout 空答只有 2 個 key、**wire key 集合契約**（envelope/message/attachment/embed 四層各自釘死，新增欄位要先過 §3 三閘））、media（三段政策：inline 真的進 content block、save 一檔不重複下載、skip 零 request、超限不降級、**headers/body 分段交付也要讀得完**（E-8 回歸）、cleanup 年齡＋LRU）、`--selftest`（真連煙霧測試）
 
 ---
 
@@ -355,14 +366,14 @@ bus（ring 覆蓋 dropped/Notify 不漏/Drain-RequeueFront 原序/nil-Hub 防呆
 - **C1** poll 維持 v2 設計（下限 5s、無 `max_wait=0`；要立刻拿既有內容走 `discord_history`）✅
 - **C2** 我搞錯了：4 MiB 只在入口，出口 streaming 無上限 ⇒ **不改 mcptransport、不做 vendor**。而且 **LLM 永不送二進位**（只送 path/url/ID/文字），二進位全由 server 從 `--file-root` 處理 → 入口容量議題不存在，只剩出口尺寸政策。`files` 入參**拿掉 `base64`**
 - **C3** 音訊 `skip` ✅（video/other 亦 skip）
-- **C4** 未匹配 DM `ignore` ✅
+- **C4** 未匹配頻道（guild 與 DM 同一套）`ignore` ✅（M2c 把 DM 的獨立政策併進來）
 - 工具鏈：`go.mod` 樣板照舊（go 1.27 + replace mcptransport），正規寫法，不 vendor 不 proxy；有問題再處理
 - 頻道/使用者 ID：user 自己處理，我產出 routing.json 範例格式即可
 
 ## 14. 動工順序（M0 交付物）
 1. `go.mod` 加 `require github.com/bwmarrin/discordgo v0.29.0`（正規 `go mod tidy`）
 2. `internal/config`：全部鍵 + `.env` loader + 驗證 + redact + routing.json 解析
-3. `internal/router`：alias⇄target、Principal、ACL、unknown-dm=ignore
+3. `internal/router`：alias⇄target、Principal、ACL、unknown-channel=ignore
 4. `internal/discord/client.go`：Session 生命週期、Ready/Disconnected/Resumed 狀態機
 5. `main.go`：`--selftest`、`--transport`、SIGINT/EOF → 在飛 poll 回 `reason:"shutdown"` → `Session.Close()`
 6. `internal/tools/status.go`：`discord_status`

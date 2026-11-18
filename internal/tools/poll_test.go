@@ -496,12 +496,12 @@ func TestPollWireKeysAreExactlyThese(t *testing.T) {
 	if got := keySet(emb); got != "title" {
 		t.Errorf("embed keys = %s (only the ones present may appear)", got)
 	}
-	// The one id that earns its bytes: to:"user:<id>" is built from it.
+	// The one id that earns its bytes: to:"dm:<id>" is built from it.
 	wantStr(t, m, "author_id", "u1")
 }
 
 // A placeholder author id must not reach the wire: quoting it back as
-// to:"user:?" would send the reply nowhere useful.
+// to:"dm:?" would send the reply nowhere useful.
 func TestPollOmitsPlaceholderAuthorID(t *testing.T) {
 	d := newDeps(t, routingCfg(t))
 	connected(d)
@@ -534,7 +534,7 @@ func keySet(m map[string]any) string {
 func TestPollFilters(t *testing.T) {
 	dm := &bus.Event{
 		Kind: bus.KindMessage, Ts: time.Now(), Time: "2026-01-01T00:00:00Z",
-		Target: "user:222333444555666777", ChannelID: "999000111222333444", DM: true,
+		Target: "dm:222333444555666777", ChannelID: "999000111222333444", DM: true,
 		MessageID: "d1", Author: bus.Author{ID: "u2", Name: "boss", Tag: "boss#0002"},
 		Text: "in dm",
 	}
@@ -559,9 +559,9 @@ func TestPollFilters(t *testing.T) {
 		want []string // message ids, in order
 	}{
 		{"no filter", `{}`, []string{"m1", "m2", "d1"}},
-		{"by target", `{"targets":["dm:ami"]}`, []string{"d1"}},
+		{"by target", `{"targets":["ami"]}`, []string{"d1"}},
 		{"by canonical target", `{"targets":["channel:111222333444555666"]}`, []string{"m1", "m2"}},
-		{"two targets", `{"targets":["boss","dm:ami"]}`, []string{"m1", "m2", "d1"}},
+		{"two targets", `{"targets":["boss","ami"]}`, []string{"m1", "m2", "d1"}},
 		{"by channel name", `{"channels":["#rp-main"]}`, []string{"m1", "m2"}},
 		{"by channel id", `{"channels":["999000111222333444"]}`, []string{"d1"}},
 		{"by author name", `{"from":["boss"]}`, []string{"d1"}},
