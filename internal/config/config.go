@@ -82,6 +82,7 @@ type Config struct {
 	TokenEnv    string // environment variable name the token came from
 	TokenSource string // human-readable, safe to log, e.g. "env:DISCORD_TOKEN"
 	AgentID     string // principal for stdio (one process = one agent)
+	ToolPrefix  string // stamped in front of every tool name at registration ("" = bare poll/send/status)
 	Transport   string // stdio | http
 	HTTPAddr    string // reserved: http transport lands after M4
 	Origins     []string
@@ -191,6 +192,7 @@ func Load(args []string) (*Config, error) {
 
 	fs.StringVar(&c.TokenEnv, "token-env", "DISCORD_TOKEN", "environment variable holding the bot token (never a literal value)")
 	fs.StringVar(&c.AgentID, "agent", "default", "agent id this process serves (queue + ACL namespace)")
+	fs.StringVar(&c.ToolPrefix, "tool-prefix", "", "string put in front of every tool name as it is registered; empty keeps the bare names poll/send/status (a client that namespaces tools itself usually wants this empty)")
 	fs.StringVar(&c.Transport, "transport", "stdio", "transport: stdio (http reserved for a later milestone)")
 	fs.StringVar(&c.HTTPAddr, "http-addr", "127.0.0.1:8787", "reserved: listen address for the future http transport")
 	fs.Var(&origins, "origin", "allowed CORS Origin for http transport (repeatable)")
@@ -503,6 +505,13 @@ func (c *Config) finalize() error {
 	case "debug", "info", "warn", "warning", "error":
 	default:
 		return fmt.Errorf("--log-level must be debug|info|warn|error, got %q", c.LogLevel)
+	}
+	// A tool name is an identifier the caller has to type back, so a prefix with
+	// whitespace or a path separator in it would register something nobody can
+	// call. Trim the edges, then refuse anything sneaking through.
+	c.ToolPrefix = strings.TrimSpace(c.ToolPrefix)
+	if strings.ContainsAny(c.ToolPrefix, " \t\n/") {
+		return fmt.Errorf("--tool-prefix must not contain whitespace or '/', got %q", c.ToolPrefix)
 	}
 	c.checkACLOverlap()
 	return nil

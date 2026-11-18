@@ -107,7 +107,7 @@ func run(args []string) int {
 	var closeOnce sync.Once
 	shutdown := func() { closeOnce.Do(func() { close(shutting) }) }
 
-	reg := mcp.NewRegistry("discord_")
+	reg := mcp.NewRegistry(cfg.ToolPrefix)
 	deps := &tools.Deps{
 		Cfg:        cfg,
 		Router:     rt,
@@ -346,7 +346,7 @@ func selftest(cfg *config.Config, rt *router.Router, logger *slog.Logger) int {
 	}
 
 	fmt.Fprintf(out, "\ntools:\n")
-	reg := mcp.NewRegistry("discord_")
+	reg := mcp.NewRegistry(cfg.ToolPrefix)
 	deps := &tools.Deps{
 		Cfg: cfg, Router: rt, Hub: hub,
 		DC:        discord.New(cfg, logger, hub, rt), // never started in selftest

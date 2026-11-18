@@ -318,3 +318,31 @@ func TestSnowflakeTime(t *testing.T) {
 		t.Fatal("non-numeric snowflake must not parse")
 	}
 }
+
+// --tool-prefix is the only knob for how the tools are named, and its default is
+// deliberately empty: bare poll/send/status, because the client is the one that
+// namespaces them. A prefix is glued on, not separated, so it must not contain
+// anything that would break the identifier the caller has to type back.
+func TestLoadToolPrefix(t *testing.T) {
+	cfg, err := Load([]string{"-selftest", "-no-file-root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ToolPrefix != "" {
+		t.Fatalf("the default prefix must be empty, got %q", cfg.ToolPrefix)
+	}
+	with, err := Load([]string{"-selftest", "-no-file-root", "-tool-prefix=dc_"})
+	if err != nil || with.ToolPrefix != "dc_" {
+		t.Fatalf("prefix lost: %q (%v)", with.ToolPrefix, err)
+	}
+	trimmed, err := Load([]string{"-selftest", "-no-file-root", "-tool-prefix= dc_ "})
+	if err != nil || trimmed.ToolPrefix != "dc_" {
+		t.Fatalf("the edges must be trimmed: %q (%v)", trimmed.ToolPrefix, err)
+	}
+	if _, err := Load([]string{"-selftest", "-no-file-root", "-tool-prefix=bad prefix"}); err == nil {
+		t.Fatal("a prefix with a space registers a tool nobody can name back")
+	}
+	if _, err := Load([]string{"-selftest", "-no-file-root", "-tool-prefix=a/b"}); err == nil {
+		t.Fatal("a slash is not part of a tool name")
+	}
+}

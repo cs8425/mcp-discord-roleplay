@@ -288,6 +288,7 @@ user 裁示：「直接回 429 rate limit 跟時間讓 LLM 知道，然後 mcp s
 |---|---|
 | `DISCORD_TOKEN`（`--token-env` 指定變數名）| 必填；**只讀 env/file**，log redact，自動加 `"Bot "` |
 | `--agent` | `default` |
+| `--tool-prefix` | `""`（空＝工具就叫 `poll` / `send` / `status`）。註冊時才貼上去（`mcptransport.NewRegistry(prefix)`），工具自身宣告的是裸名；client 自己會加 namespace 時保持空即可。⚠ 給模型看的**文字**（description／hint／`instructions()`）目前仍寫死 `discord_poll`/`discord_send`/`discord_status`，要等下一輪把它們改成從這個值組出來 |
 | `--config` | routing.json（見下） |
 | `--transport` | `stdio`（`--http-addr` 127.0.0.1:8787、`--origin`、未來 `--auth` per-agent token） |
 | `--poll-min-wait / --poll-max-wait / --poll-default-wait / --poll-jitter-pct` | 5 / 600 / 45 / 15 |
