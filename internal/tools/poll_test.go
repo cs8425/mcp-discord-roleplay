@@ -1058,3 +1058,152 @@ func TestPollSavesAttachmentAndReportsLocalPath(t *testing.T) {
 		t.Errorf("a saved attachment must not be downloaded twice in one process: %d", hits.Load())
 	}
 }
+
+// ---------------------------------------------------------------------------
+// emoji handles: one number in the answer, and it is the content block index
+// ---------------------------------------------------------------------------
+
+// msgAttachments is firstAttachment for the message you actually mean.
+func msgAttachments(t *testing.T, out map[string]any, i int) []map[string]any {
+	t.Helper()
+	m, ok := msgs(t, out)[i].(map[string]any)
+	if !ok {
+		t.Fatalf("messages[%d] is not an object", i)
+	}
+	list, _ := m["attachments"].([]any)
+	rows := make([]map[string]any, 0, len(list))
+	for _, a := range list {
+		row, ok := a.(map[string]any)
+		if !ok {
+			t.Fatalf("messages[%d].attachments has a row that is not an object", i)
+		}
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+// emojiAtt builds the attachment normalize synthesizes for `<:name:id>`, handle and
+// all: `provisional` is the message-local number ingress wrote, which poll must
+// replace with the block index.
+func emojiAtt(id, name, rawURL string, provisional int) bus.Attachment {
+	return bus.Attachment{
+		ID: id, Filename: id + ".png", ContentType: "image/png", Size: 7,
+		Kind: bus.KindImage, Origin: bus.OriginEmoji, URL: rawURL,
+		Placeholder: fmt.Sprintf("<:%s:img@%d>", name, provisional),
+		Raw:         "<:" + name + ":" + id + ">",
+	}
+}
+
+// The number inside a handle is the content block index, so two messages whose emoji
+// were both numbered img@1 at ingress must not arrive as img@1 twice: that collision
+// is what an agent reads as "the picture I already looked at", and it is why the
+// handle gets rewritten once the batch is known rather than trusted from ingress.
+func TestPollRelabelsEmojiHandlesToBlockIndex(t *testing.T) {
+	body := []byte{0x89, 'P', 'N', 'G', 1, 2, 3}
+	url, _ := startCDN(t, body)
+	cfg := routingCfg(t, "-media-image=inline")
+	d := newDeps(t, cfg)
+	d.Media = media.New(cfg, media.Deps{})
+	t.Cleanup(func() { _ = d.Media.Close() })
+
+	e1 := evMsg("m1", "先看照片")
+	e1.Attachments = []bus.Attachment{{ID: "up1", Filename: "shot.png", Kind: bus.KindImage,
+		ContentType: "image/png", Size: len(body), URL: url + "/shot.png"}}
+
+	// Inside its own message this was attachment number one, and it appears twice:
+	// both properties have to survive the rewrite, which is one row and two handles
+	// naming the same number.
+	e2 := evMsg("m2", "hi <:gaze:img@1> again <:gaze:img@1>")
+	e2.Attachments = []bus.Attachment{emojiAtt("999", "gaze", url+"/emojis/999.png", 1)}
+
+	push(t, d, "default", e1, e2)
+	out := pollOK(t, d, `{"max_wait":1,"limit":5}`)
+
+	if got, want := wireText(t, out, 0), "先看照片"; got != want {
+		t.Errorf("a message with no handle of ours must come back untouched: %q", got)
+	}
+	want := "hi <:gaze:img@2> again <:gaze:img@2>"
+	if got := wireText(t, out, 1); got != want {
+		t.Fatalf("the handle must carry the block index, on every appearance:\n got %q\nwant %q", got, want)
+	}
+	rows := msgAttachments(t, out, 1)
+	if len(rows) != 1 {
+		t.Fatalf("one distinct emoji, one attachment row: %d", len(rows))
+	}
+	if ci, _ := rows[0]["content_index"].(float64); ci != 2 {
+		t.Fatalf("the number in the text and content_index must be the SAME number: %v", rows[0])
+	}
+}
+
+// No bytes, no handle. Pointing at a block that was never emitted is worse than
+// saying nothing, and the code the author typed carries the id its row shows.
+func TestPollRevertsHandleWhenBytesDidNotArrive(t *testing.T) {
+	body := []byte("a picture worth more than four bytes")
+	url, _ := startCDN(t, body)
+	cfg := routingCfg(t, "-media-image=inline", "-inline-max-bytes-image=4")
+	d := newDeps(t, cfg)
+	d.Media = media.New(cfg, media.Deps{})
+	t.Cleanup(func() { _ = d.Media.Close() })
+
+	att := emojiAtt("999", "gaze", url+"/emojis/999.png", 1)
+	att.Size = len(body)
+	e := evMsg("m1", "早 <:gaze:img@1> 好")
+	e.Attachments = []bus.Attachment{att}
+	push(t, d, "default", e)
+
+	out := pollOK(t, d, `{"max_wait":1}`)
+	got := wireText(t, out, 0)
+	if want := "早 <:gaze:999> 好"; got != want {
+		t.Fatalf("a skipped emoji must show the code Discord sent:\n got %q\nwant %q", got, want)
+	}
+	if strings.Contains(got, "img@") {
+		t.Errorf("no inline block means no handle left behind: %q", got)
+	}
+	rows := msgAttachments(t, out, 0)
+	if len(rows) != 1 || rows[0]["media"] != "url" || rows[0]["reason"] != "too_big" {
+		t.Fatalf("the row still has to explain itself: %v", rows)
+	}
+	if _, bad := rows[0]["content_index"]; bad {
+		t.Errorf("a skipped attachment has no block, so it must not claim one: %v", rows[0])
+	}
+}
+
+// Two guilds can ship an emoji under the same name, and renumbering the first one can
+// produce the very literal the second one is searched for. The rewrite is one pass,
+// so a handle is never rewritten twice on the way to the wrong file.
+func TestPollSameNameHandlesDoNotCollideWhenRelabeled(t *testing.T) {
+	body := []byte{0x89, 'P', 'N', 'G', 1, 2, 3}
+	url, _ := startCDN(t, body)
+	cfg := routingCfg(t, "-media-image=inline")
+	d := newDeps(t, cfg)
+	d.Media = media.New(cfg, media.Deps{})
+	t.Cleanup(func() { _ = d.Media.Close() })
+
+	e1 := evMsg("m1", "")
+	e1.Attachments = []bus.Attachment{{ID: "up1", Filename: "shot.png", Kind: bus.KindImage,
+		ContentType: "image/png", Size: len(body), URL: url + "/shot.png"}}
+
+	e2 := evMsg("m2", "<:gaze:img@2> <:gaze:img@3>")
+	up2 := bus.Attachment{ID: "up2", Filename: "two.png", Kind: bus.KindImage,
+		ContentType: "image/png", Size: len(body), URL: url + "/two.png"}
+	e2.Attachments = []bus.Attachment{up2,
+		emojiAtt("111", "gaze", url+"/emojis/111.png", 2),
+		emojiAtt("222", "gaze", url+"/emojis/222.png", 3)}
+
+	push(t, d, "default", e1, e2)
+	out := pollOK(t, d, `{"max_wait":1,"limit":5}`)
+
+	want := "<:gaze:img@3> <:gaze:img@4>"
+	if got := wireText(t, out, 1); got != want {
+		t.Fatalf("each handle moves exactly once:\n got %q\nwant %q", got, want)
+	}
+	rows := msgAttachments(t, out, 1)
+	if len(rows) != 3 {
+		t.Fatalf("two emoji and one upload: %v", rows)
+	}
+	for i, wantCI := range []float64{2, 3, 4} {
+		if ci, _ := rows[i]["content_index"].(float64); ci != wantCI {
+			t.Errorf("attachments[%d].content_index = %v, want %v", i, rows[i]["content_index"], wantCI)
+		}
+	}
+}

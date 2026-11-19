@@ -4,12 +4,14 @@
 package tools
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -195,12 +197,25 @@ var devNull = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 // jsonResult marshals v compactly into a single text part. Map keys are sorted
 // by encoding/json, so output is deterministic.
+//
+// HTML escaping is off, and that is the whole reason this is a function and not
+// a json.Marshal call: Go's default turns `<`, `>` and `&` into six-byte \u003c
+// sequences, and these payloads are full of them -- every `<:name:img@1>` handle,
+// every `<@id>` mention, every CDN url with `&` in its query. That escape survives
+// one layer of parsing, so whoever reads a raw log line sees \u003c where the
+// message said `<`, and the wire pays about ten bytes per handle -- against
+// --poll-max-bytes that is money. Nothing here needs HTML-safety: this text goes to
+// a JSON parser, not into a page.
 func jsonResult(v any) *mcp.ToolResult {
-	b, err := json.Marshal(v)
-	if err != nil {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
 		return mcp.ResultError("internal: cannot encode result: " + err.Error())
 	}
-	return mcp.ResultText(string(b))
+	// Encode appends a newline; the answer used to come from Marshal, which does
+	// not, and callers diff these strings in tests.
+	return mcp.ResultText(strings.TrimSuffix(buf.String(), "\n"))
 }
 
 // errResult builds an isError result carrying a machine-readable code plus a

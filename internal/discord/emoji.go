@@ -21,10 +21,17 @@ package discord
 //
 // Each one leaves a handle behind in the text so the picture and the word it came
 // from stay matched up: `[sticker:gaze]`, and for a custom emoji
-// `<:gaze:img@1>`, where `img@1` is the first entry of that message's
-// `attachments` array (uploads first, then stickers, then emoji). The index is a
-// position, not a promise that bytes arrived: an emoji that ran out of inline
-// budget still points at its entry, which then says `media: "url"`.
+// `<:gaze:img@1>`. What that number MEANS is settled later, and only later can it
+// be settled: here at ingress the only thing knowable is the position inside this
+// message's `attachments` array (uploads first, then stickers, then emoji), while
+// the agent reads the number as an address into the poll result's content blocks,
+// which depends on how many attachments came before it IN THAT ANSWER -- a fact
+// that does not exist until the queue is drained. So normalize writes a
+// provisional handle, records it on the attachment (`Placeholder`/`Raw`), and
+// poll.relabelPlaceholders rewrites it into the one number both sides agree on:
+// `img@N` where N is exactly that attachment's `content_index`, or -- when no
+// bytes came with it -- the original Discord code, because a pointer to a block
+// that was never emitted is worse than no pointer at all.
 
 import (
 	"regexp"
@@ -194,6 +201,7 @@ func addEmoji(ev *bus.Event, mode string) {
 			ext, mime = ".gif", "image/gif"
 		}
 		idx := len(ev.Attachments) + 1
+		handle := t.render(idx)
 		seen[t.ID] = idx
 		n++
 		ev.Attachments = append(ev.Attachments, bus.Attachment{
@@ -203,13 +211,16 @@ func addEmoji(ev *bus.Event, mode string) {
 			Kind:        bus.KindImage,
 			URL:         cdnEmojiBase + t.ID + ext,
 			Origin:      bus.OriginEmoji,
+			Placeholder: handle,
+			Raw:         raw,
 		})
-		return t.render(idx)
+		return handle
 	})
 }
 
-// render writes the placeholder form of the token: the code as Discord wrote it,
-// with the position of its picture in place of the id.
+// render writes the provisional placeholder form of the token: the code as Discord
+// wrote it, with the position of its picture in place of the id. poll rewrites the
+// number once it knows the real content block (see relabelPlaceholders).
 func (t emojiToken) render(idx int) string {
 	lead := ":"
 	if t.Animated {

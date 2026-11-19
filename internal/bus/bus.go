@@ -85,6 +85,17 @@ type Attachment struct {
 	DurationSecs float64 `json:"duration_secs,omitempty"`
 	URL          string  `json:"url"`
 	ProxyURL     string  `json:"proxy_url,omitempty"`
+
+	// Placeholder and Raw are bookkeeping for the handle normalize writes into
+	// Event.Text for a custom emoji: the exact string it put there (`<:gaze:img@1>`)
+	// and the Discord code it replaced (`<:gaze:1234>`). The number in a handle is
+	// provisional -- written at ingress, when all that was known was its position in
+	// this message -- and poll.relabelPlaceholders rewrites it once this call knows
+	// which content block actually carries the bytes. Both are set before the event
+	// is pushed and never touched after, so the read-only rule above still holds.
+	// They are ours, not the caller's, so they never ride the wire.
+	Placeholder string `json:"-"`
+	Raw         string `json:"-"`
 }
 
 // Embed is a minimal view of a Discord embed (rich cards are flattened).

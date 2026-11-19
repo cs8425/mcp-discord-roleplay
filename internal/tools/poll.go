@@ -88,6 +88,7 @@ func pollTool(prefix string) *mcp.Tool {
 			"author_id is the speaker's Discord id: quote it as to:\"dm:<id>\" to answer that person in DMs even when they have no alias. " +
 			"Each attachment reports what it came as: media=base64 means the bytes are appended to this result as a content block (content_index names it), " +
 			"media=file means they were saved and local_path says where, media=url means metadata only and reason says why. " +
+			"A custom emoji in the text is rewritten to <:name:img@N> where N is exactly that attachment's content_index — one number for the whole answer, so the code in the sentence and the picture are never two different addresses; when its bytes did not come, the code stays as Discord sent it. " +
 			"This call blocks up to max_wait seconds, so your client's request timeout must be at least that long.",
 		InputSchema: mcp.Schema{
 			Type:        mcp.TypeObject,
@@ -343,6 +344,7 @@ func (d *Deps) handlePoll(ctx context.Context, call *mcp.Call) (*mcp.ToolResult,
 	// fetched. msgs is written through (it IS st.msgsOut), so the JSON built
 	// below carries the verdicts, and the blocks go after it.
 	blocks, mnotes := d.applyMedia(ctx, msgs, st.kept)
+	relabelPlaceholders(msgs, st.kept) // after the verdicts: the number IS the block index
 	notes = append(notes, mnotes...)
 
 	// A caller that vanished during the downloads would not read this answer
@@ -449,6 +451,73 @@ func (d *Deps) applyMedia(ctx context.Context, msgs []pollMessage, kept []*bus.E
 			strings.Join(parts, "、")+"）；檔案還在 Discord 上，url 可以直接貼")
 	}
 	return sess.Content(), notes
+}
+
+// relabelPlaceholders turns the provisional emoji handles in a message's text into
+// the one number the agent can use: the index of the content block that carries
+// those bytes, which is exactly what content_index says on the attachment row.
+//
+// It has to run after applyMedia because the number is a property of THIS answer.
+// How many inline attachments came before a given one depends on which messages
+// made it past the byte budget and which of their attachments got bytes -- and none
+// of that exists at ingress, which is when normalize wrote the handle. The price of
+// that is a handle whose number follows the batch: the same message polled alone
+// says img@1 and polled behind two others says img@4. It is still the only number
+// in the answer, which is the point.
+//
+// An emoji whose bytes did not come (policy, budget, too big, failed fetch) loses
+// its handle and shows the Discord code again: a pointer to a block that was never
+// emitted is worse than no pointer, and the raw code carries the id -- the one
+// thing that matches its attachment row.
+//
+// The rewrite edits pollMessage.Text, the per-call copy, never bus.Event.Text, which
+// every queue that received this event shares. It can make the text a few bytes
+// longer than what the budget counted (a raw code is longer than a handle), which
+// the fuse tolerates by design: it prices text, not exactness.
+func relabelPlaceholders(msgs []pollMessage, kept []*bus.Event) {
+	for i := range msgs {
+		if i >= len(kept) || kept[i] == nil || msgs[i].Text == "" {
+			continue
+		}
+		pairs := make([]string, 0, len(msgs[i].Attachments))
+		for j := range msgs[i].Attachments {
+			if j >= len(kept[i].Attachments) {
+				break // ditto: the wire list is a prefix of the event's
+			}
+			handle := kept[i].Attachments[j].Placeholder
+			if handle == "" {
+				continue // an upload or a sticker: no handle of ours sits in the text
+			}
+			repl := kept[i].Attachments[j].Raw
+			if a := &msgs[i].Attachments[j]; a.Media == media.MediaBase64 && a.ContentIndex > 0 {
+				repl = reindex(handle, a.ContentIndex)
+			}
+			if repl == "" {
+				continue // never eat the handle for want of something to put back
+			}
+			pairs = append(pairs, handle, repl)
+		}
+		if len(pairs) == 0 {
+			continue
+		}
+		// ONE Replacer pass rather than a ReplaceAll per attachment: two emoji can
+		// carry the same name in different guilds (`<:gaze:111>` and `<:gaze:222>`),
+		// and renumbering the first can otherwise produce the exact literal the second
+		// is searching for -- which would then be rewritten twice and point at a file
+		// it is not. A Replacer scans the input once and never revisits what it wrote.
+		msgs[i].Text = strings.NewReplacer(pairs...).Replace(msgs[i].Text)
+	}
+}
+
+// reindex rewrites the number at the tail of an `...:img@N>` handle and leaves the
+// rest of the code exactly as it was, so the name the author gave the emoji stays
+// visible to the model.
+func reindex(handle string, n int) string {
+	k := strings.LastIndexByte(handle, '@')
+	if k < 0 {
+		return handle
+	}
+	return handle[:k+1] + strconv.Itoa(n) + ">"
 }
 
 // --- filters ---------------------------------------------------------------
