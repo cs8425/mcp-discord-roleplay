@@ -384,6 +384,7 @@ type statusWire struct {
 | `--dry-run` | false |
 | `--no-message-content` | false。關掉 **Message Content**（我們唯一的 privileged intent）：gateway 不再要求該 bit，incoming `text` 恆為空，但 `mentions` / `attachments` / `embeds` 不受影響照收（Portal 沒開卻硬要該 bit 會被 4014 踢）|
 | `--log-level / --log-file` | info / stderr（slog；**stdout 只能是 MCP 訊息**） |
+| **對外 proxy（無旗標，只吃 env）** | `HTTPS_PROXY`／`HTTP_PROXY`／`ALL_PROXY`／`NO_PROXY`（**大小寫都吃**；`.env` 也算，因為 `LoadDotEnv` 走 `os.Setenv` 且不覆蓋既有環境）。三條 outbound（gateway WS、REST、媒體抓取）全部落在 `http.DefaultTransport` 與 `websocket.DefaultDialer` 的 `ProxyFromEnvironment` 上，我們自己不設也不蓋。**讀碼定案（`x/net/http/httpproxy`）：只有 `HTTPS_PROXY` 會動到我們這三條**——Go 只讀 `http_proxy`／`https_proxy`／`no_proxy`（**小寫優先**）、**`ALL_PROXY` 根本不讀**（curl／docker 讀它，所以一直有人以為該有用），而 `proxyForURL` 只對 scheme `http`／`https` 回 proxy（WS 由 gorilla 先正規化成 `https` ⇒ socket 也吃 `HTTPS_PROXY`）。裸 `host:port` Go 當成 http，所以 SOCKS 一定要寫 scheme；`ALL_PROXY` 若設了，log 會標 `ALL_PROXY:…(go-ignored)`。開機 `starting` 那行帶 `outbound_proxy=HTTPS_PROXY:socks5://,…`——只報有沒有設＋scheme 前綴，**不露 host／port／帳密**；判讀碼 `internal/config/outbound.go`（單測 `outbound_test.go` 釘格式與不泄漏）|
 
  **路徑政策**（user 定案）：所有路徑參數（`--media-out` / `--log-file` / `--env-file` / `--config` / `--file-root`）一律**照原樣使用**——絕對路徑，或相對 process cwd。我們**不解析 `~`**（那是 shell 的事）、不查 `$HOME` / `$XDG_CACHE_HOME` / `$TMPDIR`、不把值改寫到別的地方；預設值也都是純檔名，所以沒設定就落在 cwd。唯一例外：`--file-root` 內部走 `filepath.Abs`，因為 chroot containment 要比對一致的目錄字串（這也正是「相對 = cwd」的實作）。附件的 `path` 是另一回事，見 §4.2：在 root 之內，開頭 `/` 等於那個 root。
 

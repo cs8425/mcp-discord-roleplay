@@ -65,7 +65,12 @@ func run(args []string) int {
 		return 2
 	}
 	slog.SetDefault(logger)
-	logger.Info("starting", "version", version, "agent", cfg.AgentID, "transport", cfg.Transport)
+	// outbound_proxy is the only place an operator can see, without waiting for a
+	// failure that happens to mention a proxy, whether the standard *_PROXY
+	// variables are in this process at all — there is no flag for them, and
+	// internal/config/outbound.go says why the summary never prints a credential.
+	logger.Info("starting", "version", version, "agent", cfg.AgentID, "transport", cfg.Transport,
+		"outbound_proxy", config.OutboundProxySummary())
 	// Config never fails on a soft finding (an entry in both allow and deny), but
 	// it must not stay invisible either.
 	for _, w := range cfg.Warnings {
