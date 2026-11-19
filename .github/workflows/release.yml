@@ -1,0 +1,76 @@
+# Prebuilt mcp-discord-roleplay binaries: raw `go build` on a tag, attached to the
+# GitHub release.
+#
+# Why raw go build and not goreleaser:
+#   * The server is CGO-free end to end — stdlib + bwmarrin/discordgo (whose
+#     websocket layer is pure Go), and the mcptransport module has no external
+#     deps — so one ubuntu-latest runner cross-compiles every target with plain
+#     GOOS/GOARCH. No per-OS C toolchain.
+#   * One binary; no archives/tap/snap/nfpm/signing/changelog. goreleaser's
+#     headline features would go unused, so a short script does the job in the
+#     open. Revisit goreleaser only if releases grow to archives, several
+#     binaries, or signing — the loop below migrates to a .goreleaser.yaml
+#     builds: list one-for-one.
+#
+# Action versions pinned to exact patch (checked on each action's releases page).
+# Go comes from go.mod (1.27).
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # the release step creates the GitHub release
+
+jobs:
+  binaries:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CGO_ENABLED: "0" # pure Go: static, reproducible cross-builds
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod # Go version lives in go.mod — single source of truth
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # The tag is the version. main.version is a var stamped at link
+          # time via -X; no date is injected on purpose so a tagged build stays
+          # byte-reproducible.
+          stamp=""
+          case "$GITHUB_REF" in
+            refs/tags/v*) stamp="-X main.serverVersion=${GITHUB_REF_NAME#v}" ;;
+          esac
+          #   goos:goarch:exe-suffix
+          # To add a target, append one string (e.g. "darwin:arm64:").
+          for t in "linux:amd64:" "linux:arm64:" "windows:amd64:.exe"; do
+            IFS=: read -r goos goarch ext <<<"$t"
+            echo "building mcp-discord-roleplay-$goos-$goarch$ext"
+            GOOS=$goos GOARCH=$goarch \
+              go build -trimpath -ldflags="-s -w $stamp" \
+              -o "dist/mcp-discord-roleplay-$goos-$goarch$ext" .
+          done
+          (cd dist && sha256sum mcp-discord-roleplay-* > SHA256SUMS.txt)
+          cat dist/SHA256SUMS.txt
+
+      # Every run leaves the binaries here for inspection; a workflow_dispatch run
+      # (no v* tag) stops here, having built and verified the cross-compile only.
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: mcp-discord-roleplay-${{ github.ref_name }}
+          path: dist/
+
+      # Only a v* tag publishes; the tag name becomes the release title verbatim.
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v3.0.4
+        with:
+          files: dist/*

@@ -1,0 +1,122 @@
+# CI: compile, vet, format and unit-test mcp-discord-roleplay on the platforms we
+# ship (Linux + Windows). Tests are hermetic — the REST side is scripted through
+# discord.ReadHooks and the posting side through an injected fake poster plus a fake
+# clock, so no Discord token and no network is needed. Two Go modules are covered:
+# the root module and the replace'd ./mcptransport.
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: build-test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    env:
+      # Ship and build CGO-free exactly like release.yml. CI therefore runs vet/build
+      # with CGO_ENABLED=0; only the -race step flips CGO back on (the race detector
+      # is the one thing that genuinely needs a C toolchain).
+      CGO_ENABLED: "0"
+    steps:
+      # Windows runners ship git with core.autocrlf=true, so a plain checkout
+      # converts LF->CRLF and gofmt then flags every file. Force LF for the
+      # checkout. (.gitattributes also enforces this; this makes CI explicit.)
+      - name: Preserve LF line endings
+        if: runner.os == 'Windows'
+        shell: bash
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v7.0.1
+
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt (no diff)
+        shell: bash
+        run: |
+          set -euo pipefail
+          files=$(git ls-files '*.go')
+          bad=$(gofmt -l $files || true)
+          if [ -n "$bad" ]; then
+            echo "these files are not gofmt-clean:"; echo "$bad"
+            gofmt -d $bad
+            exit 1
+          fi
+
+      - name: Vet
+        shell: bash
+        run: |
+          set -euo pipefail
+          go vet ./...
+          (cd mcptransport && go vet ./...)
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          go build ./...
+          (cd mcptransport && go build ./...)
+          # The actual shipped binary compiles (native, per-OS). main lives at the
+          # repo root, so the package is "." — not a ./cmd/ subtree.
+          go build -trimpath -o "$RUNNER_TEMP/mcp-discord-roleplay${{ runner.os == 'Windows' && '.exe' || '' }}" .
+
+      - name: Test
+        shell: bash
+        env:
+          # -race needs a cgo toolchain; ubuntu runners ship gcc, windows ones
+          # don't — flip CGO on only where the race detector actually runs.
+          CGO_ENABLED: ${{ matrix.os == 'ubuntu-latest' && '1' || '0' }}
+        run: |
+          set -euo pipefail
+          # CGO is toggled per-OS by the env above; -race only runs where it is supported.
+          if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
+            go test -race ./...
+          else
+            go test ./...
+          fi
+          (cd mcptransport && go test ./...)
+
+  hygiene:
+    name: generated & tidy up to date
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Tidy both modules, and run go generate (this repo has no go:generate
+      # directive yet — the step is here so generated code cannot sneak in
+      # unnoticed). The tree must then be byte-identical, i.e. what is committed is
+      # what the toolchain produces.
+      - name: go generate + go mod tidy produce no diff
+        run: |
+          set -euo pipefail
+          go generate ./...
+          go mod tidy
+          (cd mcptransport && go mod tidy)
+          if ! git diff --exit-code; then
+            echo "::error::generated code or go.mod/go.sum is out of date — run 'go generate ./...' and 'go mod tidy' (root and mcptransport), then commit"
+            git status --porcelain
+            exit 1
+          fi
