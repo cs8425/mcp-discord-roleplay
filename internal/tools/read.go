@@ -209,10 +209,10 @@ func (d *Deps) handleHistory(ctx context.Context, call *mcp.Call) (*mcp.ToolResu
 		kept = append(kept, ev)
 	}
 	if bots > 0 {
-		notes = append(notes, "已跳過 "+strconv.Itoa(bots)+" 則 bot 的訊息（含本伺服器自己）；include_bots:true 才給。")
+		notes = append(notes, "skipped "+strconv.Itoa(bots)+" bot message(s), this server included; pass include_bots:true to get them.")
 	}
 	if len(kept) == 0 {
-		notes = append(notes, "這個頻道在你要的範圍內沒有讀到的訊息。")
+		notes = append(notes, "no messages read in this channel within the range you asked for.")
 	}
 
 	// All rows blank is a different fact from no rows, and only the rows can tell them
@@ -228,7 +228,7 @@ func (d *Deps) handleHistory(ctx context.Context, call *mcp.Call) (*mcp.ToolResu
 			}
 		}
 		if silent {
-			notes = append(notes, "這頁 text／embeds／attachments 全空：Discord 有回訊息，只是 content 是空的（旗標 --no-message-content 開著）。拿不拿得到 content 是 Discord 那邊的 app 設定，我們不猜原因。")
+			notes = append(notes, "this page is blank in text/embeds/attachments: Discord returned the messages but not their content (--no-message-content is on; the app's Message Content setting on Discord's side is what decides, we do not guess the reason).")
 		}
 	}
 
@@ -256,9 +256,9 @@ func (d *Deps) handleHistory(ctx context.Context, call *mcp.Call) (*mcp.ToolResu
 		env := historyWire{Target: readTarget(ru, a.Target), Channel: chanID, DM: readIsDM(ru), Messages: rows}
 		if dropped > 0 {
 			env.Notes = append(append([]string{}, notes...),
-				"位元組額度（--history-max-bytes="+strconv.Itoa(budget)+"）只裝得下最新的 "+
-					strconv.Itoa(len(rows))+" 則；已從最舊那一側丟掉 "+strconv.Itoa(dropped)+
-					" 則。要更早的訊息，把第一則的 id 當 before 再問一次。")
+				"the byte budget (--history-max-bytes="+strconv.Itoa(budget)+") only fits the newest "+
+					strconv.Itoa(len(rows))+" message(s); "+strconv.Itoa(dropped)+
+					" older one(s) were dropped. For earlier messages, ask again with the first id as before.")
 		} else {
 			env.Notes = notes
 		}
@@ -588,12 +588,12 @@ func (d *Deps) handleChannels(ctx context.Context, call *mcp.Call) (*mcp.ToolRes
 			total++
 		}
 		if len(g.Channels) == 0 {
-			notes = append(notes, "guild "+g.Name+"（"+g.ID+"）我們讀不到任何頻道（權限，或它本來就是空的）。")
+			notes = append(notes, "guild "+g.Name+" ("+g.ID+") gave us no channels at all (permissions, or it is simply empty).")
 		}
 		rows = append(rows, gw)
 	}
 	if wantType != "" && total == 0 {
-		notes = append(notes, "沒有 kind 是 "+wantType+" 的頻道。")
+		notes = append(notes, "no channel of kind "+wantType+".")
 	}
 
 	env := channelsWire{Guilds: rows, Notes: notes}
@@ -615,8 +615,8 @@ func (d *Deps) handleChannels(ctx context.Context, call *mcp.Call) (*mcp.ToolRes
 			dropped++
 		}
 		if dropped > 0 {
-			env.Notes = append(env.Notes, "位元組額度（--channels-max-bytes="+strconv.Itoa(budget)+
-				"）裝不完，已從尾端丟掉 "+strconv.Itoa(dropped)+" 個頻道；用 guild 或 type 縮小範圍再問一次。")
+			env.Notes = append(env.Notes, "the byte budget (--channels-max-bytes="+strconv.Itoa(budget)+
+				") did not fit the list; "+strconv.Itoa(dropped)+" channel(s) were dropped from the tail -- narrow with guild or type and ask again.")
 		}
 	}
 	return jsonResult(env), nil

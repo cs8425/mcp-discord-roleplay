@@ -337,8 +337,8 @@ func (d *Deps) handlePoll(ctx context.Context, call *mcp.Call) (*mcp.ToolResult,
 		// the call was CUT SHORT by a budget, while `waiting` says leftovers were
 		// REJECTED by the caller's own filters. Two different reasons for leftovers,
 		// and only one of them is the caller's doing.
-		notes = append(notes, "你的佇列裡還有 "+strconv.Itoa(remaining)+
-			" 則，請立刻再 poll 一次")
+		notes = append(notes, strconv.Itoa(remaining)+
+			" message(s) are still queued; poll again right away")
 	}
 	d.notePoll(p.AgentID)
 
@@ -448,8 +448,9 @@ func (d *Deps) applyMediaWith(ctx context.Context, msgs []pollMessage, kept []*b
 
 	var notes []string
 	if saved > 0 {
-		notes = append(notes, "有附件存進了媒體快取：local_path 可以直接餵回 "+d.toolSend()+" 的 files[].path，"+
-			"同一個附件再 poll 不會重抓")
+		notes = append(notes, "an attachment was saved into the media cache: local_path feeds "+
+			"straight back into "+d.toolSend()+"'s files[].path, and polling the same "+
+			"attachment again will not re-download it")
 	}
 	if skipped > 0 {
 		keys := make([]string, 0, len(reasons))
@@ -459,10 +460,11 @@ func (d *Deps) applyMediaWith(ctx context.Context, msgs []pollMessage, kept []*b
 		sort.Strings(keys)
 		parts := make([]string, 0, len(keys))
 		for _, r := range keys {
-			parts = append(parts, r+"×"+strconv.Itoa(reasons[r]))
+			parts = append(parts, r+" x"+strconv.Itoa(reasons[r]))
 		}
-		notes = append(notes, "有 "+strconv.Itoa(skipped)+" 個附件只給了 url（reason："+
-			strings.Join(parts, "、")+"）；檔案還在 Discord 上，url 可以直接貼")
+		notes = append(notes, strconv.Itoa(skipped)+" attachment(s) came with a url only "+
+			"(reason: "+strings.Join(parts, ", ")+"); the files are still on Discord, "+
+			"the url can be pasted as-is")
 	}
 	return sess.Content(), notes
 }
@@ -821,7 +823,7 @@ func (st *drainState) want(d *Deps, p router.Principal, f *pollFilter) func(*bus
 // noteBudgetFull records, at most once per attempt, that the drain stopped
 // because of the byte budget rather than because the queue was empty.
 func (st *drainState) noteBudgetFull() {
-	const msg = "後面的訊息超過這次 poll 的 text 預算，已留在佇列，下一次 poll 會先拿到"
+	const msg = "later messages exceeded this poll's text budget and stay queued; the next poll gets them first"
 	for _, n := range st.notes {
 		if n == msg {
 			return
@@ -832,7 +834,7 @@ func (st *drainState) noteBudgetFull() {
 
 // noteLimit records that this call reached its limit; the rest stay queued.
 func (st *drainState) noteLimit() {
-	const msg = "已達這次 poll 的 limit，剩下的還在佇列，請立刻再 poll 一次"
+	const msg = "this poll hit its limit; the rest are still queued, poll again right away"
 	for _, n := range st.notes {
 		if n == msg {
 			return
@@ -969,8 +971,8 @@ func fitMessage(m *pollMessage, room int, st *drainState) {
 	m.Text = m.Text[:cut]
 	m.TextTruncated = true
 	m.TextFullBytes = full
-	st.notes = append(st.notes, "這一則 text 太長（原本 "+strconv.Itoa(full)+
-		" bytes），裁到 "+strconv.Itoa(cut)+" bytes 只留開頭")
+	st.notes = append(st.notes, "this message's text was too long (originally "+strconv.Itoa(full)+
+		" bytes) and was cut to "+strconv.Itoa(cut)+" bytes, keeping the start")
 }
 
 // --- wire shapes -----------------------------------------------------------

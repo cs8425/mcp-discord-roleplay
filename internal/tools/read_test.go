@@ -185,7 +185,7 @@ func TestHistoryEmptyIsAnAnswerNotAnError(t *testing.T) {
 	if _, ok := out["messages"]; ok {
 		t.Errorf("no rows should mean no messages key: %s", res.Content[0].Text)
 	}
-	if !strings.Contains(fmt.Sprint(out["notes"]), "沒有讀到") {
+	if !strings.Contains(fmt.Sprint(out["notes"]), "no messages read") {
 		t.Errorf("silence needs a note: %v", out["notes"])
 	}
 }
@@ -202,7 +202,7 @@ func TestHistorySaysWhenTheEmptinessIsOurs(t *testing.T) {
 		},
 	})
 	out := decode(t, callRead(t, d.handleHistory, context.Background(), `{"target":"boss"}`))
-	if !strings.Contains(fmt.Sprint(out["notes"]), "全空") {
+	if !strings.Contains(fmt.Sprint(out["notes"]), "blank in text") {
 		t.Errorf("a blank page should say it is blank, not just empty: %v", out["notes"])
 	}
 
@@ -215,7 +215,7 @@ func TestHistorySaysWhenTheEmptinessIsOurs(t *testing.T) {
 		},
 	})
 	out2 := decode(t, callRead(t, d2.handleHistory, context.Background(), `{"target":"boss"}`))
-	if strings.Contains(fmt.Sprint(out2["notes"]), "全空") {
+	if strings.Contains(fmt.Sprint(out2["notes"]), "blank in text") {
 		t.Errorf("no noise when the rows have content: %v", out2["notes"])
 	}
 }
@@ -455,7 +455,7 @@ func TestChannelsGuildFilterIsPassedThrough(t *testing.T) {
 	if _, ok := g["channels"]; ok {
 		t.Errorf("a guild with no channels should omit the key, not ship an empty list: %v", g)
 	}
-	if !strings.Contains(fmt.Sprint(out["notes"]), "讀不到任何頻道") {
+	if !strings.Contains(fmt.Sprint(out["notes"]), "gave us no channels") {
 		t.Errorf("an empty guild needs a note saying it is empty, not silence: %v", out["notes"])
 	}
 }

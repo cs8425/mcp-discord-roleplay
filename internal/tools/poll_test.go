@@ -409,7 +409,7 @@ func TestPollTrimsOversizedMessage(t *testing.T) {
 	}
 	// How big it really was is a note now: the model needs to know the line was
 	// cut, not the exact byte count of a message it has already read.
-	if !hasNote(out, fmt.Sprintf("原本 %d bytes", len(text))) {
+	if !hasNote(out, fmt.Sprintf("originally %d bytes", len(text))) {
 		t.Errorf("the note must report the real size: %v", out["notes"])
 	}
 	if b := len(res.Content[0].Text); b > 8192+2048 {
@@ -919,7 +919,7 @@ func TestPollLimitCutLeavesWaitingOut(t *testing.T) {
 	if v, ok := out["oldest_s"].(float64); !ok || v < 29 {
 		t.Errorf("oldest_s should still say how long the leftovers waited, got %v", out["oldest_s"])
 	}
-	if !hasNote(out, "請立刻再 poll 一次") {
+	if !hasNote(out, "poll again right away") {
 		t.Errorf("the cut-short note is a different fact from waiting and must stay: %v", out["notes"])
 	}
 }

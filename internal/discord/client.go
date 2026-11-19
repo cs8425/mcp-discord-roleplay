@@ -26,10 +26,15 @@ import (
 // channels resolve), messages in guilds we are in, and DMs.
 //
 // withContent adds Message Content, the one PRIVILEGED intent we use. It has to
-// be switched on in the Discord Developer Portal as well; an operator who left
-// it off, or who does not want a privileged intent at all, passes false and
-// then simply never receives message text. Mentions, attachments and embeds are
-// not gated by it and arrive either way.
+// be switched on in the Discord Developer Portal as well. Whether declaring it
+// changes anything is not settled from here: the app's Message Content setting
+// in the Portal is what decides, and we have watched text arrive with the bit
+// undeclared and text withheld with it declared (docs/DESIGN.md §7 keeps both
+// observations). So pass false to mean "I do not want a privileged bit", not
+// "my messages will come back empty" -- the old wording promised that, and it
+// also claimed attachments survive either way, which the Portal experiment
+// disproved: when the setting is off, content, embeds, attachments and
+// components go empty together, on the REST paths too.
 func Intents(withContent bool) discordgo.Intent {
 	i := discordgo.IntentsGuilds |
 		discordgo.IntentsGuildMessages |
