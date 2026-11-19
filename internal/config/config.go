@@ -73,6 +73,18 @@ const (
 	EmojiText   = "text"   // leave the raw <:name:id> codes, create no attachment
 )
 
+// What the read path may do about an author's guild nickname (Config.NickLookup).
+// The reason this needs a switch at all is that Discord's REST message object
+// carries no `member` field: it appears in MESSAGE_CREATE / MESSAGE_UPDATE /
+// INTERACTIONS_CREATE only. So the very same person reads as "tapris" on the
+// gateway path and as their global name on history/get, and the only ways to fix
+// it cost something different -- the state cache is free, a member fetch is one
+// request per author. Off buys back the old behaviour, nothing else.
+const (
+	NickCache = "cache" // state cache first; on a miss, one member fetch, and the answer is written back
+	NickOff   = "off"   // never look: read rows keep the author's global name
+)
+
 // ParseMediaMode validates a user supplied media mode.
 func ParseMediaMode(s string) (MediaMode, error) {
 	switch strings.ToLower(strings.TrimSpace(s)) {
@@ -120,6 +132,10 @@ type Config struct {
 	ReadTimeout      time.Duration
 	HistoryMaxBytes  int
 	ChannelsMaxBytes int
+
+	// NickLookup is NickCache|NickOff: whether history/get resolve the guild
+	// nickname a REST message object does not carry. See the constants above.
+	NickLookup string
 
 	// --- inbound media policy -------------------------------------------------
 	Media        map[string]MediaMode // key: image|audio|video|other
@@ -223,11 +239,13 @@ func Load(args []string) (*Config, error) {
 	fs.Var(&origins, "origin", "allowed CORS Origin for http transport (repeatable)")
 
 	// Message Content is the only PRIVILEGED intent this server asks for, so it is
-	// the one that can be dropped: a bot whose portal toggle is off (or whose
-	// operator does not want a privileged intent at all) still gets MESSAGE_CREATE,
-	// just with an empty content. Mentions, attachments and embeds are NOT gated by
-	// this intent, so they keep arriving.
-	fs.BoolVar(&c.NoMessageContent, "no-message-content", false, "do not request the privileged Message Content intent: incoming text will always be empty, only attachments/embeds/mentions describe the message")
+	// the one that can be dropped -- and dropping it is what keeps us connectable
+	// while the Portal toggle moves. But what we DECLARE is not what we GET: live on
+	// 2026-11-19 the flag was on (bit undeclared) and a guild message naming nobody
+	// still arrived WITH text while the Portal toggle was on; with the toggle off,
+	// only @-mentions and DMs carried it. Mentions, attachments and embeds are not
+	// gated by this intent either way.
+	fs.BoolVar(&c.NoMessageContent, "no-message-content", false, "do not request the privileged Message Content intent at IDENTIFY; whether Discord sends 'text' at all is decided by the app's Message Content setting in the Developer Portal (observed both ways -- see docs/DESIGN.md §7)")
 
 	fs.IntVar(&c.PollMinWait, "poll-min-wait", 5, "smallest max_wait (seconds) a poll may request")
 	fs.IntVar(&c.PollMaxWait, "poll-max-wait", 600, "largest max_wait (seconds) a poll may request")
@@ -241,6 +259,8 @@ func Load(args []string) (*Config, error) {
 	fs.DurationVar(&c.ReadTimeout, "read-timeout", 10*time.Second, "deadline for one REST read (history/get/channels); discordgo's own default is 20s and its 429 retry sleep is disabled on this path")
 	fs.IntVar(&c.HistoryMaxBytes, "history-max-bytes", 4000, "budget for one history answer (-1 = no cap); messages are dropped from the OLDEST end and the answer says it did")
 	fs.IntVar(&c.ChannelsMaxBytes, "channels-max-bytes", 4000, "budget for one channels answer (-1 = no cap); channel lists are trimmed from the tail and the answer says it did")
+	fs.StringVar(&c.NickLookup, "nick-lookup", NickCache,
+		"how history/get name an author: cache (state cache first, one member fetch per author it has never seen, answer written back for next time) | off (never look; a REST row shows the global name while poll shows the guild nickname)")
 
 	fs.StringVar(&c.mImage, "media-image", "inline", "policy for inbound images: inline|save|skip")
 	fs.StringVar(&c.mAudio, "media-audio", "skip", "policy for inbound audio (skip = never burn tokens on voice)")
@@ -430,6 +450,15 @@ func (c *Config) finalize() error {
 		return fmt.Errorf("media-sticker: %w", perr)
 	}
 	c.MediaSticker = stickerMode
+
+	// 3c. the read path's nickname lookup. Normalized like the two above so the
+	// read code compares against the constants.
+	c.NickLookup = strings.ToLower(strings.TrimSpace(c.NickLookup))
+	switch c.NickLookup {
+	case NickCache, NickOff:
+	default:
+		return fmt.Errorf("nick-lookup: invalid value %q (want cache|off)", c.NickLookup)
+	}
 
 	// 4. write-side paths
 	var err error
@@ -640,6 +669,10 @@ func (c *Config) MediaFor(kind string) MediaMode {
 // content: the queue still fills up, but 'text' says nothing.
 func (c *Config) MessageContentEnabled() bool { return !c.NoMessageContent }
 
+// NickLookupEnabled is whether the read path may go looking for the guild
+// nickname a REST message object does not carry (see NickCache / NickOff).
+func (c *Config) NickLookupEnabled() bool { return c.NickLookup != NickOff }
+
 // SaveEnabled reports whether the save mode is available. --media-save-max-bytes=0
 // is the switch that turns it off; an empty --media-out can only mean the same
 // thing, because validate refuses a non-zero cap without a directory.
@@ -779,6 +812,7 @@ func (c *Config) Audit() map[string]any {
 		"agent":           c.AgentID,
 		"transport":       c.Transport,
 		"message_content": c.MessageContentEnabled(),
+		"nick_lookup":     c.NickLookup,
 		"token_source":    c.TokenSource,
 		"token":           c.RedactedToken(),
 		"poll": map[string]any{

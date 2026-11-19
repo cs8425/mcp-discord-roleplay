@@ -60,13 +60,16 @@ const (
 	guildsPerPage       = 200 // Discord's own cap for /users/@me/guilds
 )
 
-// readSeam is the test seam for the REST reads: the four session calls this
+// readSeam is the test seam for the REST reads: the five session calls this
 // file makes, in the shapes this file wants. It stays nil in production.
 type readSeam struct {
 	messages      func(ctx context.Context, channelID string, limit int, before, after, around string) ([]*discordgo.Message, error)
 	message       func(ctx context.Context, channelID, messageID string) (*discordgo.Message, error)
 	guilds        func(ctx context.Context, limit int) ([]*discordgo.UserGuild, error)
 	guildChannels func(ctx context.Context, guildID string) ([]*discordgo.Channel, error)
+	// guildMember is the nickname lookup of applyNick. A seam that leaves it nil
+	// simply gets no nickname enrichment, which is --nick-lookup=off in shape.
+	guildMember func(ctx context.Context, guildID, userID string) (*discordgo.Member, error)
 }
 
 // ReadHooks is the same three questions the read tools ask, answerable by a
@@ -120,6 +123,9 @@ func (c *Client) reader() (*readSeam, *SendError) {
 		},
 		guildChannels: func(ctx context.Context, g string) ([]*discordgo.Channel, error) {
 			return sess.GuildChannels(g, opts(ctx)...)
+		},
+		guildMember: func(ctx context.Context, g, u string) (*discordgo.Member, error) {
+			return sess.GuildMember(g, u, opts(ctx)...)
 		},
 	}, nil
 }
@@ -218,8 +224,10 @@ func (c *Client) History(ctx context.Context, q HistoryQuery) ([]*bus.Event, err
 	}
 
 	events := make([]*bus.Event, 0, len(msgs))
+	// One page, one probe set: see applyNick for why the dedupe is per call.
+	seen := make(map[string]struct{})
 	for i := len(msgs) - 1; i >= 0; i-- {
-		if ev := c.event(msgs[i], q.Name); ev != nil {
+		if ev := c.event(ctx, r, msgs[i], q.Name, seen); ev != nil {
 			events = append(events, ev)
 		}
 	}
@@ -254,7 +262,7 @@ func (c *Client) GetOne(ctx context.Context, channelID, messageID, name string) 
 	if err != nil {
 		return nil, c.readError("get", err, start)
 	}
-	ev := c.event(m, name)
+	ev := c.event(ctx, r, m, name, map[string]struct{}{})
 	if ev == nil {
 		return nil, &SendError{Code: CodeAPIError, Msg: "discord returned no message"}
 	}
@@ -264,9 +272,15 @@ func (c *Client) GetOne(ctx context.Context, channelID, messageID, name string) 
 }
 
 // event turns one message -- gateway or REST -- into the bus.Event the rest of
-// the server speaks. normalize is the single mapping; the only thing added here
-// is the channel label, for channels the state cache has never seen.
-func (c *Client) event(m *discordgo.Message, name string) *bus.Event {
+// the server speaks. normalize is the single mapping; what is added here are the
+// two things a REST message object does not carry: the channel label (for
+// channels the state cache has never seen) and the author's guild nickname.
+//
+// `seen` is the per-call dedupe for that nickname lookup, so that one page of 50
+// messages from a stranger the cache has never met costs at most ONE member
+// request, whether that request succeeds or fails. A caller with no page in mind
+// passes a fresh map, as get does.
+func (c *Client) event(ctx context.Context, r *readSeam, m *discordgo.Message, name string, seen map[string]struct{}) *bus.Event {
 	if m == nil {
 		return nil
 	}
@@ -277,7 +291,94 @@ func (c *Client) event(m *discordgo.Message, name string) *bus.Event {
 	if ev.ChannelName == "" && name != "" {
 		ev.ChannelName = name
 	}
+	c.applyNick(ctx, r, ev, m, seen)
 	return ev
+}
+
+// applyNick gives a row read over REST the same author label the gateway would
+// have given it.
+//
+// Discord sends `member` only in MESSAGE_CREATE / MESSAGE_UPDATE /
+// INTERACTIONS_CREATE; GET /channels/{id}/messages answers with neither
+// `member` nor `guild_id`. So normalize's nickname branch can never fire here
+// and the author silently degrades to their global name: one person, two
+// spellings, in the same product, depending on whether they happened to speak
+// while we were listening. Guild id and author id are the only pair that
+// identifies a nickname, and a REST row gives us neither, so the guild comes
+// from the channel we already resolved.
+//
+// Cheapest thing first: the state cache, which GUILD_CREATE fills for guilds
+// under discordgo's large_threshold (250) and rememberMember fills from every
+// message that arrives; then one GET /guilds/{g}/members/{u} for an author even
+// that has never shown us, written back so the next page is free. A cached
+// member with an empty Nick IS an answer ("no nickname here") and costs nothing;
+// only a cache miss goes to the network. --nick-lookup=off skips the lot and
+// keeps today's global name.
+func (c *Client) applyNick(ctx context.Context, r *readSeam, ev *bus.Event, m *discordgo.Message, seen map[string]struct{}) {
+	if ev == nil || m == nil || m.Author == nil || !c.nickLookupOn() {
+		return
+	}
+	if m.Member != nil {
+		return // a gateway-shaped object: normalize already had the nickname in hand
+	}
+	sess := c.Session()
+	if sess == nil || sess.State == nil {
+		return
+	}
+	guildID := m.GuildID
+	if guildID == "" {
+		if ch := c.lookupChannel(sess, m.ChannelID); ch != nil {
+			guildID = ch.GuildID
+		}
+	}
+	if guildID == "" {
+		return // a DM has no nickname, and a channel state never saw has no guild to ask
+	}
+	if mem, err := sess.State.Member(guildID, ev.Author.ID); err == nil {
+		if mem != nil && mem.Nick != "" {
+			ev.Author.Name = mem.Nick
+		}
+		return
+	}
+	if r == nil || r.guildMember == nil || seen == nil {
+		return
+	}
+	key := guildID + "/" + ev.Author.ID
+	if _, ok := seen[key]; ok {
+		return
+	}
+	seen[key] = struct{}{}
+	mem, err := r.guildMember(ctx, guildID, ev.Author.ID)
+	if err != nil {
+		// Not a failure of the read the caller asked for: the row is still real,
+		// it just names its author the way Discord's REST object does.
+		c.log.Debug("nick lookup failed", "guild", guildID, "author", ev.Author.ID,
+			"message", m.ID, "err", err)
+		return
+	}
+	if mem == nil {
+		return
+	}
+	// discordgo's memberAdd keys on member.User.ID and replaces the stored member
+	// wholesale, so fill in the identity before handing it over (client.go).
+	if mem.GuildID == "" {
+		mem.GuildID = guildID
+	}
+	if mem.User == nil {
+		mem.User = &discordgo.User{ID: ev.Author.ID}
+	}
+	if e := sess.State.MemberAdd(mem); e != nil {
+		c.log.Debug("nick lookup not cached", "guild", guildID, "author", ev.Author.ID, "err", e)
+	}
+	if mem.Nick != "" {
+		ev.Author.Name = mem.Nick
+	}
+}
+
+// nickLookupOn is --nick-lookup with the courtesy a config-less test client gets:
+// the same answer as the flag's own default.
+func (c *Client) nickLookupOn() bool {
+	return c.cfg == nil || c.cfg.NickLookupEnabled()
 }
 
 // ChannelInfo and GuildInfo are our own words for what Discord lists. The tools

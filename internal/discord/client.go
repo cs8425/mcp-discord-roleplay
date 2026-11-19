@@ -178,8 +178,14 @@ func (c *Client) Start(ctx context.Context) error {
 		"intents", strings.Join(IntentsList(c.cfg.MessageContentEnabled()), ","),
 		"token", c.cfg.RedactedToken())
 	if !c.cfg.MessageContentEnabled() {
-		c.log.Warn("message content intent is off: incoming 'text' will be empty, " +
-			"only attachments, embeds and mentions describe what was said")
+		// A fact about OURS, not about the gateway: live shows Discord decides
+		// whether `text` comes through by the app's Portal setting, not by what we
+		// declare -- with the toggle on, a guild message naming nobody still arrived
+		// with text; with it off, only @-mentions and DMs did. So this warns about
+		// the declaration we skipped and stops promising an emptiness we do not own.
+		c.log.Warn("message content intent is off: we do not declare the privileged Message Content bit at IDENTIFY; " +
+			"'text' may still arrive -- that is decided by the app's Message Content setting in the Developer Portal, " +
+			"observed both ways (see docs/DESIGN.md §7)")
 	}
 
 	// v0.29.0 keeps the URL of the *connected* socket private (Ready only gained
@@ -343,6 +349,12 @@ func (c *Client) onMessageCreate(s *discordgo.Session, m *discordgo.MessageCreat
 	c.snap.LastEventAt = time.Now()
 	c.mu.Unlock()
 
+	// The member object riding on this event is the cheapest nickname we will
+	// ever get for this person, and the read path lives off it. Before normalize,
+	// because the fact is about the author, not about whether anybody here is
+	// allowed to read this message.
+	c.rememberMember(s, m.Message)
+
 	ev := c.normalize(s, m.Message)
 
 	// Our own echo never enters a queue. The caller already has this message
@@ -387,6 +399,51 @@ func agentIDsOf(aud []router.AudienceEntry) []string {
 		out = append(out, a.Agent)
 	}
 	return out
+}
+
+// rememberMember puts the guild member that rides on MESSAGE_CREATE into the
+// state cache, which discordgo does not do for itself: its onState handler for a
+// message only calls MessageAdd (state.go, `case *MessageCreate`), so the partial
+// member object a message carries is thrown away. That leaves GUILD_CREATE as the
+// cache's only member source -- which Discord omits for guilds above
+// large_threshold, and which we can never refresh, because we do not subscribe to
+// GUILD_MEMBERS. Feeding it here is what makes `history` able to name a person the
+// way `poll` already did, at the cost of a map write.
+//
+// Only a NON-EMPTY nick is written. The member object is partial and Go cannot
+// tell "the field was not sent" from "the nickname was cleared" -- both land as ""
+// -- while memberAdd REPLACES the stored member (`*m = *member`, keeping only
+// JoinedAt). Writing an empty one would let a single message erase knowledge
+// GUILD_CREATE paid for. The identity fields are filled in from the message for
+// the same reason: memberAdd dereferences member.User.ID, and the member object
+// of an event is not guaranteed to carry either guild_id or user.
+//
+// This runs regardless of --nick-lookup: keeping the cache warm costs a map write,
+// so turning the read-side lookup back on needs no restart paying for it again.
+func (c *Client) rememberMember(s *discordgo.Session, m *discordgo.Message) {
+	if s == nil || s.State == nil || m == nil || m.Member == nil || m.Member.Nick == "" {
+		return
+	}
+	guildID := m.GuildID
+	if guildID == "" {
+		guildID = m.Member.GuildID
+	}
+	if guildID == "" {
+		return // nothing to key on, and a DM carries no member anyway
+	}
+	user := m.Member.User
+	if user == nil {
+		user = m.Author
+	}
+	if user == nil || user.ID == "" {
+		return
+	}
+	mem := *m.Member // a copy: we hand discordgo a pointer it will keep
+	mem.GuildID = guildID
+	mem.User = user
+	if err := s.State.MemberAdd(&mem); err != nil && err != discordgo.ErrStateNotFound {
+		c.log.Debug("member cache write failed", "guild", guildID, "author", user.ID, "err", err)
+	}
 }
 
 // normalize converts a discordgo message into a bus.Event. Only the in-memory

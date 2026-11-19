@@ -237,6 +237,14 @@ func selftest(cfg *config.Config, rt *router.Router, logger *slog.Logger) int {
 		report(true, "intents: %s (Message Content intent OFF by --no-message-content: incoming text is usually empty; @-mentions, DMs and our own sends still carry it)",
 			strings.Join(discord.IntentsList(false), "|"))
 	}
+	// A REST message object carries no `member` and we do not subscribe to
+	// GUILD_MEMBERS, so --nick-lookup is what keeps history/get from naming a
+	// person differently than poll already does.
+	if cfg.NickLookupEnabled() {
+		report(true, "author names: history/get read the guild nickname from the state cache, and fetch one guild member only for an author that cache has never seen (--nick-lookup=cache|off)")
+	} else {
+		report(true, "author names: --nick-lookup=off, so history/get show an author's global name while poll shows the guild nickname")
+	}
 
 	routingLabel := cfg.RoutingFile
 	switch {
