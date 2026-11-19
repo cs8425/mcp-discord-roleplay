@@ -845,6 +845,84 @@ func TestPollEmptyAnswerNamesWhatIsWaiting(t *testing.T) {
 	}
 }
 
+// F-4: those hints used to be a consolation prize for a poll that took nothing, so
+// a caller handed one message out of three was told `remaining:2` and nothing about
+// why. They describe the queue, not the caller's hands -- and the shape live showed
+// on 2026-11-19 19:26 (one DM delivered, two guild messages held by `targets`, no
+// explanation anywhere) is what this pins.
+func TestPollWaitingRidesAlongWithMessages(t *testing.T) {
+	d := newDeps(t, routingCfg(t, "-poll-jitter-pct=0"))
+	connected(d)
+
+	// Oldest first as queued: two messages from a channel this caller did not ask
+	// about, then the one from the DM it did.
+	first := evMsg("m1", "in rp-main")
+	first.Ts = time.Now().Add(-4 * time.Second)
+	second := evMsg("m2", "also rp-main")
+	second.Ts = time.Now().Add(-3 * time.Second)
+	asked := evMsg("m3", "in the DM")
+	asked.Target = "dm:222333444555666777"
+	asked.ChannelName = "Ami"
+	asked.Ts = time.Now().Add(-2 * time.Second)
+	push(t, d, "default", first, second, asked)
+
+	out := pollOK(t, d, `{"targets":["ami"],"max_wait":1}`)
+	wantStr(t, out, "reason", "messages")
+	if list := msgs(t, out); len(list) != 1 || !strings.Contains(wireText(t, out, 0), "DM") {
+		t.Fatalf("the one in-scope message must be delivered, got %v", list)
+	}
+	wantNum(t, out, "remaining", 2)
+	wantStr(t, out, "waiting", "2 target")
+	if got := keySet(out); got != "messages,oldest_s,reason,remaining,waiting" {
+		t.Errorf("keys = %s, want the batch plus what is still queued", got)
+	}
+	// oldest_s is the front of the queue, not the front of what this caller cares
+	// about: the two held messages are older than the delivered one.
+	if v, ok := out["oldest_s"].(float64); !ok || v < 4 {
+		t.Errorf("oldest_s = %v, want the ~4 seconds the oldest held message waited", out["oldest_s"])
+	}
+}
+
+// Being cut short is not the same as being filtered, and the two must not be
+// merged into one signal: a poll that stopped at `limit` left messages behind it
+// never looked at, so there is nothing to name in `waiting` -- while the note that
+// says to poll again stays, because that is the budget's story.
+func TestPollLimitCutLeavesWaitingOut(t *testing.T) {
+	d := newDeps(t, routingCfg(t, "-poll-jitter-pct=0"))
+	connected(d)
+	for i := 0; i < 3; i++ {
+		e := evMsg(fmt.Sprintf("m%d", i), fmt.Sprintf("msg %d", i))
+		e.Ts = time.Now().Add(-30 * time.Second)
+		push(t, d, "default", e)
+	}
+
+	out := pollOK(t, d, `{"max_wait":1,"limit":1}`)
+	wantNum(t, out, "remaining", 2)
+	if _, bad := out["waiting"]; bad {
+		t.Errorf("no filter rejected anything, so waiting stays absent: %v", out["waiting"])
+	}
+	if v, ok := out["oldest_s"].(float64); !ok || v < 29 {
+		t.Errorf("oldest_s should still say how long the leftovers waited, got %v", out["oldest_s"])
+	}
+	if !hasNote(out, "請立刻再 poll 一次") {
+		t.Errorf("the cut-short note is a different fact from waiting and must stay: %v", out["notes"])
+	}
+}
+
+// The other edge: a poll that takes everything has nothing left to describe, so the
+// hints must not show up merely because the call succeeded.
+func TestPollCaughtUpAnswerCarriesNoWaiting(t *testing.T) {
+	d := newDeps(t, routingCfg(t, "-poll-jitter-pct=0"))
+	connected(d)
+	push(t, d, "default", evMsg("m1", "a"), evMsg("m2", "b"))
+
+	out := pollOK(t, d, `{"max_wait":1}`)
+	wantStr(t, out, "reason", "messages")
+	if got := keySet(out); got != "messages,reason" {
+		t.Errorf("an answer that drained the queue must not grow hints, got %s", got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // small helpers
 // ---------------------------------------------------------------------------

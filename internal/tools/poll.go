@@ -6,10 +6,10 @@
 // restart empties the queue (by design, see internal/bus), which is why
 // catching up on older messages is the history tool's job (M3), not poll's.
 //
-// An answer that takes nothing says one of two things, and the wire tells them
-// apart without a second call: one key means nothing arrived, while `remaining`
-// plus `waiting` mean the queue was NOT empty and this call's own filters refused
-// what was in it.
+// Anything left behind says so: whenever `remaining` is present, `waiting` and
+// `oldest_s` ride along, whether or not this call also took messages (F-4). One
+// key therefore means nothing arrived at all; `remaining` plus `waiting` mean the
+// queue was NOT empty and this call's own filters refused what was in it.
 //
 // Two limits keep a reply inside a model context window:
 //
@@ -82,7 +82,7 @@ func pollTool(prefix string) *mcp.Tool {
 			"reason=disconnected means the gateway was not listening during that wait, so nothing could have arrived; " +
 			"reason=cancelled/shutdown means this answer was not delivered. " +
 			"If remaining is present, that many messages are still queued — poll again right away. " +
-			"An empty answer that carries waiting was not a quiet channel: those messages were turned away by your own filters, and waiting names them (bot|mentions|target|channel|from) while oldest_s says how long the oldest has been waiting. " +
+			"Whenever waiting is present it names, by count, the filters that turned messages away in this pass (bot|mentions|target|channel|from), and oldest_s says how long the oldest queued message has been waiting; they ride along with remaining, so an answer that took some messages still says why the rest stayed behind. waiting only counts what this pass scanned, so it can be smaller than remaining -- that is scope, not loss. " +
 			"If dropped is present, messages were overwritten while nobody polled; poll more often. " +
 			"A long message text may be cut to fit the server's byte budget, and a note then says how big it really was; only text is ever cut, attachments are always listed. " +
 			"author_id is the speaker's Discord id: quote it as to:\"dm:<id>\" to answer that person in DMs even when they have no alias. " +
@@ -333,8 +333,10 @@ func (d *Deps) handlePoll(ctx context.Context, call *mcp.Call) (*mcp.ToolResult,
 	}
 
 	if st.stopped {
-		// Only worth saying when this call was cut short: leftovers that this
-		// poll's own filter rejects are none of the caller's business yet.
+		// Kept deliberately, and it is not redundant with `waiting`: this note says
+		// the call was CUT SHORT by a budget, while `waiting` says leftovers were
+		// REJECTED by the caller's own filters. Two different reasons for leftovers,
+		// and only one of them is the caller's doing.
 		notes = append(notes, "你的佇列裡還有 "+strconv.Itoa(remaining)+
 			" 則，請立刻再 poll 一次")
 	}
@@ -370,6 +372,11 @@ func (d *Deps) handlePoll(ctx context.Context, call *mcp.Call) (*mcp.ToolResult,
 		count: len(msgs), remaining: remaining, partial: st.stopped,
 		bytes: used, notes: notes, messages: msgs,
 		dropped: queueDropped(q),
+		// F-4: the same two hints an empty answer gets. `waiting` covers only what
+		// this pass scanned, so it may honestly be smaller than `remaining`; that is
+		// a scope difference, not a lost message.
+		waiting: st.renderHeld(),
+		oldestS: oldestWaited(q),
 	}))
 	// The JSON answer occupies content[0]; every media block lands after it, in
 	// the order the messages were read. That is what makes content_index
@@ -1030,9 +1037,10 @@ type pollMeta struct {
 	messages  []pollMessage
 	dropped   uint64
 
-	// waiting and oldestS describe what is STILL queued on an answer that took no
-	// messages, so the caller learns whether the channel was quiet or its own
-	// filters were narrow. Both stay zero when the queue is empty.
+	// waiting and oldestS describe what is STILL queued on any answer that leaves
+	// something behind (F-4), so the caller learns whether the channel was quiet or
+	// its own filters were narrow -- even when this very call also handed messages
+	// over. Both stay zero when the queue is empty.
 	waiting string
 	oldestS float64
 }
@@ -1048,13 +1056,16 @@ type pollWire struct {
 	Remaining int       `json:"remaining,omitempty"` // absent means caught up
 	Dropped   uint64    `json:"dropped,omitempty"`
 	Notes     []string  `json:"notes,omitempty"`
-	// Waiting names, by count, the filters that turned messages away on a pass that
-	// came back empty ("2 bot, 1 mentions"). It only appears when the queue was NOT
-	// empty, which is the whole point: without it a caller cannot tell "nobody
-	// spoke" from "nobody you asked about spoke", and would have to poll again with
-	// a different filter to find out. OldestS rides along for the same reason —
-	// three messages that have waited four minutes are a different problem from
-	// three that arrived a second ago.
+	// Waiting names, by count, the filters that turned messages away in this pass
+	// ("2 bot, 1 mentions"). It appears whenever the queue was NOT empty at the end
+	// of the call, empty-handed or not (F-4) -- which is the whole point: without it
+	// a caller cannot tell "nobody spoke" from "nobody you asked about spoke", and
+	// would have to poll again with a different filter to find out. Its counts cover
+	// only what this pass scanned, so they can be smaller than Remaining. OldestS
+	// rides along for the same reason -- three messages that have waited four minutes
+	// are a different problem from three that arrived a second ago -- and it measures
+	// the oldest queued message whoever that one was waiting for, so it need not line
+	// up with Waiting's tally.
 	Waiting string  `json:"waiting,omitempty"`
 	OldestS float64 `json:"oldest_s,omitempty"`
 }
@@ -1072,20 +1083,25 @@ func (d *Deps) pollEnvelope(m pollMeta) pollWire {
 		reason = "disconnected"
 	}
 	w := pollWire{Reason: reason}
-	// With messages there is everything to say: the batch, what is left, what was
-	// overwritten. Without them there are two very different cases, and the field
-	// count is what tells them apart.
+	// With messages there is the batch, the notes, and what was overwritten. Without
+	// them the two cases -- nobody spoke, or nobody you asked about spoke -- are told
+	// apart by whether the leftovers block below fires at all.
 	if m.count > 0 {
 		w.Messages = wireMessages(m.messages)
 		w.Remaining = m.remaining
 		w.Dropped = m.dropped
 		w.Notes = m.notes
 	} else if m.remaining > 0 {
-		// Empty hands, non-empty queue: those messages were seen and turned away.
 		w.Remaining = m.remaining
+		w.Dropped = m.dropped
+	}
+	// F-4: what stayed behind is worth reporting on either kind of answer, so the
+	// hints are gated on the queue and not on the caller's hands. A caller who got
+	// one message of three still needs to know why the other two are not theirs yet.
+	// An empty queue costs exactly one key, as before.
+	if w.Remaining > 0 {
 		w.Waiting = m.waiting
 		w.OldestS = m.oldestS
-		w.Dropped = m.dropped
 	}
 	d.logPoll(m)
 	return w
@@ -1113,11 +1129,25 @@ func (d *Deps) emptyHanded(q *bus.Queue, st *drainState, reason, agent string, s
 		if st != nil {
 			m.waiting = st.renderHeld()
 		}
-		if e := q.Oldest(); e != nil && !e.Ts.IsZero() {
-			m.oldestS = round1(time.Since(e.Ts).Seconds())
-		}
+		m.oldestS = oldestWaited(q)
 	}
 	return m
+}
+
+// oldestWaited answers "how long has the oldest thing in this queue been waiting",
+// for a queue the caller is already done with. It is a peek and not a claim: the
+// answer describes whoever happens to be queued, including messages this pass
+// never looked at, so it need not line up with waiting's counts. nil-safe, because
+// both the empty-handed path and the loaded one call it.
+func oldestWaited(q *bus.Queue) float64 {
+	if q == nil {
+		return 0
+	}
+	e := q.Oldest()
+	if e == nil || e.Ts.IsZero() {
+		return 0
+	}
+	return round1(time.Since(e.Ts).Seconds())
 }
 
 // logPoll writes the one bookkeeping line a poll leaves behind: every number
