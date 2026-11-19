@@ -103,7 +103,7 @@ func historyTool(prefix string) *mcp.Tool {
 			"Bots are skipped unless include_bots is true -- that includes this server's own messages, which " + ToolName(prefix, "poll") + " never shows you. " +
 			"Attachments are listed with their url but not downloaded here (media:\"url\", reason:\"policy\"): call " + ToolName(prefix, "get") + " with the message id when you want the bytes. " +
 			"If the answer is bigger than the server's --history-max-bytes, whole rows are dropped from the OLDEST end and a note says how many; a single row too big to fit is still shipped rather than dropped. " +
-			"The text comes from Discord's stored message, so it is not limited to what arrived while you were online.",
+			"The text is Discord's stored message, so it answers for time before this process ran. We report whatever Discord returned: an empty text is Discord's answer (no content, or no access to it) and we do not guess which.",
 		InputSchema: mcp.Schema{
 			Type:        mcp.TypeObject,
 			Description: "target is required; everything else is optional.",
@@ -140,11 +140,15 @@ func historyTool(prefix string) *mcp.Tool {
 	}
 }
 
-// historyWire is the answer. Target and Channel are stated once instead of on
-// every row (see the file header): the rows are all from one place.
+// historyWire is the answer. Target, Channel and DM are stated once instead of on
+// every row (see the file header): the rows are all from one place. DM is here and
+// not on the rows because a message read back over REST does not carry guild_id --
+// only the gateway does -- so a read has to answer it from the rule it resolved.
+// Passing the rows through buildMessage is not the bug; letting the row guess is.
 type historyWire struct {
 	Target   string    `json:"target"`
 	Channel  string    `json:"channel"`
+	DM       bool      `json:"dm,omitempty"`
 	Messages []msgWire `json:"messages,omitempty"`
 	Notes    []string  `json:"notes,omitempty"`
 }
@@ -210,11 +214,29 @@ func (d *Deps) handleHistory(ctx context.Context, call *mcp.Call) (*mcp.ToolResu
 		notes = append(notes, "這個頻道在你要的範圍內沒有讀到的訊息。")
 	}
 
+	// All rows blank is a different fact from no rows, and only the rows can tell them
+	// apart -- so we report it and stop there. Why Discord withholds content is the
+	// operator's call to make in the Portal (Message Content Intent, reviewed at
+	// 10,000+ users); we do not claim to know it from here.
+	if len(kept) > 0 && d.Cfg != nil && !d.Cfg.MessageContentEnabled() {
+		silent := true
+		for _, ev := range kept {
+			if strings.TrimSpace(ev.Text) != "" || len(ev.Embeds) > 0 || len(ev.Attachments) > 0 {
+				silent = false
+				break
+			}
+		}
+		if silent {
+			notes = append(notes, "這頁 text／embeds／attachments 全空：Discord 有回訊息，只是 content 是空的（旗標 --no-message-content 開著）。拿不拿得到 content 是 Discord 那邊的 app 設定，我們不猜原因。")
+		}
+	}
+
 	msgs := make([]pollMessage, 0, len(kept))
 	for _, ev := range kept {
 		m := d.buildMessage(p, ev)
 		m.AgeS = 0    // "since we saw it" is not a fact about a stored message
 		m.Target = "" // same channel on every row: the envelope says it once
+		m.DM = false  // and a REST message cannot know either; see readIsDM
 		for j := range m.Attachments {
 			// Listed, not fetched. Same verdict word poll uses for "the policy
 			// declined this file", because the answer is the same either way.
@@ -230,7 +252,7 @@ func (d *Deps) handleHistory(ctx context.Context, call *mcp.Call) (*mcp.ToolResu
 	// the note has to be priced in, or trimming would stop short and then grow
 	// past the cap the moment it explained itself.
 	build := func(rows []msgWire, dropped int) historyWire {
-		env := historyWire{Target: readTarget(ru, a.Target), Channel: chanID, Messages: rows}
+		env := historyWire{Target: readTarget(ru, a.Target), Channel: chanID, DM: readIsDM(ru), Messages: rows}
 		if dropped > 0 {
 			env.Notes = append(append([]string{}, notes...),
 				"位元組額度（--history-max-bytes="+strconv.Itoa(budget)+"）只裝得下最新的 "+
@@ -265,6 +287,18 @@ func readLabel(ru *router.Rule) string {
 		return ru.Name
 	}
 	return ru.Alias
+}
+
+// readIsDM answers "is this a DM" from the rule we resolved rather than from the
+// message, because the two read endpoints answer with a message object that has no
+// guild_id (the gateway sends one, REST does not) -- so a row built from a read
+// would otherwise call every guild channel a DM, which is exactly what it did.
+// KindMe is a DM to the bot itself. A raw channel:<id> that happens to be a DM is
+// answered wrong by convention and right by nothing: the routing table is the only
+// place that knows, and it is the same answer for all rows of the call, which is
+// why it lives in the envelope.
+func readIsDM(ru *router.Rule) bool {
+	return ru != nil && (ru.Kind == router.KindDM || ru.Kind == router.KindMe)
 }
 
 // readTarget is what the envelope calls the place: the alias the caller can
@@ -367,6 +401,7 @@ func getTool(prefix string) *mcp.Tool {
 type getWire struct {
 	Target  string   `json:"target"`
 	Channel string   `json:"channel"`
+	DM      bool     `json:"dm,omitempty"`
 	Message msgWire  `json:"message"`
 	Notes   []string `json:"notes,omitempty"`
 }
@@ -426,6 +461,7 @@ func (d *Deps) handleGet(ctx context.Context, call *mcp.Call) (*mcp.ToolResult, 
 	m := d.buildMessage(p, ev)
 	m.AgeS = 0    // ditto: this row has a ts, and that is the whole truth
 	m.Target = "" // and the envelope says where it came from, once is enough
+	m.DM = false  // ditto, and it could not have known: REST omits guild_id
 	msgs := []pollMessage{m}
 	kept := []*bus.Event{ev}
 	blocks, mnotes := d.applyMediaWith(ctx, msgs, kept, pick)
@@ -434,7 +470,7 @@ func (d *Deps) handleGet(ctx context.Context, call *mcp.Call) (*mcp.ToolResult, 
 	// get has no byte cap of its own, and that is not an oversight: one message's
 	// text is already bounded by --text-max-runes, so the only thing that could
 	// overflow here is the media, which never counts towards the JSON budget.
-	env := getWire{Target: readTarget(ru, a.Target), Channel: chanID, Message: msgs[0].wire(), Notes: mnotes}
+	env := getWire{Target: readTarget(ru, a.Target), Channel: chanID, DM: readIsDM(ru), Message: msgs[0].wire(), Notes: mnotes}
 	res := jsonResult(env)
 	res.Content = append(res.Content, blocks...)
 	return res, nil

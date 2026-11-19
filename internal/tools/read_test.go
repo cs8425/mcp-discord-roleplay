@@ -114,7 +114,7 @@ func TestHistoryAnswersFromTheStore(t *testing.T) {
 	if first["id"] != "10" || last["id"] != "12" {
 		t.Errorf("rows must stay oldest first with their ids: %v / %v", first["id"], last["id"])
 	}
-	assertRowKeys(t, first, "age_s", "target")
+	assertRowKeys(t, first, "age_s", "target", "dm")
 	if !strings.Contains(fmt.Sprint(out["notes"]), "bot") {
 		t.Errorf("dropping a bot's message silently is exactly what a note is for: %v", out["notes"])
 	}
@@ -190,6 +190,36 @@ func TestHistoryEmptyIsAnAnswerNotAnError(t *testing.T) {
 	}
 }
 
+// TestHistorySaysWhenTheEmptinessIsOurs: "no rows" and "rows with nothing in them" are
+// two different facts, and only the rows can tell them apart. We report which one we
+// got and stop there -- why Discord withholds content is decided over there (Portal
+// setting / review), not by us. So the note names the shape, not a cause.
+func TestHistorySaysWhenTheEmptinessIsOurs(t *testing.T) {
+	d := newDeps(t, routingCfg(t, "-no-message-content"))
+	d.DC.SetReadHooks(discord.ReadHooks{
+		History: func(context.Context, discord.HistoryQuery) ([]*bus.Event, error) {
+			return []*bus.Event{readEvent("30", "", false), readEvent("31", "", false)}, nil
+		},
+	})
+	out := decode(t, callRead(t, d.handleHistory, context.Background(), `{"target":"boss"}`))
+	if !strings.Contains(fmt.Sprint(out["notes"]), "全空") {
+		t.Errorf("a blank page should say it is blank, not just empty: %v", out["notes"])
+	}
+
+	// But it must stay quiet when the channel is merely talking, because the same
+	// sentence on a normal answer is just noise.
+	d2 := newDeps(t, routingCfg(t, "-no-message-content"))
+	d2.DC.SetReadHooks(discord.ReadHooks{
+		History: func(context.Context, discord.HistoryQuery) ([]*bus.Event, error) {
+			return []*bus.Event{readEvent("32", "talking", false)}, nil
+		},
+	})
+	out2 := decode(t, callRead(t, d2.handleHistory, context.Background(), `{"target":"boss"}`))
+	if strings.Contains(fmt.Sprint(out2["notes"]), "全空") {
+		t.Errorf("no noise when the rows have content: %v", out2["notes"])
+	}
+}
+
 func TestHistoryAsksTheReadHalfOfTheACL(t *testing.T) {
 	d := newDeps(t, routingCfg(t))
 	called := 0
@@ -258,7 +288,7 @@ func TestGetReadsOneMessageWithItsOwnChannel(t *testing.T) {
 	if msg["id"] != "55" || msg["text"] != "look" {
 		t.Errorf("message body: %v", msg)
 	}
-	assertRowKeys(t, msg, "age_s", "target")
+	assertRowKeys(t, msg, "age_s", "target", "dm")
 	atts, _ := msg["attachments"].([]any)
 	if len(atts) != 1 {
 		t.Fatalf("the attachment row disappeared: %v", msg["attachments"])
@@ -289,6 +319,48 @@ func TestGetRejectsWhatItCannotDo(t *testing.T) {
 	res = callRead(t, d.handleGet, context.Background(), `{"target":"ghost","message":"55"}`)
 	if decode(t, res)["error"] != "unknown_target" {
 		t.Errorf("wrong reason: %s", res.Content[0].Text)
+	}
+}
+
+// TestReadEnvelopeAnswersDMOnce is the contract the live box taught, not a
+// hypothetical: a message read back over REST carries no guild_id (only the gateway
+// puts one there), so normalize set DM=true on every row we read -- a text channel in
+// a guild answered "dm":true, five times in a row, confidently. The read tools know
+// the channel from the rule they resolved, and one true answer per call beats a
+// guess per row; poll keeps dm per row because a poll really does mix channels.
+func TestReadEnvelopeAnswersDMOnce(t *testing.T) {
+	d := newDeps(t, routingCfg(t))
+	guildish := func(id, text string) *bus.Event {
+		ev := readEvent(id, text, false)
+		ev.DM = true // exactly what a REST message looks like to normalize()
+		return ev
+	}
+	d.DC.SetReadHooks(discord.ReadHooks{
+		History: func(_ context.Context, _ discord.HistoryQuery) ([]*bus.Event, error) {
+			return []*bus.Event{guildish("20", "one")}, nil
+		},
+		Get: func(_ context.Context, _, _ string) (*bus.Event, error) {
+			return guildish("21", "two"), nil
+		},
+	})
+
+	h := decode(t, callRead(t, d.handleHistory, context.Background(), `{"target":"boss"}`))
+	if _, ok := h["dm"]; ok {
+		t.Errorf("a guild channel must not answer dm:true just because REST omitted guild_id: %v", h["dm"])
+	}
+	rows, _ := h["messages"].([]any)
+	if len(rows) != 1 {
+		t.Fatalf("one row expected: %v", h["messages"])
+	}
+	assertRowKeys(t, rows[0].(map[string]any), "dm")
+
+	g := decode(t, callRead(t, d.handleGet, context.Background(), `{"target":"ami","message":"21"}`))
+	if g["dm"] != true {
+		t.Errorf("an alias whose rule is a DM says so once, in the envelope: %v", g)
+	}
+	assertRowKeys(t, g["message"].(map[string]any), "dm")
+	if s, _ := g["channel"].(string); s != "dry-run-dm:222333444555666777" {
+		t.Errorf("a DM target reads the DM channel, not the alias: %q", s)
 	}
 }
 

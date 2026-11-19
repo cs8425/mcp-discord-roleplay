@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/bwmarrin/discordgo"
 
@@ -138,14 +139,31 @@ func (c *Client) readCtx(ctx context.Context) (context.Context, context.CancelFu
 	return context.WithTimeout(ctx, c.readTimeout())
 }
 
+// CodeNoAccess is a read answer for Discord's "Missing Access". classify's word for
+// the same error number (50001) is cannot_send_to_channel, because that is what it
+// means when you post -- but on a read it is a claim about the wrong verb: an agent
+// told "cannot send" goes looking for a write permission it already has, when the
+// real answer is that we may not even look at this channel.
+const CodeNoAccess = "no_access"
+
 // readError turns a REST failure into the shared error type. classify already
 // knows discord's codes; the read-specific part is the wording, because
-// classify's sentences are written for sending.
+// classify's sentences -- and two of its codes -- are written for sending.
 func (c *Client) readError(what string, err error, start time.Time) *SendError {
 	se := classify(err)
 	switch {
 	case se.Code == CodeCancelled:
 		se.Msg = what + " timed out after " + c.readTimeout().String()
+	case se.Code == CodeCannotSend:
+		se.Code = CodeNoAccess
+		msg := strings.TrimSpace(se.Msg)
+		if !strings.ContainsFunc(msg, unicode.IsLetter) {
+			// Not `msg == ""`: when Discord's body carried no message, classify falls
+			// back to the raw HTTP status ("403"), so an emptiness check would leave
+			// the agent with "history: 403" -- a number, not a hint.
+			msg = "no access to this channel"
+		}
+		se.Msg = what + ": " + msg + " (this was a read: View Channel is missing, or the channel is gone)"
 	case se.Msg != "":
 		se.Msg = what + ": " + se.Msg
 	}
