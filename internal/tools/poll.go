@@ -601,7 +601,21 @@ func eventTargets(e *bus.Event) []string {
 	if e.ChannelName != "" {
 		out = append(out, strings.ToLower(e.ChannelName))
 	}
-	return out
+	// normalize() already canonicalizes a DM's Target to "dm:<peer>", so the
+	// explicit dm: entry above is now usually a duplicate (it stays as the
+	// fallback for events built elsewhere, e.g. in tests or by future producers).
+	// Collapse them: this list is also what the audit log prints, and the same
+	// address twice reads like a bug.
+	seen := make(map[string]bool, len(out))
+	uniq := out[:0]
+	for _, t := range out {
+		if seen[t] {
+			continue
+		}
+		seen[t] = true
+		uniq = append(uniq, t)
+	}
+	return uniq
 }
 
 // eventKind names the target kind an event belongs to, which is what a wildcard

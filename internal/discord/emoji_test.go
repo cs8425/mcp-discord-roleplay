@@ -163,8 +163,8 @@ func TestNormalizeEmojiCapKeepsRawCodes(t *testing.T) {
 // and only the codes become placeholders. A mention is not an emoji and must not be
 // touched (mentions_only depends on it).
 func TestNormalizeEmojiInsideSentence(t *testing.T) {
-	ev := normalizeOf(t, emojiMsg("<@477426421900378113> nice <:gaze:1> shot <a:party:2>!"))
-	want := "<@477426421900378113> nice <:gaze:img@1> shot <a:party:img@2>!"
+	ev := normalizeOf(t, emojiMsg("<@700000000000000001> nice <:gaze:1> shot <a:party:2>!"))
+	want := "<@700000000000000001> nice <:gaze:img@1> shot <a:party:img@2>!"
 	if ev.Text != want {
 		t.Errorf("Text = %q,\nwant               %q", ev.Text, want)
 	}

@@ -1207,3 +1207,32 @@ func TestPollSameNameHandlesDoNotCollideWhenRelabeled(t *testing.T) {
 		}
 	}
 }
+
+// normalize() now hands a DM the canonical "dm:<peer>" Target, so the explicit
+// dm: entry eventTargets adds has become a duplicate (it stays as the fallback
+// for events built elsewhere). The list drives alias lookup and is also what the
+// audit log prints, so it must read like a human wrote it: every address once.
+func TestEventTargetsDedupesCanonicalDMLabel(t *testing.T) {
+	e := &bus.Event{
+		Target: "dm:700000000000000001", ChannelID: "700000000000000002", DM: true,
+		Extra: map[string]string{"peer": "700000000000000001"}, ChannelName: "someone",
+	}
+	got := eventTargets(e)
+	seen := map[string]bool{}
+	for _, s := range got {
+		if seen[s] {
+			t.Fatalf("eventTargets returned %q twice: %v", s, got)
+		}
+		seen[s] = true
+	}
+	// Every spelling a caller might reasonably use must still be there.
+	for _, want := range []string{
+		"dm:700000000000000001",
+		"channel:700000000000000002",
+		"someone",
+	} {
+		if !seen[want] {
+			t.Errorf("eventTargets lost %q: %v", want, got)
+		}
+	}
+}

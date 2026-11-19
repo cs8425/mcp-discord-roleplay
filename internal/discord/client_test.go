@@ -153,6 +153,66 @@ func TestNormalizePrefersGuildNickname(t *testing.T) {
 	}
 }
 
+// A DM's canonical address is the peer user, not the DM channel id: routing
+// writes "dm:<user>", discord_send takes that back unchanged, and a DM channel
+// id is something nobody outside Discord can guess or remember. The state cache
+// is usually too fresh to know the channel when a stranger's first message
+// lands (a nil session in these tests is exactly that case: every lookup
+// misses), so the peer falls back to the author id.
+func TestNormalizeDMTargetIsThePeer(t *testing.T) {
+	c, _ := logClient(slog.LevelInfo)
+	c.cfg = testCfg(t)
+
+	msg := &discordgo.Message{
+		ID: "1", ChannelID: "dmchan9", Content: "hi",
+		Author: &discordgo.User{ID: "700000000000000001", Username: "someone"},
+	}
+	ev := c.normalize(nil, msg)
+	if !ev.DM {
+		t.Fatal("a message with no guild id is a DM")
+	}
+	if got, want := ev.Target, "dm:700000000000000001"; got != want {
+		t.Errorf("Target = %q, want %q", got, want)
+	}
+	if got := ev.Extra["peer"]; got != "700000000000000001" {
+		t.Errorf("Extra[peer] = %q, want the author id so dm: filters and routing agree", got)
+	}
+	if ev.ChannelID != "dmchan9" {
+		t.Errorf("ChannelID = %q, want it to stay the DM channel for the audit trail", ev.ChannelID)
+	}
+
+	// A guild message keeps the channel coordinate, and has no peer.
+	msg.GuildID = "g1"
+	if got, want := c.normalize(nil, msg).Target, "channel:dmchan9"; got != want {
+		t.Errorf("guild Target = %q, want %q", got, want)
+	}
+	if c.normalize(nil, msg).Extra["peer"] != "" {
+		t.Error("a guild message must not get a DM peer")
+	}
+}
+
+// "?" is what normalize writes when there is neither an author nor a webhook, so
+// no peer may be invented from it (a DM would get an address that resolves to
+// nothing). A webhook's id is not a user id, but it is the only id available and
+// the event is still addressable, so it becomes the peer.
+func TestNormalizeDMPeerFromMissingOrWebhookAuthor(t *testing.T) {
+	c, _ := logClient(slog.LevelInfo)
+	c.cfg = testCfg(t)
+
+	ev := c.normalize(nil, &discordgo.Message{ID: "2", ChannelID: "c2", Content: "x"})
+	if ev.Target != "channel:c2" {
+		t.Errorf("Target = %q, want the channel coordinate when there is no peer to name", ev.Target)
+	}
+	if ev.Extra["peer"] != "" {
+		t.Errorf("Extra[peer] = %q, want nothing invented for the %q placeholder author", ev.Extra["peer"], "?")
+	}
+
+	hooked := &discordgo.Message{ID: "3", ChannelID: "c3", Content: "x", WebhookID: "w9"}
+	if got, want := c.normalize(nil, hooked).Target, "dm:w9"; got != want {
+		t.Errorf("webhook DM Target = %q, want %q", got, want)
+	}
+}
+
 func TestHeadLogKeepsUTF8AndShortStrings(t *testing.T) {
 	if got := headLog("abc", 10); got != "abc" {
 		t.Errorf("short string changed: %q", got)

@@ -395,7 +395,8 @@ func (c *Client) normalize(s *discordgo.Session, m *discordgo.Message) *bus.Even
 		Text:      m.Content,
 		// Canonical, agent-independent label: aliases differ per agent, so the
 		// shared event carries only the id form and poll resolves the alias for
-		// whoever is asking.
+		// whoever is asking. A DM is overridden to "dm:<peer>" a few lines below,
+		// because that is the spelling routing and discord_send both speak.
 		Target: "channel:" + m.ChannelID,
 	}
 	ev.Time = tz.Format(ev.Ts)
@@ -434,6 +435,28 @@ func (c *Client) normalize(s *discordgo.Session, m *discordgo.Message) *bus.Even
 					ev.ChannelName = name
 				}
 			}
+		}
+	}
+
+	// A DM is addressed by its PEER, not by the DM channel id. Routing writes a
+	// DM target as "dm:<user-snowflake>" (a DM's channel id is per-conversation
+	// noise nobody can guess), so putting that same string on the event means the
+	// address poll prints is always one you can hand straight back to
+	// discord_send — for a target listed in routing.json AND for a stranger whose
+	// DM we opened the moment ago. The state cache is not reliable here: the
+	// first message from a stranger can arrive before CHANNEL_CREATE lands, and a
+	// DM reached through a mutual guild we are not in is never in it at all, so
+	// when it misses we take the author. That is not a fabricated fact: in a 1:1
+	// DM the author IS the peer; in a group DM it is one of them, and "dm:<id>"
+	// routing matches on any participant anyway. A webhook's id is not a user, so
+	// those events (rare in DMs) get the webhook id as peer and are still
+	// sendable to the channel; "?" (no author, no webhook) invents nothing.
+	if ev.DM {
+		if ev.Extra["peer"] == "" && ev.Author.ID != "" && ev.Author.ID != "?" {
+			ev.Extra = setExtra(ev.Extra, "peer", ev.Author.ID)
+		}
+		if peer := ev.Extra["peer"]; peer != "" {
+			ev.Target = "dm:" + peer
 		}
 	}
 

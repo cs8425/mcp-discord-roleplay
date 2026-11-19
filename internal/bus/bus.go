@@ -115,6 +115,10 @@ type Event struct {
 	Time string    `json:"time"`
 	AgeS float64   `json:"age_s,omitempty"`
 
+	// Target is the event's canonical, agent-independent address — the form
+	// routing.json and discord_send both speak: "channel:<id>" for a guild
+	// channel, "dm:<peer-user-id>" for a DM (see normalize). Aliases are
+	// per-agent, so they are resolved at poll time, never stored here.
 	Target      string `json:"target,omitempty"`
 	GuildID     string `json:"guild_id,omitempty"`
 	ChannelID   string `json:"channel_id,omitempty"`

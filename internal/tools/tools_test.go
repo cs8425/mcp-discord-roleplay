@@ -16,7 +16,7 @@ import (
 // --poll-max-bytes budget that is already tight.
 func TestJSONResultKeepsAngleBracketsAndAmpersandsRaw(t *testing.T) {
 	res := jsonResult(map[string]any{
-		"text": "<:gaze:img@1> <@477426421900378113> https://x/y?format=jpg&name=medium",
+		"text": "<:gaze:img@1> <@700000000000000001> https://x/y?format=jpg&name=medium",
 	})
 	if res.IsError {
 		t.Fatalf("marshalling a map must not fail: %+v", res)
