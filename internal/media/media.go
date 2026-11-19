@@ -519,16 +519,28 @@ func readCapped(r io.Reader, n int64) ([]byte, error) {
 	return raw, nil
 }
 
-// saveName builds the on-disk name: <8 hex>-<safe filename>.
+// saveName builds the on-disk name, and it splits into two families because the
+// two kinds of attachment have different secrets to keep.
 //
-// The token is HMAC-shaped — a per-process secret mixed with the attachment ID
-// and the sanitized name — which buys two things at once. It is not guessable
-// from the outside: knowing that a picture was called photo.png does not tell
-// another agent (or the model) which file to open. And it is stable inside one
-// process, so seeing the same attachment twice overwrites the same file
-// instead of leaving a trail of copies behind.
+//   - Uploads: <8 hex>-<safe filename>. The token is HMAC-shaped — a per-process
+//     secret mixed with the attachment ID and the sanitized name — and it buys two
+//     things. It is not guessable: an upload is addressed to one agent, so the
+//     others never see its URL, and a shared --media-out must not turn into a room
+//     where they can read anything they like by guessing a name. And it is stable
+//     inside one process, so seeing the same attachment twice overwrites the same
+//     file instead of leaving a trail of copies behind.
+//   - Emoji and stickers: <id><ext>, no token. Their identity is the CDN id, which
+//     is public — the URL we hand over is cdn.discordapp.com/emojis/<id>.png and the
+//     CDN asks for no auth — so hiding it protects nothing. Dropping the per-process
+//     secret instead makes the name stable across restarts and across agents: whoever
+//     sees the sticker first writes the file, and everyone who sees it later gets that
+//     same file back from the stat check. The extension chain comes from the name
+//     ingress built (a sticker's .apng.png), so the file on disk still says what it is.
 func saveName(a bus.Attachment, secret []byte) string {
 	base := files.SafeName(a.Filename)
+	if cdnNamed(a.Origin) && a.ID != "" {
+		return files.SafeName(a.ID) + extChainOf(base)
+	}
 	h := sha256.New()
 	h.Write(secret)
 	h.Write([]byte{0})
@@ -536,6 +548,24 @@ func saveName(a bus.Attachment, secret []byte) string {
 	h.Write([]byte{0})
 	h.Write([]byte(base))
 	return hex.EncodeToString(h.Sum(nil)[:4]) + "-" + base
+}
+
+// cdnNamed reports whether an origin is a CDN object whose id is public, and whose
+// saved file therefore needs nothing hidden behind it.
+func cdnNamed(origin string) bool {
+	return origin == bus.OriginEmoji || origin == bus.OriginSticker
+}
+
+// extChainOf returns everything from the first dot onwards, so a compound
+// extension survives in one piece: ".apng.png" for "catface.apng.png", ".png" for
+// "42.png", "" for a name with no dot. A sticker whose own name contains a dot
+// keeps the rest of it here too, which is untidy but harmless: the name starts
+// with the id, so nothing can collide with it.
+func extChainOf(name string) string {
+	if i := strings.IndexByte(name, '.'); i >= 0 {
+		return name[i:]
+	}
+	return ""
 }
 
 // newSecret draws the bytes behind that token. crypto/rand does not fail in

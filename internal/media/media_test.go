@@ -379,6 +379,9 @@ func TestProxyURLNotFollowedOffHost(t *testing.T) {
 	}
 }
 
+// The upload family of save names: a token prefix that another process cannot
+// land on by luck, because an upload is addressed to one agent and the others
+// never see its URL.
 func TestSaveNameIsStableAndNotGuessable(t *testing.T) {
 	a := bus.Attachment{ID: "a1", Filename: "../../etc/passwd"}
 	n1 := saveName(a, []byte("secret-one"))
@@ -396,6 +399,69 @@ func TestSaveNameIsStableAndNotGuessable(t *testing.T) {
 	}
 	if !strings.HasSuffix(n1, "-passwd") {
 		t.Errorf("the readable part must survive so a human can recognise the file: %q", n1)
+	}
+}
+
+// The other family: an emoji or a sticker is named by its CDN id, with no token.
+// The id is public information (the URL we hand over already contains it, and the
+// CDN asks for no auth), so hiding it protects nothing -- while dropping it makes
+// the name stable across restarts and across agents.
+func TestSaveNameOfCDNObjectsIsTheId(t *testing.T) {
+	sticker := bus.Attachment{ID: "861289848563957801", Filename: "catface.apng.png", Origin: bus.OriginSticker}
+	emoji := bus.Attachment{ID: "1110036146588749884", Filename: "1110036146588749884.png", Origin: bus.OriginEmoji}
+
+	if got, want := saveName(sticker, []byte("secret-one")), "861289848563957801.apng.png"; got != want {
+		t.Errorf("sticker save name = %q, want %q (the id plus the whole extension chain, no token)", got, want)
+	}
+	if got, want := saveName(emoji, []byte("secret-one")), "1110036146588749884.png"; got != want {
+		t.Errorf("emoji save name = %q, want %q", got, want)
+	}
+	if n := saveName(sticker, []byte("secret-two")); n != saveName(sticker, []byte("secret-one")) {
+		t.Errorf("the name must not depend on the per-process secret: %q vs %q", n, saveName(sticker, []byte("secret-one")))
+	}
+	// Same display name, different sticker: the id is what keeps them apart, now
+	// that there is no hash doing it.
+	twin := bus.Attachment{ID: "900000000000000002", Filename: "catface.apng.png", Origin: bus.OriginSticker}
+	if saveName(twin, nil) == saveName(sticker, nil) {
+		t.Error("two stickers that share a name must not share a file")
+	}
+	// And an upload in the same directory cannot land on an id name by accident,
+	// because it always carries the token and its dash.
+	up := bus.Attachment{ID: "861289848563957801", Filename: "apng.png"}
+	if got := saveName(up, []byte("s")); !strings.HasSuffix(got, "-apng.png") || got == "861289848563957801.apng.png" {
+		t.Errorf("an upload must keep the token prefix: %q", got)
+	}
+}
+
+// The payoff of an un-tokened name: the file one process wrote is the file the
+// next one finds, so a sticker pack that lives in several channels is downloaded
+// once per server, not once per run. An upload deliberately keeps the opposite
+// behaviour -- the isolation is worth the extra fetch.
+func TestSavedStickerIsReusedAcrossProcesses(t *testing.T) {
+	dir := t.TempDir()
+	c := newCDN(t, []byte{0x89, 'P', 'N', 'G', 1})
+	cfg := func() *config.Config {
+		return testCfg(t, "-media-sticker=save", "-media-image=save", "-media-out="+dir)
+	}
+	att := stickerAtt("s5", c.at("/stickers/s5.png"), bus.KindImage)
+
+	h1 := fetcherFor(t, cfg()).NewSession(context.Background()).Handle(att)
+	if h1.Media != MediaFile {
+		t.Fatalf("first save = %q (reason %q), want %q", h1.Media, h1.Reason, MediaFile)
+	}
+	h2 := fetcherFor(t, cfg()).NewSession(context.Background()).Handle(att)
+	if h2.Media != MediaFile || h2.Path != h1.Path {
+		t.Fatalf("a new process must find the same file: %q then %q/%q", h1.Path, h2.Path, h2.Media)
+	}
+	if c.count() != 1 {
+		t.Errorf("the CDN must be asked once across two processes, got %d", c.count())
+	}
+
+	shot := png("u1", c.at("/shot.png"), 5)
+	up1 := fetcherFor(t, cfg()).NewSession(context.Background()).Handle(shot)
+	up2 := fetcherFor(t, cfg()).NewSession(context.Background()).Handle(shot)
+	if up1.Path == "" || up1.Path == up2.Path {
+		t.Errorf("an upload must keep a per-process name, got %q then %q", up1.Path, up2.Path)
 	}
 }
 

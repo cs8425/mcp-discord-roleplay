@@ -67,29 +67,56 @@ func TestNormalizeStickersAppendToText(t *testing.T) {
 	}
 }
 
-// The extension must match what the CDN actually serves, and only the formats
-// that are really images should be classified as images.
+// The URL extension must match what the CDN actually serves, the name we show may
+// say more than that, and only the formats that are really images should be
+// classified as images.
 func TestNormalizeStickerFormats(t *testing.T) {
 	cases := []struct {
-		format int
-		ext    string
-		kind   string
+		format  int
+		fileExt string
+		urlExt  string
+		kind    string
 	}{
-		{1, ".png", bus.KindImage},
-		{2, ".apng", bus.KindImage}, // an APNG is a PNG container: declared image/png
-		{3, ".json", bus.KindOther}, // Lottie: a vector animation, nothing to inline
-		{4, ".gif", bus.KindImage},  // the newer GIF stickers
-		{99, ".png", bus.KindImage}, // unknown: guess the rendition that always exists
+		{1, ".png", ".png", bus.KindImage},
+		{2, ".apng.png", ".png", bus.KindImage}, // named as an APNG, fetched as a PNG
+		{3, ".json", ".json", bus.KindOther},    // Lottie: a vector animation, nothing to inline
+		{4, ".gif", ".gif", bus.KindImage},      // the newer GIF stickers
+		{99, ".png", ".png", bus.KindImage},     // unknown: guess the rendition that always exists
 	}
 	for _, c := range cases {
 		ev := normalizeOf(t, stickerMsg("", &discordgo.StickerItem{ID: "7", Name: "s", FormatType: discordgo.StickerFormat(c.format)}))
 		a := ev.Attachments[0]
-		if !strings.HasSuffix(a.Filename, c.ext) || !strings.HasSuffix(a.URL, c.ext) {
-			t.Errorf("format %d: filename/url = %q / %q, want suffix %s", c.format, a.Filename, a.URL, c.ext)
+		if !strings.HasSuffix(a.Filename, c.fileExt) {
+			t.Errorf("format %d: filename = %q, want suffix %s", c.format, a.Filename, c.fileExt)
+		}
+		if want := cdnStickerBase + "7" + c.urlExt; a.URL != want {
+			t.Errorf("format %d: URL = %q, want %q", c.format, a.URL, want)
 		}
 		if a.Kind != c.kind {
 			t.Errorf("format %d: kind = %s, want %s", c.format, a.Kind, c.kind)
 		}
+	}
+}
+
+// The live bug this pins: an APNG sticker used to be fetched at
+// /stickers/<id>.apng, and the CDN answers that with a 404, so the agent got
+// media:"url" reason:"error" and no picture at all. The name keeps .apng (one
+// step under a .png, which is where the bytes really came from) so a saved
+// sticker is not mistaken for a still image.
+func TestNormalizeAPNGStickerFetchesThePngRendition(t *testing.T) {
+	ev := normalizeOf(t, stickerMsg("", &discordgo.StickerItem{ID: "861289848563957801", Name: "cat", FormatType: 2}))
+	if len(ev.Attachments) != 1 {
+		t.Fatalf("attachments = %d, want 1", len(ev.Attachments))
+	}
+	a := ev.Attachments[0]
+	if want := cdnStickerBase + "861289848563957801.png"; a.URL != want {
+		t.Errorf("URL = %q, want %q (the sticker CDN has no .apng endpoint)", a.URL, want)
+	}
+	if want := "cat.apng.png"; a.Filename != want {
+		t.Errorf("Filename = %q, want %q", a.Filename, want)
+	}
+	if a.ContentType != "image/png" || a.Kind != bus.KindImage {
+		t.Errorf("ContentType/Kind = %q/%s, want image/png/%s", a.ContentType, a.Kind, bus.KindImage)
 	}
 }
 

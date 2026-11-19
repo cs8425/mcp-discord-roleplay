@@ -103,25 +103,34 @@ func parseEmojiToken(raw string) (emojiToken, bool) {
 	return t, t.ID != ""
 }
 
-// stickerFormat maps Discord's format_type onto the extension the CDN uses and
-// the MIME type we declare for the block.
+// stickerFormat maps Discord's format_type onto two extensions and a MIME type:
+// the one in the filename the agent sees, and the one the sticker CDN actually
+// serves. They are the same everywhere except APNG.
 //
-// The APNG entry is the one worth a comment: an APNG file is a PNG file with
-// extra chunks, so declaring image/png is true of the container and is what the
-// model APIs accept — at the cost of the animation, which reads as the first
-// frame. Declaring image/apng instead would have a real chance of getting the
-// whole tool result rejected over one sticker. Lottie has no picture to show, so
-// it stays the JSON it is and ClassifyMedia files it under "other".
-func stickerFormat(formatType int) (ext, mime string) {
+// APNG is the trap we walked into live: cdn.discordapp.com has no
+// /stickers/<id>.apng endpoint — it answers 404 — while the same id at .png is
+// those very APNG bytes (and the same id at .gif answers 415, so the CDN checks
+// an extension list rather than transcoding anything). So we fetch .png but name
+// the attachment .apng.png: the two-part name keeps both facts, that the bytes
+// are an animated PNG and that they arrived under a .png, and a saved sticker
+// cannot be mistaken for a still image.
+//
+// Declaring image/png rather than image/apng is deliberate: an APNG file is a PNG
+// file with extra chunks, which is what the model APIs accept — at the cost of
+// the animation, which reads as the first frame. Declaring image/apng instead
+// would have a real chance of getting the whole tool result rejected over one
+// sticker. Lottie has no picture to show, so it stays the JSON it is and
+// ClassifyMedia files it under "other".
+func stickerFormat(formatType int) (fileExt, urlExt, mime string) {
 	switch formatType {
 	case 2:
-		return ".apng", "image/png"
+		return ".apng.png", ".png", "image/png"
 	case 3:
-		return ".json", "application/json"
+		return ".json", ".json", "application/json"
 	case 4:
-		return ".gif", "image/gif"
+		return ".gif", ".gif", "image/gif"
 	default: // 1, and anything Discord invents next: the PNG rendition is the safe guess
-		return ".png", "image/png"
+		return ".png", ".png", "image/png"
 	}
 }
 
@@ -137,9 +146,10 @@ func appendNote(text, note string) string {
 // addStickers turns a message's stickers into attachments plus a word of their
 // own in the text. Discord sends up to three per message.
 //
-// They follow the ordinary image policy from here on (--media-image): a sticker
-// does have a name, and where that name is worthless the [sticker:...] note is
-// still in the text to say which attachment belongs to it.
+// From here on a sticker is an image with a name, and it follows the sticker
+// policy (--media-sticker, which overrides --media-image because that one is set
+// for photographs). Where the name is worthless the [sticker:...] note in the
+// text still says which attachment belongs to it.
 func addStickers(ev *bus.Event, items []*discordgo.StickerItem) {
 	for _, st := range items {
 		if st == nil || st.ID == "" {
@@ -149,14 +159,14 @@ func addStickers(ev *bus.Event, items []*discordgo.StickerItem) {
 		if name == "" {
 			name = st.ID
 		}
-		ext, mime := stickerFormat(int(st.FormatType))
-		file := name + ext
+		fileExt, urlExt, mime := stickerFormat(int(st.FormatType))
+		file := name + fileExt
 		ev.Attachments = append(ev.Attachments, bus.Attachment{
 			ID:          st.ID,
 			Filename:    file,
 			ContentType: mime,
 			Kind:        bus.ClassifyMedia(file, mime),
-			URL:         cdnStickerBase + st.ID + ext,
+			URL:         cdnStickerBase + st.ID + urlExt,
 			Origin:      bus.OriginSticker,
 		})
 		ev.Text = appendNote(ev.Text, "[sticker:"+name+"]")
