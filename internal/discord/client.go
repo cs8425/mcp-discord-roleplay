@@ -335,6 +335,21 @@ func (c *Client) onMessageCreate(s *discordgo.Session, m *discordgo.MessageCreat
 
 	ev := c.normalize(s, m.Message)
 
+	// Our own echo never enters a queue. The caller already has this message
+	// (discord_send handed it over the moment we wrote it), so a copy here is a
+	// fact re-read, not news. It used to be queued and then skipped by every
+	// default poll, which left it sitting there counted as unread until the ring
+	// wrapped around it; that was the whole of the self-message pollution problem.
+	if ev.Author.Self {
+		if c.hub != nil {
+			c.hub.NoteSelfEcho()
+		}
+		c.log.Debug("self echo, not queued",
+			"channel", ev.ChannelID, "message", ev.MessageID,
+			"runes", len([]rune(ev.Text)), "attachments", len(ev.Attachments))
+		return
+	}
+
 	// Who is allowed to read this? The event is then stored by reference in each
 	// of those agents' queues, so nothing may touch ev below this line.
 	aud := c.rt.Audience(ev.GuildID, ev.ChannelID, ev.DM, recipientIDs(ev))
@@ -486,15 +501,14 @@ func (c *Client) publishSystem(text string) {
 	if c.hub == nil {
 		return
 	}
-	now := time.Now()
-	// System notices go to every queue but are never delivered to a caller: a
-	// poll consumes and discards them so they cannot hold a slot forever.
-	c.hub.PublishAll(&bus.Event{
-		Kind: bus.KindSystem,
-		Ts:   now,
-		Time: tz.Format(now),
-		Text: text,
-	})
+	// A lifecycle notice is a wake-up, not a message. It used to be pushed into
+	// every queue, where it occupied a slot, counted as unread, could evict a real
+	// message on a full ring, and was then consumed-and-discarded by the next poll
+	// — which is four costs for a thing nobody reads. It now only nudges the
+	// waiting polls (so a disconnect surfaces as reason=disconnected instead of a
+	// timeout on a dead line); the text goes to the log, which is its audience.
+	c.hub.WakeAll()
+	c.log.Debug("system notice", "text", text)
 }
 
 // watchdog keeps a quiet socket visible in the logs (Discord pings every

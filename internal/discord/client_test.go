@@ -173,3 +173,51 @@ func TestHeadLogKeepsUTF8AndShortStrings(t *testing.T) {
 		}
 	}
 }
+
+// This is where our own echo leaves the story: discord_send has already handed
+// that message to whoever asked for it, so a queued copy is a fact re-read, not
+// news. Admission drops it, and counts it in its own bucket -- an agent that talks
+// a lot must not look like a routing mistake (skipped_no_audience).
+func TestSelfEchoNeverQueued(t *testing.T) {
+	c, _, _ := newTestClient(t, testCfg(t, "-unknown-channel=ring"))
+	if len(c.hub.Agents()) == 0 {
+		t.Fatal("the fixture hub has no queues, so this test would prove nothing")
+	}
+	c.mu.Lock()
+	c.snap.SelfID = "bot1"
+	c.mu.Unlock()
+
+	queued := func() (n int) {
+		for _, st := range c.hub.Stats() {
+			n += st.Size
+		}
+		return n
+	}
+	say := func(id, authorID, name string, bot bool) {
+		c.onMessageCreate(nil, &discordgo.MessageCreate{Message: &discordgo.Message{
+			ID: id, ChannelID: "c1", Content: "hello",
+			Author: &discordgo.User{ID: authorID, Username: name, Bot: bot},
+		}})
+	}
+
+	// A stranger speaks: news, so it is queued. Without this the self assertions
+	// below could pass simply because nothing is ever queued in this fixture.
+	say("m1", "u1", "someone", false)
+	if got := queued(); got != 1 {
+		t.Fatalf("queued = %d after a stranger's message, want 1", got)
+	}
+
+	// Then we speak, twice -- once flagged as a bot by Discord, once not, because
+	// what makes it ours is the id, not the flag.
+	say("m2", "bot1", "selfbot", true)
+	say("m3", "bot1", "selfbot", false)
+	if got := queued(); got != 1 {
+		t.Errorf("queued = %d, want still 1: a self echo must not enter any queue", got)
+	}
+	if got := c.hub.SelfEchoes(); got != 2 {
+		t.Errorf("SelfEchoes = %d, want 2", got)
+	}
+	if got := c.hub.Skipped(); got != 0 {
+		t.Errorf("Skipped = %d, want 0: our own message had an audience, it just did not want it", got)
+	}
+}

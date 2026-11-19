@@ -70,16 +70,46 @@ func TestFanoutSharesOnePointer(t *testing.T) {
 	}
 }
 
-func TestPublishAllCoversEveryQueue(t *testing.T) {
+// A lifecycle notice must wake every waiter WITHOUT filling any queue: the ring is
+// for things that happened, and a notice is not a thing anyone said. If it ever
+// starts storing again, every restart costs each agent a slot and a phantom
+// `queue` count -- which is exactly what it used to do.
+func TestWakeAllNudgesWithoutQueueing(t *testing.T) {
 	h := testHub(t, 5, "a", "b", "c")
-	if n := h.PublishAll(&Event{Kind: KindSystem, Text: "reconnected"}); n != 3 {
-		t.Fatalf("PublishAll = %d", n)
-	}
+	wakes := make([]<-chan struct{}, 0, 3)
 	for _, name := range h.Agents() {
 		q, _ := h.Queue(name)
-		if st := q.Stats(); st.Size != 1 {
-			t.Fatalf("queue %s size = %d, want 1", name, st.Size)
+		wakes = append(wakes, q.Notify())
+	}
+	if n := h.WakeAll(); n != 3 {
+		t.Fatalf("WakeAll = %d, want 3", n)
+	}
+	for i, name := range h.Agents() {
+		select {
+		case <-wakes[i]:
+		default:
+			t.Errorf("queue %s was not woken", name)
 		}
+		q, _ := h.Queue(name)
+		if st := q.Stats(); st.Size != 0 || st.Dropped != 0 {
+			t.Errorf("queue %s after a wake: size=%d dropped=%d, want 0 and 0", name, st.Size, st.Dropped)
+		}
+	}
+}
+
+// The two doors must not share a counter: skipped_no_audience is "nobody was
+// allowed to read this", self_echoes is "somebody was, and does not want to".
+// Merging them would make a chatty agent look like a routing mistake.
+func TestSelfEchoesAreCountedApartFromSkipped(t *testing.T) {
+	h := testHub(t, 5, "a")
+	h.NoteSkipped()
+	h.NoteSelfEcho()
+	h.NoteSelfEcho()
+	if got := h.Skipped(); got != 1 {
+		t.Errorf("Skipped = %d, want 1", got)
+	}
+	if got := h.SelfEchoes(); got != 2 {
+		t.Errorf("SelfEchoes = %d, want 2", got)
 	}
 }
 

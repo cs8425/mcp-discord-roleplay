@@ -28,6 +28,12 @@ import (
 )
 
 // Event kinds.
+//
+// KindSystem is what lifecycle notices ("gateway reconnected") used to be: they
+// were pushed into every queue purely to wake a waiting poll, which meant they
+// occupied a slot, counted as unread, and could evict a real message on a full
+// ring. They now go through Hub.WakeAll and are not stored at all, so the kind
+// survives only as a defensive check in poll — nothing puts one in a queue.
 const (
 	KindMessage = "message"
 	KindSystem  = "system"
@@ -185,6 +191,17 @@ func (q *Queue) Notify() <-chan struct{} {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	return q.notify
+}
+
+// Wake signals waiting pollers without storing anything. A lifecycle notice is
+// worth waking up for, but it is not information a caller reads, so it must not
+// occupy a slot, count towards Size, or risk evicting an unread message. Nothing
+// else changes: no Pushed, no Dropped, and a poll that finds an empty queue
+// still answers a clean timeout.
+func (q *Queue) Wake() {
+	q.mu.Lock()
+	q.signalLocked()
+	q.mu.Unlock()
 }
 
 // Drain walks the queue oldest first, asks want() about each event, removes

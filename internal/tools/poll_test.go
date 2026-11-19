@@ -557,6 +557,11 @@ func TestPollFilters(t *testing.T) {
 	mention.MentionsSelf = true
 	bot := evMsg("m3", "bot noise")
 	bot.Author = bus.Author{ID: "u3", Name: "webhook", Bot: true}
+	// m4 is what our own message looks like if something pushes one into a queue by
+	// hand. Production no longer does it (the gateway client drops a self echo
+	// before it fans out), so this event's only job is to prove poll has no self
+	// gate of its own any more: a queued self event is just a bot, and that is the
+	// whole of it.
 	own := evMsg("m4", "I talk to myself")
 	own.Author = bus.Author{ID: "u9", Name: "selfbot", Bot: true, Self: true}
 
@@ -583,9 +588,7 @@ func TestPollFilters(t *testing.T) {
 		{"by author id", `{"from":["u1"]}`, []string{"m1", "m2"}},
 		{"mentions only", `{"mentions_only":true}`, []string{"m2"}},
 		{"bots skipped by default", `{"limit":10}`, []string{"m1", "m2", "d1"}},
-		{"bots allowed", `{"ignore_bots":false,"limit":10}`, []string{"m1", "m2", "m3", "d1"}},
-		{"self stays out", `{"ignore_bots":false,"include_self":false,"limit":10}`, []string{"m1", "m2", "m3", "d1"}},
-		{"include self", `{"include_self":true,"limit":10}`, []string{"m1", "m2", "m3", "m4", "d1"}},
+		{"bots allowed", `{"ignore_bots":false,"limit":10}`, []string{"m1", "m2", "m3", "m4", "d1"}},
 		{"nothing matches", `{"channels":["nope"]}`, nil},
 	}
 
@@ -601,6 +604,12 @@ func TestPollFilters(t *testing.T) {
 				}
 				if queueLen(t, d, "default") != 5 {
 					t.Error("a filtered-out message must stay queued")
+				}
+				// An empty answer also has to say why it is empty, and the tally is
+				// per gate: m3/m4 are bots (checked first), the other three are the
+				// wrong channel. Busiest gate first, ties by name.
+				if out["waiting"] != "3 channel, 2 bot" {
+					t.Errorf(`empty answer waiting = %v, want "3 channel, 2 bot"`, out["waiting"])
 				}
 				return
 			}
@@ -760,8 +769,10 @@ func TestPollShutdown(t *testing.T) {
 	wantStr(t, out, "reason", "shutdown")
 }
 
-// Lifecycle notices are consumed silently: they must never be handed to a
-// caller, nor sit in the queue forever blocking the head.
+// A lifecycle notice is not a message. They no longer enter a queue at all
+// (Hub.WakeAll only wakes the waiters), so what this pins is the defensive branch
+// in the drain: if one ever does get stored, it is taken and discarded, never
+// handed to a caller, and it leaves no phantom `remaining` behind.
 func TestPollConsumesSystemEvents(t *testing.T) {
 	d := newDeps(t, routingCfg(t, "-poll-jitter-pct=0"))
 	connected(d)
@@ -800,6 +811,40 @@ func TestPollReportsDrops(t *testing.T) {
 	}
 }
 
+// An empty answer used to be one fact. It is now two, and they call for
+// different actions -- nothing happened, versus something did and this call's own
+// filter refused it -- so the difference has to be legible without a second poll.
+func TestPollEmptyAnswerNamesWhatIsWaiting(t *testing.T) {
+	d := newDeps(t, routingCfg(t, "-poll-jitter-pct=0"))
+	connected(d)
+	e := evMsg("m1", "hello")
+	e.Ts = time.Now().Add(-3 * time.Second) // it has been waiting a while
+	push(t, d, "default", e)
+
+	// This call asked for the DM conversation; the message is from a guild channel.
+	out := pollOK(t, d, `{"targets":["ami"],"max_wait":1}`)
+	wantStr(t, out, "reason", "timeout")
+	if got := keySet(out); got != "oldest_s,reason,remaining,waiting" {
+		t.Errorf("keys = %s, want the reason plus what is still queued", got)
+	}
+	wantNum(t, out, "remaining", 1)
+	wantStr(t, out, "waiting", "1 target")
+	if v, ok := out["oldest_s"].(float64); !ok || v < 3 {
+		t.Errorf("oldest_s = %v, want the ~3 seconds this event has waited", out["oldest_s"])
+	}
+
+	// Ask without the filter and the very same message is deliverable: the queue
+	// drains, and the leftovers vocabulary disappears again.
+	out = pollOK(t, d, `{"max_wait":1}`)
+	wantStr(t, out, "reason", "messages")
+	if _, bad := out["waiting"]; bad {
+		t.Error("waiting describes what a poll could not deliver, not a full batch")
+	}
+	if _, bad := out["remaining"]; bad {
+		t.Error("the queue is empty now, so remaining must be absent")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // small helpers
 // ---------------------------------------------------------------------------
@@ -831,10 +876,16 @@ func TestPollToolSchema(t *testing.T) {
 		t.Fatal("input schema must be an object")
 	}
 	for _, key := range []string{"max_wait", "limit", "targets", "channels", "from",
-		"mentions_only", "ignore_bots", "include_self"} {
+		"mentions_only", "ignore_bots"} {
 		if _, ok := tool.InputSchema.Properties[key]; !ok {
 			t.Errorf("missing property %q", key)
 		}
+	}
+	// Our own messages are dropped before they are queued, so there is nothing for
+	// a poll argument to ask for: bringing include_self back would mean deciding
+	// again that the model should be shown its own words.
+	if _, dead := tool.InputSchema.Properties["include_self"]; dead {
+		t.Error("include_self is gone from the schema")
 	}
 	if len(tool.InputSchema.Required) != 0 {
 		t.Errorf("every poll argument is optional, got %v", tool.InputSchema.Required)

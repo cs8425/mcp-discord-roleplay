@@ -291,8 +291,11 @@ func (d *Deps) fullPanel(p router.Principal) map[string]any {
 			"last_poll_age_s": d.lastPollAgeS(p.AgentID),
 			// Events the bot saw but no agent may read. Non-zero with
 			// routing.json is normal; with no routing file it means the
-			// allow-lists are excluding everything.
+			// allow-lists are excluding everything. self_echoes is the other door:
+			// our own messages, dropped before the queue because discord_send has
+			// already handed them to whoever asked for them.
 			"skipped_no_audience": d.Hub.Skipped(),
+			"self_echoes":         d.Hub.SelfEchoes(),
 			"last_event_age_s":    snap.LastEventAgoS,
 		},
 

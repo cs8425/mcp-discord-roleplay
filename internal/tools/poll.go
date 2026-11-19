@@ -6,6 +6,11 @@
 // restart empties the queue (by design, see internal/bus), which is why
 // catching up on older messages is the history tool's job (M3), not poll's.
 //
+// An answer that takes nothing says one of two things, and the wire tells them
+// apart without a second call: one key means nothing arrived, while `remaining`
+// plus `waiting` mean the queue was NOT empty and this call's own filters refused
+// what was in it.
+//
 // Two limits keep a reply inside a model context window:
 //
 //   - limit: at most N messages per call, oldest first.
@@ -70,11 +75,14 @@ func pollTool(prefix string) *mcp.Tool {
 		Name:  "poll",
 		Title: "Wait for new Discord messages",
 		Description: "Wait until this agent's queue holds messages, return them, and remove them from the queue. " +
+			"This queue holds only what happened while you were away: messages this bot sent are never queued, because " +
+			"the send call already handed them to you. " +
 			"There is no cursor and no acknowledge step: what a poll hands you is yours, and what you do not take stays. " +
-			"reason=messages means you got something; reason=timeout (ok:true) means nothing arrived within max_wait, call again; " +
+			"reason=messages means you got something; reason=timeout is NOT a failure (the tool result's isError is false), it means nothing arrived within max_wait — call again; " +
 			"reason=disconnected means the gateway was not listening during that wait, so nothing could have arrived; " +
 			"reason=cancelled/shutdown means this answer was not delivered. " +
 			"If remaining is present, that many messages are still queued — poll again right away. " +
+			"An empty answer that carries waiting was not a quiet channel: those messages were turned away by your own filters, and waiting names them (bot|mentions|target|channel|from) while oldest_s says how long the oldest has been waiting. " +
 			"If dropped is present, messages were overwritten while nobody polled; poll more often. " +
 			"A long message text may be cut to fit the server's byte budget, and a note then says how big it really was; only text is ever cut, attachments are always listed. " +
 			"author_id is the speaker's Discord id: quote it as to:\"dm:<id>\" to answer that person in DMs even when they have no alias. " +
@@ -117,12 +125,9 @@ func pollTool(prefix string) *mcp.Tool {
 					Description: "Only messages that @-mention the bot (default false).",
 				},
 				"ignore_bots": {
-					Type:        mcp.TypeBoolean,
-					Description: "Skip messages authored by bots, this bot included (default true).",
-				},
-				"include_self": {
-					Type:        mcp.TypeBoolean,
-					Description: "Also return messages this bot sent (default false; implies ignore_bots=false).",
+					Type: mcp.TypeBoolean,
+					Description: "Skip messages authored by bots (default true). This covers other bots and webhooks; " +
+						"this server's own messages are never queued, so they cannot echo back at you regardless of this flag.",
 				},
 			},
 		},
@@ -137,7 +142,6 @@ type pollArgs struct {
 	From         []string `json:"from"`
 	MentionsOnly *bool    `json:"mentions_only"`
 	IgnoreBots   *bool    `json:"ignore_bots"`
-	IncludeSelf  *bool    `json:"include_self"`
 }
 
 // pollMessage is the WORKING form of one queued event — it never goes on the
@@ -305,22 +309,16 @@ func (d *Deps) handlePoll(ctx context.Context, call *mcp.Call) (*mcp.ToolResult,
 			continue
 		case <-timer.C:
 			d.notePoll(p.AgentID)
-			return jsonResult(d.pollEnvelope(pollMeta{
-				reason: "timeout", agent: p.AgentID, waitedMS: durMS(time.Since(start)),
-				maxWait: waitS, connected: connected,
-			})), nil
+			return jsonResult(d.pollEnvelope(
+				d.emptyHanded(q, st, "timeout", p.AgentID, start, waitS, connected))), nil
 		case <-ctx.Done():
 			// Nothing deliverable was taken (msgs is empty), so there is nothing
 			// to put back.
-			return jsonResult(d.pollEnvelope(pollMeta{
-				reason: "cancelled", agent: p.AgentID, waitedMS: durMS(time.Since(start)),
-				maxWait: waitS, connected: connected,
-			})), nil
+			return jsonResult(d.pollEnvelope(
+				d.emptyHanded(q, st, "cancelled", p.AgentID, start, waitS, connected))), nil
 		case <-d.Stopping:
-			return jsonResult(d.pollEnvelope(pollMeta{
-				reason: "shutdown", agent: p.AgentID, waitedMS: durMS(time.Since(start)),
-				maxWait: waitS, connected: connected,
-			})), nil
+			return jsonResult(d.pollEnvelope(
+				d.emptyHanded(q, st, "shutdown", p.AgentID, start, waitS, connected))), nil
 		}
 	}
 
@@ -329,17 +327,15 @@ func (d *Deps) handlePoll(ctx context.Context, call *mcp.Call) (*mcp.ToolResult,
 	// oldest end, in order, for the next poll.
 	if ctx.Err() != nil {
 		q.RequeueFront(st.kept)
-		return jsonResult(d.pollEnvelope(pollMeta{
-			reason: "cancelled", agent: p.AgentID, waitedMS: durMS(time.Since(start)),
-			maxWait: waitS, connected: connected,
-		})), nil
+		return jsonResult(d.pollEnvelope(
+			d.emptyHanded(q, st, "cancelled", p.AgentID, start, waitS, connected))), nil
 	}
 
 	if st.stopped {
 		// Only worth saying when this call was cut short: leftovers that this
 		// poll's own filter rejects are none of the caller's business yet.
 		notes = append(notes, "你的佇列裡還有 "+strconv.Itoa(remaining)+
-			" 則（含可能的系統訊息），請立刻再 poll 一次")
+			" 則，請立刻再 poll 一次")
 	}
 	d.notePoll(p.AgentID)
 
@@ -354,10 +350,8 @@ func (d *Deps) handlePoll(ctx context.Context, call *mcp.Call) (*mcp.ToolResult,
 	// already saved stays on disk: the next poll reuses it rather than refetching.
 	if ctx.Err() != nil {
 		q.RequeueFront(st.kept)
-		return jsonResult(d.pollEnvelope(pollMeta{
-			reason: "cancelled", agent: p.AgentID, waitedMS: durMS(time.Since(start)),
-			maxWait: waitS, connected: connected,
-		})), nil
+		return jsonResult(d.pollEnvelope(
+			d.emptyHanded(q, st, "cancelled", p.AgentID, start, waitS, connected))), nil
 	}
 
 	var self string
@@ -460,13 +454,12 @@ func (d *Deps) applyMedia(ctx context.Context, msgs []pollMessage, kept []*bus.E
 // --- filters ---------------------------------------------------------------
 
 type pollFilter struct {
-	targets     map[string]bool
-	kinds       map[string]bool // kinds opened by a wildcard rule ("dm:*", "channel:*")
-	channels    map[string]bool
-	from        map[string]bool
-	mentions    bool
-	ignoreBots  bool
-	includeSelf bool
+	targets    map[string]bool
+	kinds      map[string]bool // kinds opened by a wildcard rule ("dm:*", "channel:*")
+	channels   map[string]bool
+	from       map[string]bool
+	mentions   bool
+	ignoreBots bool
 }
 
 func (d *Deps) newFilter(p router.Principal, a *pollArgs) (*pollFilter, error) {
@@ -483,15 +476,6 @@ func (d *Deps) newFilter(p router.Principal, a *pollArgs) (*pollFilter, error) {
 	if a.IgnoreBots != nil {
 		f.ignoreBots = *a.IgnoreBots
 	}
-	if a.IncludeSelf != nil {
-		f.includeSelf = *a.IncludeSelf
-	}
-	// Wanting your own messages while skipping bots is self-contradictory;
-	// include_self wins because it can only be said on purpose.
-	if f.includeSelf {
-		f.ignoreBots = false
-	}
-
 	for _, ref := range a.Targets {
 		s := strings.TrimSpace(ref)
 		if s == "" {
@@ -560,15 +544,19 @@ func eventKind(e *bus.Event) string {
 	return router.KindChannel
 }
 
-func (f *pollFilter) keep(e *bus.Event) bool {
-	if !f.includeSelf && e.Author.Self {
-		return false
-	}
+// reject names the first gate that turns this event away, or "" when it passes.
+// The word it returns is what a caller sees in the `waiting` field of an empty
+// answer, so each name has to be something the model can act on: `bot`
+// (ignore_bots — other bots and webhooks), `mentions` (mentions_only), and
+// `target`/`channel`/`from` (this call narrowed the source itself). A self
+// message never reaches here any more: the gateway client does not queue our own
+// echo at all, because discord_send already handed it to the caller.
+func (f *pollFilter) reject(e *bus.Event) string {
 	if f.ignoreBots && e.Author.Bot {
-		return false
+		return "bot"
 	}
 	if f.mentions && !e.MentionsSelf {
-		return false
+		return "mentions"
 	}
 	if len(f.targets) > 0 || len(f.kinds) > 0 {
 		hit := false
@@ -582,7 +570,7 @@ func (f *pollFilter) keep(e *bus.Event) bool {
 			hit = true
 		}
 		if !hit {
-			return false
+			return "target"
 		}
 	}
 	if len(f.channels) > 0 {
@@ -594,7 +582,7 @@ func (f *pollFilter) keep(e *bus.Event) bool {
 			}
 		}
 		if !hit {
-			return false
+			return "channel"
 		}
 	}
 	if len(f.from) > 0 {
@@ -611,11 +599,14 @@ func (f *pollFilter) keep(e *bus.Event) bool {
 			}
 		}
 		if !hit {
-			return false
+			return "from"
 		}
 	}
-	return true
+	return ""
 }
+
+// keep is the yes/no view of reject, for callers that do not care which gate fired.
+func (f *pollFilter) keep(e *bus.Event) bool { return f.reject(e) == "" }
 
 // --- budgeted drain --------------------------------------------------------
 
@@ -638,6 +629,13 @@ type drainState struct {
 	// instead of "the queue happens to be non-empty", which would be true for any
 	// filtered poll and would push the model into pointless polls.
 	stopped bool
+
+	// held tallies what this pass skipped, by the gate that rejected it, so an
+	// empty-handed poll can say "2 bot" instead of letting the caller guess
+	// whether the channel was quiet or its own filters were narrow. It only means
+	// something when the pass scanned the whole queue: a pass that ended on Stop
+	// never reached the tail, so it reports nothing.
+	held map[string]int
 }
 
 // want is the verdict function handed to Queue.Drain: it decides, strictly in
@@ -645,9 +643,13 @@ type drainState struct {
 func (st *drainState) want(d *Deps, p router.Principal, f *pollFilter) func(*bus.Event) bus.Verdict {
 	return func(e *bus.Event) bus.Verdict {
 		if e.Kind == bus.KindSystem {
-			return bus.Take // consume and discard: nobody should have to read these
+			// Defensive: a lifecycle notice wakes a queue without being stored, so
+			// nothing puts one here any more. If a future caller does, treat it the
+			// way notices have always been treated — read it and move on.
+			return bus.Take
 		}
-		if !f.keep(e) {
+		if why := f.reject(e); why != "" {
+			st.hold(why)
 			return bus.Skip
 		}
 		if st.count >= st.limit {
@@ -697,6 +699,41 @@ func (st *drainState) noteLimit() {
 		}
 	}
 	st.notes = append(st.notes, msg)
+}
+
+// hold records one rejection under the gate that caused it.
+func (st *drainState) hold(why string) {
+	if st.held == nil {
+		st.held = map[string]int{}
+	}
+	st.held[why]++
+}
+
+// renderHeld turns the tally into one short, stable string: busiest gate first,
+// ties broken by name, e.g. "2 bot, 1 mentions". Empty when nothing was skipped.
+func (st *drainState) renderHeld() string {
+	if len(st.held) == 0 {
+		return ""
+	}
+	type pair struct {
+		why string
+		n   int
+	}
+	list := make([]pair, 0, len(st.held))
+	for why, n := range st.held {
+		list = append(list, pair{why, n})
+	}
+	sort.Slice(list, func(i, j int) bool {
+		if list[i].n != list[j].n {
+			return list[i].n > list[j].n
+		}
+		return list[i].why < list[j].why
+	})
+	parts := make([]string, 0, len(list))
+	for _, p := range list {
+		parts = append(parts, strconv.Itoa(p.n)+" "+p.why)
+	}
+	return strings.Join(parts, ", ")
 }
 
 // targetLabel names the conversation this principal may answer with. An alias
@@ -804,7 +841,9 @@ func fitMessage(m *pollMessage, room int, st *drainState) {
 // below are the only thing that gets marshalled, which buys three things: the
 // model never sees a field nobody asked for, bus.Author/bus.Embed shapes can no
 // longer leak onto the wire, and adding a field to pollMessage costs the model
-// nothing until it is deliberately added here too.
+// nothing until it is deliberately added here too. There is no `self` field: a
+// message this bot sent is dropped before it is ever queued, so nothing that
+// arrives here could need it (the send reply is what tells you what you said).
 
 type embedWire struct {
 	Title       string `json:"title,omitempty"`
@@ -828,7 +867,6 @@ type msgWire struct {
 	Author       string      `json:"author"`
 	AuthorID     string      `json:"author_id,omitempty"`
 	Bot          bool        `json:"bot,omitempty"`
-	Self         bool        `json:"self,omitempty"`
 	DM           bool        `json:"dm,omitempty"`
 	Ts           string      `json:"ts,omitempty"`
 	AgeS         float64     `json:"age_s,omitempty"`
@@ -846,7 +884,6 @@ func (m pollMessage) wire() msgWire {
 		Author:       m.From.Name,
 		AuthorID:     m.From.ID,
 		Bot:          m.From.Bot,
-		Self:         m.From.Self,
 		DM:           m.DM,
 		Ts:           m.Ts,
 		AgeS:         m.AgeS,
@@ -909,6 +946,12 @@ type pollMeta struct {
 	notes     []string
 	messages  []pollMessage
 	dropped   uint64
+
+	// waiting and oldestS describe what is STILL queued on an answer that took no
+	// messages, so the caller learns whether the channel was quiet or its own
+	// filters were narrow. Both stay zero when the queue is empty.
+	waiting string
+	oldestS float64
 }
 
 // pollWire is the envelope, and it is the whole budget: a quiet poll costs one
@@ -922,6 +965,15 @@ type pollWire struct {
 	Remaining int       `json:"remaining,omitempty"` // absent means caught up
 	Dropped   uint64    `json:"dropped,omitempty"`
 	Notes     []string  `json:"notes,omitempty"`
+	// Waiting names, by count, the filters that turned messages away on a pass that
+	// came back empty ("2 bot, 1 mentions"). It only appears when the queue was NOT
+	// empty, which is the whole point: without it a caller cannot tell "nobody
+	// spoke" from "nobody you asked about spoke", and would have to poll again with
+	// a different filter to find out. OldestS rides along for the same reason —
+	// three messages that have waited four minutes are a different problem from
+	// three that arrived a second ago.
+	Waiting string  `json:"waiting,omitempty"`
+	OldestS float64 `json:"oldest_s,omitempty"`
 }
 
 // pollEnvelope builds the reply from the bookkeeping. What pollMeta carries and
@@ -937,16 +989,52 @@ func (d *Deps) pollEnvelope(m pollMeta) pollWire {
 		reason = "disconnected"
 	}
 	w := pollWire{Reason: reason}
-	// Everything below rides with messages only: a queue that handed over
-	// nothing has nothing left, nothing trimmed and nothing to explain.
+	// With messages there is everything to say: the batch, what is left, what was
+	// overwritten. Without them there are two very different cases, and the field
+	// count is what tells them apart.
 	if m.count > 0 {
 		w.Messages = wireMessages(m.messages)
 		w.Remaining = m.remaining
 		w.Dropped = m.dropped
 		w.Notes = m.notes
+	} else if m.remaining > 0 {
+		// Empty hands, non-empty queue: those messages were seen and turned away.
+		w.Remaining = m.remaining
+		w.Waiting = m.waiting
+		w.OldestS = m.oldestS
+		w.Dropped = m.dropped
 	}
 	d.logPoll(m)
 	return w
+}
+
+// emptyHanded builds the metadata for a pass that came back with no messages.
+// The numbers describe what is STILL queued, so they are read after the drain
+// released the lock: `Oldest` is a peek that costs the caller nothing, and the
+// skip tally is the one from the most recent full scan (the only thing that can
+// have changed since is a new arrival, which the next poll will describe).
+//
+// A queue that is actually empty gets nothing but the reason, which is why this
+// is worth computing at all: the idle case stays one key and ~20 bytes.
+func (d *Deps) emptyHanded(q *bus.Queue, st *drainState, reason, agent string, start time.Time, waitS float64, connected bool) pollMeta {
+	m := pollMeta{
+		reason: reason, agent: agent, waitedMS: durMS(time.Since(start)),
+		maxWait: waitS, connected: connected,
+	}
+	if q == nil {
+		return m
+	}
+	if s := q.Stats(); s.Size > 0 {
+		m.remaining = s.Size
+		m.dropped = s.Dropped
+		if st != nil {
+			m.waiting = st.renderHeld()
+		}
+		if e := q.Oldest(); e != nil && !e.Ts.IsZero() {
+			m.oldestS = round1(time.Since(e.Ts).Seconds())
+		}
+	}
+	return m
 }
 
 // logPoll writes the one bookkeeping line a poll leaves behind: every number

@@ -28,7 +28,8 @@ type Hub struct {
 	order  []string // declaration order, for stable status output
 	cap    int
 
-	skipped atomic.Uint64 // inbound events nobody was allowed to see
+	skipped    atomic.Uint64 // inbound events nobody was allowed to see
+	selfEchoes atomic.Uint64 // our own messages, turned away at the door
 }
 
 // NewHub builds one queue per agent id. Duplicate ids collapse; the default
@@ -94,18 +95,21 @@ func (h *Hub) Fanout(e *Event, agents []string) int {
 	return n
 }
 
-// PublishAll pushes e to every queue (lifecycle/system notices: "gateway
-// reconnected"). System events are never delivered to a caller; a poll consumes
-// and discards them so they cannot occupy a slot forever.
-func (h *Hub) PublishAll(e *Event) int {
-	if h == nil || e == nil {
+// WakeAll nudges every queue without storing anything (lifecycle notices:
+// "gateway ready", "session resumed", "disconnected; reconnecting"). A change
+// of gateway state is worth waking a blocked poll for — it can then answer
+// disconnected instead of timing out on a dead line — but the notice itself is
+// not information a caller reads, so it never occupies a slot, never counts as
+// unread, and cannot evict a message on a full ring.
+func (h *Hub) WakeAll() int {
+	if h == nil {
 		return 0
 	}
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	n := 0
 	for _, q := range h.queues {
-		q.Push(e)
+		q.Wake()
 		n++
 	}
 	return n
@@ -125,6 +129,27 @@ func (h *Hub) Skipped() uint64 {
 		return 0
 	}
 	return h.skipped.Load()
+}
+
+// NoteSelfEcho records a message this bot wrote, which is never queued: the
+// sender already has it (discord_send handed it over, with the clock and the
+// queue state attached), so storing the echo would be a second copy of a fact
+// the caller does not need to learn. Counted separately from NoteSkipped
+// because the reason differs: that one is "nobody was allowed to read this",
+// this one is "somebody was allowed to, and does not want to".
+func (h *Hub) NoteSelfEcho() {
+	if h == nil {
+		return
+	}
+	h.selfEchoes.Add(1)
+}
+
+// SelfEchoes reports how many of this bot's own messages were turned away.
+func (h *Hub) SelfEchoes() uint64 {
+	if h == nil {
+		return 0
+	}
+	return h.selfEchoes.Load()
 }
 
 // QueueStat is one agent's queue counters, for discord_status.

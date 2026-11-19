@@ -435,9 +435,11 @@ func instructions(cfg *config.Config, names []string) string {
 		"You never send binary data: reference local files by a path under the server's --file-root (a leading '/' means that root), " +
 		"and put links in files[].url - they are pasted, not fetched. " +
 		"Text over 2000 characters is split for you. " +
-		poll + " holds the call open until something arrives or max_wait passes; an empty answer is ok:true, not a failure. " +
+		poll + " holds the call open until something arrives or max_wait passes; an empty answer (reason=timeout) is not a failure — isError stays false. " +
 		"Messages you have taken are gone from your queue - there is nothing to acknowledge and nothing to remember. " +
 		"If an answer says remaining:N, that many messages are still queued - call " + poll + " again right away. " +
+		"When such an answer comes back empty, waiting names the filters that turned those messages away and oldest_s says how long the oldest has waited. " +
+		"Messages this bot sent are never queued, so " + poll + " only hands back what someone else said. " +
 		"If dropped is present, messages were overwritten while nobody polled; poll more often. " +
 		"Set your client's request timeout to at least max_wait, or the call is cancelled while waiting and the answer is lost. " +
 		"This process serves agent '" + cfg.AgentID + "'."
