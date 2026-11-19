@@ -110,6 +110,17 @@ type Config struct {
 	PollMaxBytes int // text-byte budget for one discord_poll call; -1 = unlimited (0 is a rejected typo)
 	TextMaxRunes int
 
+	// ReadTimeout bounds ONE REST read (history / get / channels), per call. It is
+	// ours, not discordgo's: its own default is 20s (discord.go, New()), which no
+	// tool call should wait out. ReadTimeout also implies that we disable
+	// discordgo's sleep-and-retry on 429 -- see internal/discord/read.go.
+	// HistoryMaxBytes / ChannelsMaxBytes are the same kind of budget as
+	// PollMaxBytes: a whole answer, -1 removes the cap, and a call that hits it
+	// says so instead of silently returning less.
+	ReadTimeout      time.Duration
+	HistoryMaxBytes  int
+	ChannelsMaxBytes int
+
 	// --- inbound media policy -------------------------------------------------
 	Media        map[string]MediaMode // key: image|audio|video|other
 	MediaEmoji   string               // inline | text, see EmojiInline/EmojiText
@@ -226,6 +237,10 @@ func Load(args []string) (*Config, error) {
 	fs.IntVar(&c.BusCapacity, "bus-capacity", 2000, "per-agent in-memory queue size (messages); the oldest is dropped when full")
 	fs.IntVar(&c.PollMaxBytes, "poll-max-bytes", DefaultPollMaxBytes, "budget for one poll, counted in the bytes of message text only (not JSON); -1 removes the cap")
 	fs.IntVar(&c.TextMaxRunes, "text-max-runes", 4000, "truncate stored message text beyond this many runes")
+
+	fs.DurationVar(&c.ReadTimeout, "read-timeout", 10*time.Second, "deadline for one REST read (history/get/channels); discordgo's own default is 20s and its 429 retry sleep is disabled on this path")
+	fs.IntVar(&c.HistoryMaxBytes, "history-max-bytes", 4000, "budget for one history answer (-1 = no cap); messages are dropped from the OLDEST end and the answer says it did")
+	fs.IntVar(&c.ChannelsMaxBytes, "channels-max-bytes", 4000, "budget for one channels answer (-1 = no cap); channel lists are trimmed from the tail and the answer says it did")
 
 	fs.StringVar(&c.mImage, "media-image", "inline", "policy for inbound images: inline|save|skip")
 	fs.StringVar(&c.mAudio, "media-audio", "skip", "policy for inbound audio (skip = never burn tokens on voice)")

@@ -97,6 +97,11 @@ type Client struct {
 	post     poster                                           // nil = ChannelMessageSendComplex
 	dmCreate channelPoster                                    // nil = UserChannelCreate
 	sleep    func(ctx context.Context, d time.Duration) error // nil = real timer, ctx-aware
+
+	// read is the seam for the M3 REST read path (read.go): history, get, one
+	// message, and the two listing calls channels needs. nil means the live
+	// session's own calls, which is what production does.
+	read *readSeam
 }
 
 // New builds a client; nothing is connected until Start. Inbound events are
