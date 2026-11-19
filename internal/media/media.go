@@ -111,6 +111,11 @@ type Fetcher struct {
 
 	// secret backs saveName's token: random per process, never on the wire.
 	secret []byte
+
+	// cache holds the bytes of the id-named CDN files (emoji, stickers) this
+	// process has already fetched, so the tenth message with the same emoji costs
+	// no download. See cache.go for why nothing else qualifies.
+	cache *cdnCache
 }
 
 // New prepares the process-wide fetcher. It creates the media directory when
@@ -128,6 +133,7 @@ func New(cfg *config.Config, d Deps) *Fetcher {
 	f.dir = cleanDir(cfg.MediaOut)
 	f.prefix = cfg.LocalPathPrefix()
 	f.secret = newSecret()
+	f.cache = newCDNCache()
 	if f.dir != "" && cfg.SaveEnabled() && cfg.AnySave() {
 		if err := f.openSaveRoot(); err != nil {
 			f.log.Warn("media: the save directory is unusable, 'save' will skip",
@@ -250,6 +256,33 @@ func (s *Session) Close() error { return nil }
 
 // Handle applies the policy for a.Kind and does whatever it asks for.
 func (s *Session) Handle(a bus.Attachment) Handle {
+	// A custom emoji does not follow --media-image: it is always inlined when it
+	// was asked for at all. The reason is the name, or rather the lack of one --
+	// people upload emoji under "emoji_23" or under the bare id they scraped them
+	// from -- so a link or a path to "1110036146588749884.png" would tell the model
+	// nothing about what the message said. --media-emoji governs instead, and that
+	// decision was already taken up in normalize, where "text" creates no
+	// attachment for us to see at all.
+	if a.Origin == bus.OriginEmoji {
+		return s.inline(a)
+	}
+	// A sticker is the same problem wearing a better disguise: it does have a name,
+	// but that name is whatever the uploader felt like typing, and the picture is
+	// still the message. So it gets its own switch rather than inheriting
+	// --media-image, which is set for photographs; save and skip are both there for
+	// callers who want the bytes off the wire. A Lottie sticker has no picture to
+	// inline (it is JSON), so "inline" lands on unsupported and it comes back as a
+	// url like any other non-blockable kind.
+	if a.Origin == bus.OriginSticker {
+		switch s.f.cfg.MediaSticker {
+		case config.MediaSave:
+			return s.save(a)
+		case config.MediaSkip:
+			return skip(SkipPolicy)
+		default: // config.MediaInline
+			return s.inline(a)
+		}
+	}
 	switch s.f.cfg.MediaFor(a.Kind) {
 	case config.MediaMode(ModeInline):
 		return s.inline(a)
@@ -290,9 +323,15 @@ func (s *Session) inline(a bus.Attachment) Handle {
 		s.log.Warn("media: inline read failed", "id", a.ID, "err", err.Error())
 		return skip(SkipError)
 	}
-	s.inlined++
+	ct := pickMIME(a, raw)
+	if a.Origin != bus.OriginEmoji {
+		s.inlined++ // emoji are counted elsewhere; see checkCaps
+	}
 	s.inlinedBytes += int64(len(raw))
-	s.content = append(s.content, block(a.Kind, base64.StdEncoding.EncodeToString(raw), pickMIME(a, raw)))
+	s.content = append(s.content, block(a.Kind, base64.StdEncoding.EncodeToString(raw), ct))
+	// An id-named CDN file is worth remembering: the same emoji in a later message
+	// finds these bytes instead of asking the CDN again.
+	s.f.cache.put(a, raw, ct)
 	return Handle{
 		Media:        MediaBase64,
 		Bytes:        int64(len(raw)),
@@ -380,7 +419,12 @@ func (s *Session) checkCaps(a bus.Attachment) string {
 			return SkipSide
 		}
 	}
-	if lim := cfg.InlineMaxCount; !config.Unlimited(lim) && s.inlined >= lim {
+	// The count gate is a budget for real attachments. Emoji are exempt by design:
+	// how many of them one message gets is decided up in normalize (maxEmojiPerMessage
+	// distinct ones), and sharing a counter with photographs would let one crowd out
+	// the other. The byte caps below still apply, so a poll of nothing but emoji runs
+	// out of bytes rather than of slots.
+	if lim := cfg.InlineMaxCount; a.Origin != bus.OriginEmoji && !config.Unlimited(lim) && s.inlined >= lim {
 		return SkipNoBudget
 	}
 	if lim := cfg.InlineMaxTotalBytes; !config.Unlimited(lim) && s.inlinedBytes >= int64(lim) {
@@ -423,6 +467,10 @@ func (s *Session) fetchCtx() (context.Context, context.CancelFunc) {
 func (s *Session) get(ctx context.Context, a bus.Attachment) (*http.Response, error) {
 	if a.URL == "" {
 		return nil, errors.New("media: attachment has no url")
+	}
+	if raw, mime, ok := s.f.cache.get(a); ok {
+		s.log.Debug("media: cdn cache hit", "id", a.ID, "origin", a.Origin, "bytes", len(raw))
+		return cachedResponse(raw, mime), nil
 	}
 	resp, err := s.open(ctx, a.URL)
 	if err == nil {

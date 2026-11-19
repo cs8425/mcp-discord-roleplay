@@ -371,10 +371,16 @@ func closed(ch chan struct{}) bool {
 func (d *Deps) mediaSummary() map[string]any {
 	cfg := d.Cfg
 	out := map[string]any{
-		"image":        cfg.MediaFor(config.KindImage),
-		"audio":        cfg.MediaFor(config.KindAudio),
-		"video":        cfg.MediaFor(config.KindVideo),
-		"other":        cfg.MediaFor(config.KindOther),
+		"image": cfg.MediaFor(config.KindImage),
+		"audio": cfg.MediaFor(config.KindAudio),
+		"video": cfg.MediaFor(config.KindVideo),
+		"other": cfg.MediaFor(config.KindOther),
+		// Not MediaFor entries: an emoji or a sticker does not follow --media-image.
+		// The image policy is what the operator set for photographs, and these two are
+		// content -- a URL to a file called 1110036146588749884.png says nothing about
+		// what the message meant. See --media-emoji and --media-sticker.
+		"emoji":        cfg.MediaEmoji,
+		"sticker":      cfg.MediaSticker,
 		"can_inline":   cfg.CanInline(),
 		"save_dir":     cfg.MediaOut,
 		"save_enabled": cfg.SaveEnabled(),

@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/hex"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -525,5 +526,189 @@ func TestPrefixComesFromConfig(t *testing.T) {
 	}
 	if joinPrefix("", "x.png") != "x.png" {
 		t.Errorf("no prefix must mean the bare name")
+	}
+}
+
+// --- synthesized CDN files: emoji and stickers --------------------------------
+
+// emojiAtt is what normalize builds for one custom emoji: an image attachment
+// whose URL is derived from its id and whose Origin says where it came from.
+func emojiAtt(id, url string) bus.Attachment {
+	return bus.Attachment{
+		ID: id, Filename: id + ".png", ContentType: "image/png",
+		Kind: bus.KindImage, URL: url, Origin: bus.OriginEmoji,
+	}
+}
+
+// A custom emoji is the one attachment that does not follow --media-image. Its
+// name is usually meaningless, so handing back a path or a URL would deliver no
+// information about what the message said; the bytes are the message.
+func TestEmojiInlinesEvenWhenImagesSave(t *testing.T) {
+	body := []byte{0x89, 'P', 'N', 'G', 1}
+	c := newCDN(t, body)
+	s := fetcherFor(t, testCfg(t, "-media-image=save")).NewSession(context.Background())
+
+	h := s.Handle(emojiAtt("e1", c.at("/emojis/e1.png")))
+	if h.Media != MediaBase64 {
+		t.Fatalf("emoji under a save policy = %q (reason %q), want %q", h.Media, h.Reason, MediaBase64)
+	}
+	if h.Path != "" {
+		t.Errorf("an inlined emoji carries no path, got %q", h.Path)
+	}
+	if len(s.Content()) != 1 {
+		t.Errorf("the content block is the answer, got %d", len(s.Content()))
+	}
+	if c.count() != 1 {
+		t.Errorf("one emoji, one download: %d", c.count())
+	}
+}
+
+// The URL behind an id never changes its answer, so the second message with the
+// same emoji is served from memory: one request for the whole process, across
+// every session and every agent that shares the Fetcher.
+func TestCdnCacheServesAnEmojiOnce(t *testing.T) {
+	body := []byte{0x89, 'P', 'N', 'G', 1, 2, 3}
+	c := newCDN(t, body)
+	f := fetcherFor(t, testCfg(t, "-media-image=inline"))
+
+	for i := 0; i < 3; i++ {
+		s := f.NewSession(context.Background())
+		h := s.Handle(emojiAtt("e7", c.at("/emojis/e7.png")))
+		if h.Media != MediaBase64 {
+			t.Fatalf("round %d: media = %q (reason %q), want %q", i, h.Media, h.Reason, MediaBase64)
+		}
+		blocks := s.Content()
+		if len(blocks) != 1 {
+			t.Fatalf("round %d: %d content blocks, want 1", i, len(blocks))
+		}
+		if want := base64.StdEncoding.EncodeToString(body); blocks[0].Data != want {
+			t.Errorf("round %d: a cached block must hold the same bytes", i)
+		}
+	}
+	if c.count() != 1 {
+		t.Errorf("three sightings of one emoji cost %d downloads, want 1", c.count())
+	}
+}
+
+// An ordinary upload is deliberately not cached: its URL is a path on a CDN that
+// may re-serve something else, and the files are large enough that holding them
+// costs more than asking again. Saving has its own reuse check (the
+// deterministic file name), so the cache only has to cover inline.
+func TestUploadsAreNotCached(t *testing.T) {
+	body := []byte("a picture")
+	c := newCDN(t, body)
+	f := fetcherFor(t, testCfg(t, "-media-image=inline"))
+
+	for i := 0; i < 2; i++ {
+		s := f.NewSession(context.Background())
+		if h := s.Handle(png("a1", c.at("/shot.png"), len(body))); h.Media != MediaBase64 {
+			t.Fatalf("round %d: %q (reason %q)", i, h.Media, h.Reason)
+		}
+	}
+	if c.count() != 2 {
+		t.Errorf("the same upload twice = %d downloads, want 2: uploads are not the cache's business", c.count())
+	}
+}
+
+// The cache is bounded by entry count and by weight, and it declines files that
+// are not the kind of thing it is for.
+func TestCdnCacheBounds(t *testing.T) {
+	c := newCDNCache()
+	urlOf := func(i int) string { return fmt.Sprintf("https://cdn/%d.png", i) }
+
+	over := make([]byte, cacheMaxEntryBytes+1)
+	c.put(emojiAtt("big", "https://cdn/big.png"), over, "image/png")
+	if c.entries() != 0 {
+		t.Fatalf("an over-cap file was stored: %d entries", c.entries())
+	}
+
+	for i := 0; i < cacheMaxEntries+10; i++ {
+		c.put(emojiAtt("e", urlOf(i)), []byte{byte(i), 'x', 'y'}, "image/png")
+	}
+	if got := c.entries(); got != cacheMaxEntries {
+		t.Errorf("entries = %d, want the cap of %d", got, cacheMaxEntries)
+	}
+	if _, _, ok := c.get(emojiAtt("e", urlOf(0))); ok {
+		t.Error("the least recently used entry should have been evicted")
+	}
+	if _, _, ok := c.get(emojiAtt("e", urlOf(cacheMaxEntries+9))); !ok {
+		t.Error("the newest entry should still be held")
+	}
+}
+
+func stickerAtt(id, url, kind string) bus.Attachment {
+	return bus.Attachment{
+		ID: id, Filename: id + ".png", ContentType: "image/png",
+		Kind: kind, URL: url, Origin: bus.OriginSticker,
+	}
+}
+
+// A sticker follows --media-sticker, NOT --media-image: the operator set that one
+// for photographs, and a sticker is content. All three answers have to override the
+// image policy in their own direction.
+func TestStickerFollowsItsOwnSwitch(t *testing.T) {
+	body := []byte{0x89, 'P', 'N', 'G', 1}
+
+	in := newCDN(t, body)
+	s := fetcherFor(t, testCfg(t, "-media-image=save", "-media-out="+t.TempDir(), "-media-sticker=inline")).NewSession(context.Background())
+	if h := s.Handle(stickerAtt("s1", in.at("/stickers/s1.png"), bus.KindImage)); h.Media != MediaBase64 {
+		t.Errorf("sticker=inline over image=save: got %q (reason %q), want %q", h.Media, h.Reason, MediaBase64)
+	}
+
+	dir := t.TempDir()
+	sv := fetcherFor(t, testCfg(t, "-media-image=inline", "-media-sticker=save", "-media-out="+dir)).NewSession(context.Background())
+	h := sv.Handle(stickerAtt("s2", in.at("/stickers/s2.png"), bus.KindImage))
+	if h.Media != MediaFile {
+		t.Fatalf("sticker=save under image=inline: got %q (reason %q), want %q", h.Media, h.Reason, MediaFile)
+	}
+	if _, err := os.Stat(filepath.Join(dir, filepath.Base(h.Path))); err != nil {
+		t.Errorf("the saved sticker is missing: %v", err)
+	}
+
+	c := newCDN(t, body)
+	sk := fetcherFor(t, testCfg(t, "-media-image=inline", "-media-sticker=skip")).NewSession(context.Background())
+	if h := sk.Handle(stickerAtt("s3", c.at("/stickers/s3.png"), bus.KindImage)); h.Media != MediaURL || h.Reason != SkipPolicy {
+		t.Errorf("sticker=skip: got %q/%q, want %q/%q", h.Media, h.Reason, MediaURL, SkipPolicy)
+	}
+	if c.count() != 0 {
+		t.Errorf("skip must not download, got %d requests", c.count())
+	}
+}
+
+// A Lottie sticker is JSON, so the switch cannot conjure a picture out of it: the
+// honest answer is a url that says why, not a base64 blob of a vector animation.
+func TestLottieStickerCannotBeInlined(t *testing.T) {
+	c := newCDN(t, []byte(`{"v":"5.7.4"}`))
+	s := fetcherFor(t, testCfg(t, "-media-sticker=inline")).NewSession(context.Background())
+	h := s.Handle(stickerAtt("s4", c.at("/stickers/s4.json"), bus.KindOther))
+	if h.Media != MediaURL || h.Reason != SkipUnsupported {
+		t.Errorf("lottie sticker = %q/%q, want %q/%q", h.Media, h.Reason, MediaURL, SkipUnsupported)
+	}
+	if c.count() != 0 {
+		t.Errorf("a verdict from the kind alone must not cost a download: %d", c.count())
+	}
+}
+
+// "Independent budget" has to mean both directions: a photograph may not crowd the
+// emoji out of a result, and the emoji may not crowd the photographs out. The byte
+// caps still apply to both.
+func TestEmojiNotCountedAgainstInlineMaxCount(t *testing.T) {
+	body := []byte{0x89, 'P', 'N', 'G', 1}
+	c := newCDN(t, body)
+	s := fetcherFor(t, testCfg(t, "-media-image=inline", "-inline-max-count=1")).NewSession(context.Background())
+
+	if h := s.Handle(png("a1", c.at("/a1"), len(body))); h.Media != MediaBase64 {
+		t.Fatalf("the photo should fit the single slot: %q/%q", h.Media, h.Reason)
+	}
+	for _, id := range []string{"e1", "e2"} {
+		if h := s.Handle(emojiAtt(id, c.at("/emojis/"+id+".png"))); h.Media != MediaBase64 {
+			t.Errorf("emoji %s = %q/%q, want inlined: emoji have their own cap (maxEmojiPerMessage)", id, h.Media, h.Reason)
+		}
+	}
+	if h := s.Handle(png("a2", c.at("/a2"), len(body))); h.Media != MediaURL || h.Reason != SkipNoBudget {
+		t.Errorf("the second photo must still run out of slots: %q/%q", h.Media, h.Reason)
+	}
+	if got := len(s.Content()); got != 3 {
+		t.Errorf("blocks = %d, want 3 (one photo, two emoji)", got)
 	}
 }

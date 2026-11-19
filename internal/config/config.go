@@ -61,6 +61,18 @@ const (
 	KindOther = "other"
 )
 
+// What custom emoji in an inbound message deliver (Config.MediaEmoji). They get
+// their own switch instead of following --media-image because the usual answers do
+// not work for them: the text carries only a code, and the name inside that code is
+// frequently no help at all (people upload under "emoji_23", or under nothing but
+// the id they pulled it from). So the picture is the message, and a URL or a file
+// path tells the model nothing about what was said -- unless the caller turns the
+// whole feature off, which is what text is for.
+const (
+	EmojiInline = "inline" // fetch each distinct emoji of a message as its own image attachment
+	EmojiText   = "text"   // leave the raw <:name:id> codes, create no attachment
+)
+
 // ParseMediaMode validates a user supplied media mode.
 func ParseMediaMode(s string) (MediaMode, error) {
 	switch strings.ToLower(strings.TrimSpace(s)) {
@@ -99,11 +111,13 @@ type Config struct {
 	TextMaxRunes int
 
 	// --- inbound media policy -------------------------------------------------
-	Media      map[string]MediaMode // key: image|audio|video|other
-	MediaOut   string               // "" = save disabled; relative = under the cwd
-	LocalPath  string               // declared prefix for the agent-facing local_path; "" = derive from MediaOut
-	MediaKeep  time.Duration
-	MediaMaxMB int
+	Media        map[string]MediaMode // key: image|audio|video|other
+	MediaEmoji   string               // inline | text, see EmojiInline/EmojiText
+	MediaSticker MediaMode            // inline | save | skip; overrides Media["image"] for stickers
+	MediaOut     string               // "" = save disabled; relative = under the cwd
+	LocalPath    string               // declared prefix for the agent-facing local_path; "" = derive from MediaOut
+	MediaKeep    time.Duration
+	MediaMaxMB   int
 	// The inline caps and the save cap share one rule (decided 2026-11-17):
 	// -1 = no limit, 0 = that mode is switched off, anything else = the limit.
 	InlineMaxBytesImage int
@@ -158,6 +172,7 @@ type Config struct {
 
 	// raw flag values kept private so the public surface stays tidy
 	mImage, mAudio, mVideo, mOther string
+	mSticker                       string
 	rawRoots                       []string
 
 	// toggles
@@ -216,6 +231,9 @@ func Load(args []string) (*Config, error) {
 	fs.StringVar(&c.mAudio, "media-audio", "skip", "policy for inbound audio (skip = never burn tokens on voice)")
 	fs.StringVar(&c.mVideo, "media-video", "skip", "policy for inbound video: inline|save|skip")
 	fs.StringVar(&c.mOther, "media-other", "skip", "policy for any other attachment: inline|save|skip")
+	fs.StringVar(&c.MediaEmoji, "media-emoji", EmojiInline,
+		"what custom emoji in an inbound message deliver: inline (fetch each distinct emoji's picture) | text (keep the <:name:id> codes, no picture)")
+	fs.StringVar(&c.mSticker, "media-sticker", string(MediaInline), "policy for inbound stickers, overriding --media-image: inline|save|skip")
 	fs.StringVar(&c.MediaOut, "media-out", DefaultMediaOut, "directory 'save' writes attachments into, relative to the working directory; empty is only allowed together with --media-save-max-bytes=0")
 	fs.StringVar(&c.LocalPath, "local-path", "", "prefix we put in front of a saved file's name when we tell the agent about it, e.g. /dc-cache; it declares how the cache looks from inside --file-root (the real --media-out may live anywhere, even behind a bind mount), empty = derive from --media-out")
 	fs.DurationVar(&c.MediaKeep, "media-keep", 168*time.Hour, "delete saved attachments older than this at startup (0 wipes the cache, a negative value keeps everything)")
@@ -383,6 +401,20 @@ func (c *Config) finalize() error {
 		}
 		c.Media[kind] = m
 	}
+
+	// 3b. emoji and sticker rendering. Normalized here so the rest of the program can
+	// compare against the constants without thinking about how the flag was typed.
+	c.MediaEmoji = strings.ToLower(strings.TrimSpace(c.MediaEmoji))
+	switch c.MediaEmoji {
+	case EmojiInline, EmojiText:
+	default:
+		return fmt.Errorf("media-emoji: invalid value %q (want inline|text)", c.MediaEmoji)
+	}
+	stickerMode, perr := ParseMediaMode(c.mSticker)
+	if perr != nil {
+		return fmt.Errorf("media-sticker: %w", perr)
+	}
+	c.MediaSticker = stickerMode
 
 	// 4. write-side paths
 	var err error
@@ -602,8 +634,13 @@ func (c *Config) SaveEnabled() bool {
 
 // AnySave reports whether at least one kind asks for the save mode. It decides
 // whether the cache directory has to exist at all: with nothing set to save,
-// the server should not leave an empty folder behind on first run.
+// the server should not leave an empty folder behind on first run. The sticker
+// switch counts too even though it lives outside the per-kind map -- a root that
+// never opens turns every "save" into a silent save_off.
 func (c *Config) AnySave() bool {
+	if c.MediaSticker == MediaSave {
+		return true
+	}
 	for _, k := range []string{KindImage, KindAudio, KindVideo, KindOther} {
 		if c.MediaFor(k) == MediaSave {
 			return true
@@ -739,6 +776,7 @@ func (c *Config) Audit() map[string]any {
 		"media": map[string]any{
 			"image": c.MediaFor(KindImage), "audio": c.MediaFor(KindAudio),
 			"video": c.MediaFor(KindVideo), "other": c.MediaFor(KindOther),
+			"emoji": c.MediaEmoji, "sticker": c.MediaSticker,
 			"out": c.MediaOut, "keep": c.MediaKeep.String(), "max_mb": c.MediaMaxMB,
 			"local_path":     c.LocalPathPrefix(),
 			"save_max_bytes": c.MediaSaveMaxBytes,

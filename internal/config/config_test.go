@@ -366,3 +366,69 @@ func TestLoadToolPrefix(t *testing.T) {
 		t.Fatal("a slash is not part of a tool name")
 	}
 }
+
+// --media-emoji is the one media knob that is not a MediaMode. Custom emoji either
+// get their pictures inlined or keep their codes: "save" is not on the menu, because
+// a saved emoji is a path to a filename nobody chose (see internal/discord/emoji.go
+// for why the name is no help).
+func TestMediaEmojiFlag(t *testing.T) {
+	cfg, err := Load([]string{"-selftest", "-no-file-root"})
+	if err != nil {
+		t.Fatalf("defaults: %v", err)
+	}
+	if cfg.MediaEmoji != EmojiInline {
+		t.Errorf("default MediaEmoji = %q, want %q", cfg.MediaEmoji, EmojiInline)
+	}
+
+	cfg, err = Load([]string{"-selftest", "-no-file-root", "-media-emoji=TEXT"})
+	if err != nil {
+		t.Fatalf("case-insensitive value: %v", err)
+	}
+	if cfg.MediaEmoji != EmojiText {
+		t.Errorf("MediaEmoji = %q, want %q", cfg.MediaEmoji, EmojiText)
+	}
+
+	for _, bad := range []string{"save", "skip", "both"} {
+		if _, err := Load([]string{"-selftest", "-no-file-root", "-media-emoji=" + bad}); err == nil {
+			t.Errorf("media-emoji=%s was accepted, want an error", bad)
+		}
+	}
+}
+
+// --media-sticker is a real MediaMode, but it sits beside --media-image instead of
+// inside it: what the operator set for photographs is not necessarily what a sticker
+// should get, and a sticker is content, so the default is the visible one.
+func TestMediaStickerFlag(t *testing.T) {
+	cfg, err := Load([]string{"-selftest", "-no-file-root"})
+	if err != nil {
+		t.Fatalf("defaults: %v", err)
+	}
+	if cfg.MediaSticker != MediaInline {
+		t.Errorf("default MediaSticker = %q, want %q (a sticker is content)", cfg.MediaSticker, MediaInline)
+	}
+
+	for _, want := range []MediaMode{MediaInline, MediaSave, MediaSkip} {
+		got, err := Load([]string{"-selftest", "-no-file-root", "-media-sticker=" + strings.ToUpper(string(want))})
+		if err != nil {
+			t.Fatalf("media-sticker=%s: %v", want, err)
+		}
+		if got.MediaSticker != want {
+			t.Errorf("media-sticker=%s: got %q", want, got.MediaSticker)
+		}
+	}
+
+	for _, bad := range []string{"text", "both", ""} {
+		if _, err := Load([]string{"-selftest", "-no-file-root", "-media-sticker=" + bad}); err == nil {
+			t.Errorf("media-sticker=%q was accepted, want an error", bad)
+		}
+	}
+
+	// AnySave is what makes the cache root open at all. The sticker switch lives
+	// outside the per-kind map, so it is easy to forget -- and forgetting it turns
+	// every "save" into a silent save_off, which reads like a broken directory.
+	if cfg, err := Load([]string{"-selftest", "-no-file-root", "-media-sticker=save"}); err != nil {
+		t.Fatalf("media-sticker=save: %v", err)
+	} else if !cfg.AnySave() {
+		t.Error("AnySave() is false when only the sticker asks for save: the media root would never open")
+	}
+}

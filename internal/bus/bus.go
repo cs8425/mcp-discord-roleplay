@@ -48,6 +48,18 @@ const (
 	KindOther = "other"
 )
 
+// Where an attachment came from (Attachment.Origin). An upload from Discord leaves
+// it empty. The two non-empty values mark an attachment we assembled ourselves:
+// out of a message's sticker_items, or out of the custom emoji codes in its text
+// (Discord sends no file for those; the client renders them from the id). Both
+// point at a CDN file named by a snowflake id whose
+// bytes Discord never replaces, which is exactly the property that makes them
+// worth caching by URL (see internal/media).
+const (
+	OriginEmoji   = "emoji"
+	OriginSticker = "sticker"
+)
+
 // Author is the normalized sender.
 type Author struct {
 	ID   string `json:"id"`
@@ -65,7 +77,8 @@ type Attachment struct {
 	ID           string  `json:"id"`
 	Filename     string  `json:"filename,omitempty"`
 	ContentType  string  `json:"content_type,omitempty"`
-	Kind         string  `json:"kind"` // image|audio|video|other
+	Kind         string  `json:"kind"`             // image|audio|video|other
+	Origin       string  `json:"origin,omitempty"` // "" = an upload | emoji | sticker
 	Size         int     `json:"size,omitempty"`
 	Width        int     `json:"width,omitempty"`
 	Height       int     `json:"height,omitempty"`

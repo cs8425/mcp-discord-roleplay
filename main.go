@@ -301,9 +301,10 @@ func selftest(cfg *config.Config, rt *router.Router, logger *slog.Logger) int {
 	}
 	report(true, "url attachments are pasted into the message, never fetched by this server")
 	report(true, "upload caps: %d bytes/file, %d files/message", cfg.MaxUploadBytes, cfg.MaxFilesPerMsg)
-	report(true, "inbound media: image=%s audio=%s video=%s other=%s",
+	report(true, "inbound media: image=%s audio=%s video=%s other=%s emoji=%s sticker=%s",
 		cfg.MediaFor(config.KindImage), cfg.MediaFor(config.KindAudio),
-		cfg.MediaFor(config.KindVideo), cfg.MediaFor(config.KindOther))
+		cfg.MediaFor(config.KindVideo), cfg.MediaFor(config.KindOther),
+		cfg.MediaEmoji, cfg.MediaSticker)
 	if !cfg.SaveEnabled() {
 		// --media-save-max-bytes=0 is the one switch that turns saving off (and it
 		// is the only thing that licenses an empty --media-out), so say whether a

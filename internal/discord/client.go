@@ -467,6 +467,14 @@ func (c *Client) normalize(s *discordgo.Session, m *discordgo.Message) *bus.Even
 		// says nothing about another. poll computes it per call.
 	}
 
+	// Stickers and custom emoji keep their content outside `content`, so they become
+	// synthesized attachments with a placeholder left in the text (see emoji.go).
+	// This runs after the truncation above on purpose: a handle like [sticker:gaze]
+	// or the img@N an emoji code turns into is worth more than the last few runes of
+	// a long message, and it must not be cut off from the attachment it names.
+	addStickers(ev, m.StickerItems)
+	addEmoji(ev, c.cfg.MediaEmoji)
+
 	for _, e := range m.Embeds {
 		if e == nil {
 			continue
