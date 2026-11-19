@@ -589,6 +589,16 @@ func TestPollFilters(t *testing.T) {
 		{"two targets", `{"targets":["boss","ami"]}`, []string{"m1", "m2", "d1"}},
 		{"by channel name", `{"channels":["#rp-main"]}`, []string{"m1", "m2"}},
 		{"by channel id", `{"channels":["999000111222333444"]}`, []string{"d1"}},
+		// An alias is the name every other tool takes, so a filter has to take it
+		// too -- and this is the shape of the live trap: the guild channel's Discord
+		// name is not its alias, so before this the alias matched nothing and the
+		// answer came back "turned away by channel", which reads like silence.
+		{"by routing alias", `{"channels":["boss"]}`, []string{"m1", "m2"}},
+		{"canonical spelling in channels", `{"channels":["channel:111222333444555666"]}`, []string{"m1", "m2"}},
+		// A DM's alias resolves to dm:<peer>, and no channel id equals that -- it
+		// matches on the target the router gave the event instead.
+		{"by dm alias", `{"channels":["ami"]}`, []string{"d1"}},
+		{"alias is case-insensitive", `{"channels":["BOSS", "#Rp-Main"]}`, []string{"m1", "m2"}},
 		{"by author name", `{"from":["boss"]}`, []string{"d1"}},
 		{"by author id", `{"from":["u1"]}`, []string{"m1", "m2"}},
 		{"mentions only", `{"mentions_only":true}`, []string{"m2"}},

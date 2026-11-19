@@ -114,7 +114,7 @@ func pollTool(prefix string) *mcp.Tool {
 				"channels": {
 					Type:        mcp.TypeArray,
 					Items:       &mcp.Schema{Type: mcp.TypeString},
-					Description: "Only messages whose channel id or channel name matches (case-insensitive, leading # optional).",
+					Description: "Only messages whose channel id, channel name, or routing alias matches (case-insensitive; a leading # and a channel: prefix are ignored).",
 				},
 				"from": {
 					Type:        mcp.TypeArray,
@@ -584,8 +584,20 @@ func (d *Deps) newFilter(p router.Principal, a *pollArgs) (*pollFilter, error) {
 	}
 	for _, c := range a.Channels {
 		s := strings.TrimSpace(c)
-		if s != "" {
-			f.channels[strings.ToLower(strings.TrimPrefix(s, "#"))] = true
+		if s == "" {
+			continue
+		}
+		f.channels[channelKey(s)] = true
+		// An alias has to work here too. Every other tool takes one (`send`,
+		// `history`, `get`), and a filter that matches nothing does not report an
+		// unknown name -- it just says the messages were turned away by `channel`,
+		// which reads exactly like "nobody talked". Live it bit us: the channel's
+		// Discord name is 一般 while our alias is test, so {"channels":["test"]}
+		// emptied the answer. Resolve it and register everything the answer could
+		// be addressed by; an unknown name still just stays a literal, as above.
+		if ru, ok := d.Router.Resolve(s); ok && !ru.Wildcard {
+			f.channels[channelKey(ru.Alias)] = true
+			f.channels[channelKey(ru.Target)] = true
 		}
 	}
 	for _, u := range a.From {
@@ -632,6 +644,37 @@ func eventTargets(e *bus.Event) []string {
 	return uniq
 }
 
+// channelKey normalizes one side of a `channels` filter: lowercase, trimmed of
+// the decorations both a caller and an event can carry ("#rp-main",
+// "channel:111..."). One function for both sides is the point -- if the filter
+// trimmed something the event did not (or the reverse), the tool description and
+// the code would disagree about what matches.
+func channelKey(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	s = strings.TrimPrefix(s, "#")
+	s = strings.TrimPrefix(s, "channel:")
+	return s
+}
+
+// channelKeys lists what a `channels` filter may match on: the channel id, the
+// name Discord itself gave the channel, and the target the router picked for the
+// event (our alias live, e.g. "test", or the canonical "channel:<id>" as tests
+// build it). The last one is what makes an alias -- and a DM alias, whose id is
+// a peer id no channel id can equal -- work at all.
+func channelKeys(e *bus.Event) []string {
+	out := make([]string, 0, 3)
+	seen := make(map[string]bool, 3)
+	for _, raw := range []string{e.ChannelID, e.ChannelName, e.Target} {
+		k := channelKey(raw)
+		if k == "" || seen[k] {
+			continue
+		}
+		seen[k] = true
+		out = append(out, k)
+	}
+	return out
+}
+
 // eventKind names the target kind an event belongs to, which is what a wildcard
 // filter ("dm:*") matches on.
 func eventKind(e *bus.Event) string {
@@ -672,8 +715,8 @@ func (f *pollFilter) reject(e *bus.Event) string {
 	}
 	if len(f.channels) > 0 {
 		hit := false
-		for _, t := range []string{strings.ToLower(e.ChannelID), strings.ToLower(e.ChannelName)} {
-			if t != "" && f.channels[t] {
+		for _, t := range channelKeys(e) {
+			if f.channels[t] {
 				hit = true
 				break
 			}
