@@ -109,6 +109,14 @@ func (d *Deps) toolStatus() string { return ToolName(d.prefix(), "status") }
 func (d *Deps) toolPoll() string   { return ToolName(d.prefix(), "poll") }
 func (d *Deps) toolSend() string   { return ToolName(d.prefix(), "send") }
 
+// toolHistory, toolGet and toolChannels do the same for the three read tools.
+// They are named here rather than spelled inline because "history" in prose has
+// to survive --tool-prefix: advice that points at a tool nobody registered is
+// worse than no advice.
+func (d *Deps) toolHistory() string  { return ToolName(d.prefix(), "history") }
+func (d *Deps) toolGet() string      { return ToolName(d.prefix(), "get") }
+func (d *Deps) toolChannels() string { return ToolName(d.prefix(), "channels") }
+
 // RegisterAll registers the tools available in this build. Each is declared with
 // its bare name and picks up --tool-prefix from the registry; the constructors
 // are handed the same prefix so the text they write names the tools the way the
@@ -128,7 +136,9 @@ func RegisterAll(reg *mcp.Registry, d *Deps) error {
 		{statusTool(d.prefix()), d.handleStatus},
 		{sendTool(d.prefix()), d.handleSend},
 		{pollTool(d.prefix()), d.handlePoll},
-		// M3: {historyTool(d.prefix()), d.handleHistory}, {channelsTool(d.prefix()), d.handleChannels}
+		{historyTool(d.prefix()), d.handleHistory},
+		{getTool(d.prefix()), d.handleGet},
+		{channelsTool(d.prefix()), d.handleChannels},
 	}
 	for _, p := range plan {
 		// Names are still bare at this point -- the registry prefixes them as it

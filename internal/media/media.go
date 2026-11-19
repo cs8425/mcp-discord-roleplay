@@ -293,6 +293,26 @@ func (s *Session) Handle(a bus.Attachment) Handle {
 	}
 }
 
+// HandleAs applies one explicit mode to one attachment instead of the configured
+// policy, and is what the read tools use to answer "fetch me this file".
+//
+// It is deliberately narrow: ModeSkip means "metadata only" and reports
+// reason:"policy" exactly like Handle would when the configuration says skip, so
+// a skipped attachment looks the same no matter which door it came in. Emoji and
+// stickers keep their own switches only in Handle -- a caller who says inline on
+// get means this file, right now, whatever it is.
+func (s *Session) HandleAs(a bus.Attachment, mode Mode) Handle {
+	switch mode {
+	case ModeInline:
+		return s.inline(a)
+	case ModeSave:
+		return s.save(a)
+	case ModeSkip:
+		return skip(SkipPolicy)
+	}
+	return s.Handle(a)
+}
+
 // inline fetches the file and appends it as a content block. Only image and
 // audio have a block type in MCP at all (mcptransport/content.go emits data
 // for nothing else), so a video set to inline is reported as unsupported

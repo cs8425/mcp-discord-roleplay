@@ -345,7 +345,7 @@ func (d *Deps) handlePoll(ctx context.Context, call *mcp.Call) (*mcp.ToolResult,
 	// Second phase: the queue lock is gone, so this is where the bytes are
 	// fetched. msgs is written through (it IS st.msgsOut), so the JSON built
 	// below carries the verdicts, and the blocks go after it.
-	blocks, mnotes := d.applyMedia(ctx, msgs, st.kept)
+	blocks, mnotes := d.applyMediaWith(ctx, msgs, st.kept, (*media.Session).Handle)
 	relabelPlaceholders(msgs, st.kept) // after the verdicts: the number IS the block index
 	notes = append(notes, mnotes...)
 
@@ -385,17 +385,24 @@ func (d *Deps) handlePoll(ctx context.Context, call *mcp.Call) (*mcp.ToolResult,
 	return res, nil
 }
 
-// applyMedia is the second half of a poll: it runs the media policy over the
-// attachments this call actually kept and returns the content blocks they grew
-// into, plus notes worth telling the model.
+// mediaPicker is the one decision applyMediaWith delegates: given a session and
+// one attachment, produce its Handle. Poll passes (*media.Session).Handle and
+// gets the configured --media-* policy; the read tools pass a closure around
+// HandleAs so a caller who asked for "inline" on one message gets it without
+// anybody pretending the deployment's default changed.
+type mediaPicker func(*media.Session, bus.Attachment) media.Handle
+
+// applyMediaWith is the second half of a poll, and of the read tools: it runs a
+// media policy over the attachments this call actually kept and returns the
+// content blocks they grew into, plus notes worth telling the model.
 //
-// kept is the drain's own record of which event produced which message, in the
+// kept is the caller's own record of which event produced which message, in the
 // same order, so kept[i].Attachments is where the bytes for
 // msgs[i].Attachments come from. Nothing trims the attachment lists any more
 // (the byte budget only negotiates text), so the two line up exactly — which is
 // still the point of splitting poll into two phases: a message left in the queue
 // for the next poll never costs a download now.
-func (d *Deps) applyMedia(ctx context.Context, msgs []pollMessage, kept []*bus.Event) ([]mcp.ContentPart, []string) {
+func (d *Deps) applyMediaWith(ctx context.Context, msgs []pollMessage, kept []*bus.Event, pick mediaPicker) ([]mcp.ContentPart, []string) {
 	if d.Media == nil || len(msgs) == 0 {
 		return nil, nil
 	}
@@ -416,7 +423,7 @@ func (d *Deps) applyMedia(ctx context.Context, msgs []pollMessage, kept []*bus.E
 				break // ditto: the wire list is a prefix of the event's
 			}
 			before := len(sess.Content())
-			h := sess.Handle(ev.Attachments[j])
+			h := pick(sess, ev.Attachments[j])
 			att := &msgs[i].Attachments[j]
 			att.Media, att.Reason, att.Bytes, att.Path = h.Media, h.Reason, h.Bytes, h.Path
 			switch h.Media {
@@ -953,6 +960,10 @@ type attWire struct {
 }
 
 type msgWire struct {
+	// ID is the Discord message id: the handle the read tools take. It costs a
+	// poll roughly twenty bytes a message and buys the ability to follow up on a
+	// row whose attachment came back as a bare url.
+	ID           string      `json:"id,omitempty"`
 	Target       string      `json:"target,omitempty"`
 	Author       string      `json:"author"`
 	AuthorID     string      `json:"author_id,omitempty"`
@@ -970,6 +981,7 @@ type msgWire struct {
 // wire projects the working form onto what the model receives.
 func (m pollMessage) wire() msgWire {
 	out := msgWire{
+		ID:           m.ID,
 		Target:       m.Target,
 		Author:       m.From.Name,
 		AuthorID:     m.From.ID,

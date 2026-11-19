@@ -380,6 +380,11 @@ func (d *Deps) targetHint(reason string) string {
 		return "that target belongs to a different agent; run this server with --agent for the right persona"
 	case "write_denied":
 		return "you may not speak here: this target is read-only for you (its write default, or your agent's override); the operator decides in routing.json"
+	case "read_denied":
+		// The read twin of the line above, and the reason the read tools have
+		// their own resolution: "can I see this" and "can I talk here" are two
+		// different questions a routing file answers separately.
+		return "you may not read here: this target is not readable for you (its read default, or your agent's override); " + d.toolStatus() + " lists the aliases you may read"
 	default:
 		return "cannot resolve that target"
 	}

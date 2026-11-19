@@ -102,6 +102,11 @@ type Client struct {
 	// message, and the two listing calls channels needs. nil means the live
 	// session's own calls, which is what production does.
 	read *readSeam
+
+	// hooks is the door the tools package uses to answer "what did Discord say"
+	// without a network or a gateway session. It speaks bus.Event, not discordgo,
+	// because that is the language both sides already share. Zero in production.
+	hooks ReadHooks
 }
 
 // New builds a client; nothing is connected until Start. Inbound events are

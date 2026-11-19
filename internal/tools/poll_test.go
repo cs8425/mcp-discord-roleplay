@@ -496,7 +496,10 @@ func TestPollWireKeysAreExactlyThese(t *testing.T) {
 	}
 
 	m := firstMsg(t, out)
-	want := "age_s,attachments,author,author_id,embeds,target,text,ts"
+	// `id` joined the message layer with M3: without it a poll row is a dead end
+	// -- `get` needs an id to fetch one message's attachment bytes, and "url only"
+	// is exactly what poll hands out. ~20 B per row buys the way back in.
+	want := "age_s,attachments,author,author_id,embeds,id,target,text,ts"
 	if got := keySet(m); got != want {
 		t.Errorf("message keys =\n  %s\nwant\n  %s", got, want)
 	}
@@ -513,6 +516,8 @@ func TestPollWireKeysAreExactlyThese(t *testing.T) {
 	}
 	// The one id that earns its bytes: to:"dm:<id>" is built from it.
 	wantStr(t, m, "author_id", "u1")
+	// And the row says which message it was, so a later `get` can name it.
+	wantStr(t, m, "id", "m1")
 }
 
 // A placeholder author id must not reach the wire: quoting it back as

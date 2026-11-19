@@ -68,6 +68,27 @@ type readSeam struct {
 	guildChannels func(ctx context.Context, guildID string) ([]*discordgo.Channel, error)
 }
 
+// ReadHooks is the same three questions the read tools ask, answerable by a
+// caller OUTSIDE this package -- which in practice means the tools' tests. They
+// do not want to fake discordgo (this package's own tests do that, and that is
+// where the gateway/REST mapping is proven); they want to say "Discord answered
+// like this" in the language both sides speak, bus.Event.
+//
+// A nil hook leaves the real REST path alone, and production runs with all three
+// nil, so this door costs nothing there.
+type ReadHooks struct {
+	History      func(ctx context.Context, q HistoryQuery) ([]*bus.Event, error)
+	Get          func(ctx context.Context, channelID, messageID string) (*bus.Event, error)
+	ListChannels func(ctx context.Context, guildID string) ([]GuildInfo, error)
+}
+
+// SetReadHooks installs the hooks above. Test-only: no production path calls it.
+func (c *Client) SetReadHooks(h ReadHooks) {
+	if c != nil {
+		c.hooks = h
+	}
+}
+
 // reader returns the seam, wrapping the live session when there is none. A
 // client that never got a session cannot read either, and says so in the same
 // words send uses.
@@ -151,6 +172,9 @@ type HistoryQuery struct {
 // newest-first -- that is what a "before" cursor wants -- but a transcript
 // reads the other way, so we flip once here and nothing upstream has to.
 func (c *Client) History(ctx context.Context, q HistoryQuery) ([]*bus.Event, error) {
+	if c.hooks.History != nil {
+		return c.hooks.History(ctx, q)
+	}
 	r, se := c.reader()
 	if se != nil {
 		return nil, se
@@ -192,6 +216,9 @@ func (c *Client) History(ctx context.Context, q HistoryQuery) ([]*bus.Event, err
 // endpoint answers even when the message was never in our ring -- including its
 // attachments, which `get` then hands to the media pipeline.
 func (c *Client) GetOne(ctx context.Context, channelID, messageID, name string) (*bus.Event, error) {
+	if c.hooks.Get != nil {
+		return c.hooks.Get(ctx, channelID, messageID)
+	}
 	r, se := c.reader()
 	if se != nil {
 		return nil, se
@@ -263,6 +290,9 @@ type GuildInfo struct {
 //   - our ACL. What exists is Discord's business; what this agent may write to
 //     is ours, and the two must not be blended into one number.
 func (c *Client) ListChannels(ctx context.Context, guildID string) ([]GuildInfo, error) {
+	if c.hooks.ListChannels != nil {
+		return c.hooks.ListChannels(ctx, guildID)
+	}
 	r, se := c.reader()
 	if se != nil {
 		return nil, se

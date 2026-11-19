@@ -873,8 +873,10 @@ func TestProseNamesFollowToolPrefix(t *testing.T) {
 	for _, prefix := range []string{"", "discord_", "dc_"} {
 		d := newDeps(t, routingCfg(t, "-tool-prefix="+prefix))
 		status, poll, send := d.toolStatus(), d.toolPoll(), d.toolSend()
-		if status != prefix+"status" || poll != prefix+"poll" || send != prefix+"send" {
-			t.Fatalf("prefix %q produced %q/%q/%q", prefix, status, poll, send)
+		hist, getName, chans := d.toolHistory(), d.toolGet(), d.toolChannels()
+		if status != prefix+"status" || poll != prefix+"poll" || send != prefix+"send" ||
+			hist != prefix+"history" || getName != prefix+"get" || chans != prefix+"channels" {
+			t.Fatalf("prefix %q produced %q/%q/%q/%q/%q/%q", prefix, status, poll, send, hist, getName, chans)
 		}
 		cases := map[string]string{
 			"advice(circuit)": d.sendAdvice(&discord.SendError{Code: discord.CodeCircuitOpen}),
@@ -882,24 +884,84 @@ func TestProseNamesFollowToolPrefix(t *testing.T) {
 			"advice(unknown)": d.sendAdvice(&discord.SendError{Code: discord.CodeUnknownChannel}),
 			"advice(other)":   d.sendAdvice(&discord.SendError{Code: "something_unexpected"}),
 			"hint(empty)":     d.targetHint("empty_target"),
+			"hint(read)":      d.targetHint("read_denied"),
 			"send tool":       sendTool(prefix).Description + " " + sendTool(prefix).InputSchema.Properties["to"].Description,
 			"poll tool":       pollTool(prefix).InputSchema.Properties["targets"].Description,
+			// The three read tools point at each other (poll row -> get, history row
+			// -> get), so their prose has the same obligation as the old three.
+			"history tool":  historyTool(prefix).Description,
+			"get tool":      getTool(prefix).Description,
+			"channels tool": channelsTool(prefix).Description,
 		}
+		names := []string{status, poll, send, hist, getName, chans}
 		for name, text := range cases {
-			if !strings.Contains(text, status) && !strings.Contains(text, poll) && !strings.Contains(text, send) {
+			hit := false
+			for _, n := range names {
+				if strings.Contains(text, n) {
+					hit = true
+					break
+				}
+			}
+			if !hit {
 				t.Errorf("%s (%q) names no tool of this server: %q", name, prefix, text)
 			}
 			if prefix == "" && (strings.Contains(text, "discord_status") ||
 				strings.Contains(text, "discord_poll") || strings.Contains(text, "discord_send")) {
 				t.Errorf("%s still hard-codes a discord_* name: %q", name, text)
 			}
+			// With a prefix in force, advice that says "poll" when the caller has to
+			// type "dc_poll" points at a tool nobody registered. Scoped to the three
+			// read tools: the older prose predates the rule and is not rewritten here.
+			if prefix != "" && isReadToolCase[name] {
+				stripped := text
+				for _, n := range names {
+					stripped = strings.ReplaceAll(stripped, n, " ")
+				}
+				for _, bare := range []string{"poll", "history", "send"} {
+					if hasBareWord(stripped, bare) {
+						t.Errorf("%s (%q) leaves a bare %q where the prefix is required: %q", name, prefix, bare, text)
+					}
+				}
+			}
 		}
 	}
 }
 
+// hasBareWord reports whether word appears with no letter, digit or underscore
+// glued to either side -- so "get" inside "target" does not count.
+func hasBareWord(text, word string) bool {
+	for i := 0; i+len(word) <= len(text); {
+		if strings.HasPrefix(text[i:], word) {
+			leftOK := i == 0 || !isNameByte(text[i-1])
+			right := i + len(word)
+			rightOK := right == len(text) || !isNameByte(text[right])
+			if leftOK && rightOK {
+				return true
+			}
+		}
+		i++
+	}
+	return false
+}
+
+// isNameByte is true for the bytes that glue a word to its neighbours. A hyphen
+// counts: "--history-max-bytes" is a flag name, not advice that says "history".
+func isNameByte(b byte) bool {
+	return b == '_' || b == '-' || (b >= '0' && b <= '9') || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
+}
+
+// isReadToolCase marks the three prose samples that carry the stricter rule:
+// their text is new, so it has no excuse to name a tool the way the caller
+// cannot type it.
+var isReadToolCase = map[string]bool{
+	"history tool":  true,
+	"get tool":      true,
+	"channels tool": true,
+}
+
 func TestEveryRejectionReasonHasAHint(t *testing.T) {
 	d := newDeps(t, routingCfg(t))
-	for _, r := range []string{"empty_target", "no_last_target", "unknown_target", "not_allowlisted", "foreign_agent", "write_denied"} {
+	for _, r := range []string{"empty_target", "no_last_target", "unknown_target", "not_allowlisted", "foreign_agent", "write_denied", "read_denied", "wildcard_target"} {
 		if h := d.targetHint(r); h == "" || strings.Contains(h, "cannot resolve that target") {
 			t.Errorf("hint for %s should be specific, got %q", r, h)
 		}
