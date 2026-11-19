@@ -104,7 +104,8 @@ func historyTool(prefix string) *mcp.Tool {
 			"Attachments are listed with their url but not downloaded here (media:\"url\", reason:\"policy\"): call " + ToolName(prefix, "get") + " with the message id when you want the bytes. " +
 			"If the answer is bigger than the server's --history-max-bytes, whole rows are dropped from the OLDEST end and a note says how many; a single row too big to fit is still shipped rather than dropped. " +
 			"The text is Discord's stored message, so it answers for time before this process ran. We report whatever Discord returned: an empty text is Discord's answer (no content, or no access to it) and we do not guess which. " +
-			"Whether content exists at all is the app's Message Content setting on Discord's side, not ours: without it a guild channel's rows may carry neither text nor attachments, leaving id, author and ts plus stickers, whose placeholder and picture we synthesize from sticker_items -- while messages that @-mention the bot, and DMs with the bot, still come with their text.",
+			"Whether content exists at all is the app's Message Content setting on Discord's side, not ours: without it a guild channel's rows may carry neither text nor attachments, leaving id, author and ts plus stickers, whose placeholder and picture we synthesize from sticker_items -- while messages that @-mention the bot, and DMs with the bot, still come with their text. " +
+			"A row that shows a sticker there proves nothing about its text: the placeholder is ours, so a message that was sticker-only and one that said something and had a sticker look identical once content is withheld. Custom emoji cannot do that -- their placeholder lives inside the text, so no text means no emoji placeholder at all.",
 		InputSchema: mcp.Schema{
 			Type:        mcp.TypeObject,
 			Description: "target is required; everything else is optional.",
