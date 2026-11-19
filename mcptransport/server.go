@@ -29,7 +29,8 @@ type Server struct {
 	Reg *Registry
 
 	// RequestTimeout bounds each MCP request end-to-end (0 disables). It caps the
-	// whole tool call, on top of the per-CDP-call deadline the Core applies.
+	// whole tool call, on top of the per-request timeout the Discord client applies
+	// (--read-timeout) and send's own budget/gap bookkeeping.
 	RequestTimeout time.Duration
 }
 
