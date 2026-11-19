@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -132,7 +133,12 @@ func TestPathPolicyRejectsEverythingOutside(t *testing.T) {
 			t.Errorf("Open(%q) failed: %v", ok, err)
 			continue
 		}
-		if want := filepath.Base(ok); o.Name != want {
+		// The name we report is the file's base name inside the root, with the
+		// cosmetic leading slashes gone. Note this is path.Base on a slashed string,
+		// NOT filepath.Base: on Windows "//inside.txt" reads as a UNC server with no
+		// share, so filepath.Base returns "\\" and the assertion would fail on a
+		// correct answer (live: GHA windows job, 2026-11-20).
+		if want := path.Base(filepath.ToSlash(ok)); o.Name != want {
 			t.Errorf("Open(%q) name = %q, want %q", ok, o.Name, want)
 		}
 		_ = o.Close()

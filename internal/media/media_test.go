@@ -587,8 +587,12 @@ func TestPrefixComesFromConfig(t *testing.T) {
 	if got := f.Prefix(); got != "/dc-cache" {
 		t.Errorf("prefix = %q", got)
 	}
-	if got := f.Dir(); got != dir {
-		t.Errorf("dir = %q, want the cache directory %q", got, dir)
+	// Dir() is deliberately slash-normalized (cleanDir runs filepath.ToSlash: the
+	// local_path we hand the model always reads with "/"), while t.TempDir() on
+	// Windows comes back with backslashes -- so compare the same form the code
+	// promises, or a correct answer fails the test (live: GHA windows, 2026-11-20).
+	if got, want := f.Dir(), filepath.ToSlash(dir); got != want {
+		t.Errorf("dir = %q, want the cache directory %q", got, want)
 	}
 	if joinPrefix("", "x.png") != "x.png" {
 		t.Errorf("no prefix must mean the bare name")
