@@ -234,7 +234,7 @@ func selftest(cfg *config.Config, rt *router.Router, logger *slog.Logger) int {
 		report(true, "intents: %s (MessageContent is privileged — enable it in the Developer Portal)",
 			strings.Join(discord.IntentsList(true), "|"))
 	} else {
-		report(true, "intents: %s (Message Content intent OFF by --no-message-content: incoming text is always empty)",
+		report(true, "intents: %s (Message Content intent OFF by --no-message-content: incoming text is usually empty; @-mentions, DMs and our own sends still carry it)",
 			strings.Join(discord.IntentsList(false), "|"))
 	}
 

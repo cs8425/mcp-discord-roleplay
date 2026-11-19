@@ -166,8 +166,11 @@ func (d *Deps) deploymentNote(name string) string {
 	case "poll":
 		if !d.Cfg.MessageContentEnabled() {
 			return "In this deployment the Message Content intent is off, so incoming " +
-				"text is always empty: a poll proves that something arrived, not what " +
-				"was said -- mentions, attachments and embeds still work."
+				"text is usually empty: a poll proves that something arrived, not what " +
+				"was said. Three cases still arrive with text: messages that @-mention " +
+				"this bot, DMs with it, and its own sends. Stickers are unaffected -- " +
+				"their placeholder and picture are built from sticker_items, not from " +
+				"content."
 		}
 	case "send":
 		if d.Cfg.DryRun {
