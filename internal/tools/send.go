@@ -47,6 +47,8 @@ func sendTool(prefix string) *mcp.Tool {
 			"to: an alias listed by " + ToolName(prefix, "status") + ", 'channel:<id>', 'dm:<id>', '#name', '@name', a bare channel id, " +
 			"'me' (a DM to the bot itself), or 'last' (the target this agent spoke to most recently). " +
 			"A body longer than 2000 characters is split into several messages sent in order. " +
+			"reply_to quotes one of this channel's messages above ours, without pinging its author; " +
+			"pass an id we handed you — one Discord cannot see simply sends the message unquoted. " +
 			"files[].path is read on the server from the --file-root directories and uploaded as a real attachment: " +
 			"give it relative to that root and never base64. files[].url is NOT downloaded - the link is pasted " +
 			"into the message and Discord renders it. @everyone, role and user pings are stripped by the server " +
@@ -64,6 +66,10 @@ func sendTool(prefix string) *mcp.Tool {
 				"text": {
 					Type:        mcp.TypeString,
 					Description: "message body. May be empty when files carry the message. Newlines are kept.",
+				},
+				"reply_to": {
+					Type:        mcp.TypeString,
+					Description: "id of a message to quote, as it appears on the rows of poll/history/get; only the first part of a split message carries it",
 				},
 				"files": {
 					Type:        mcp.TypeArray,
@@ -85,10 +91,34 @@ func sendTool(prefix string) *mcp.Tool {
 	}
 }
 
+// validMessageID is the shape a Discord id has: all digits, and long enough to be
+// a snowflake rather than a finger-count. It is deliberately not a strict check
+// (an id of the wrong shape can still be a real message we cannot fetch), it is
+// the guard that stops "last" or a URL from being pasted into reply_to.
+//
+// 19 is not a guess: a snowflake IS an int64 (ms since the Discord epoch, shifted
+// 22 bits, plus worker/increment), so no id can ever be longer, and the 20-digit
+// string a model produces when it fat-fingers one more digit is a typo rather than
+// a message. The 15 side is loose on purpose — it only has to be too short to be a
+// plausible id, because a genuine-but-ancient id costs us nothing but a soft
+// reference that lands nowhere.
+func validMessageID(s string) bool {
+	if len(s) < 15 || len(s) > 19 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 type sendArgs struct {
-	To    string      `json:"to"`
-	Text  string      `json:"text"`
-	Files []files.Ref `json:"files"`
+	To      string      `json:"to"`
+	Text    string      `json:"text"`
+	ReplyTo string      `json:"reply_to,omitempty"`
+	Files   []files.Ref `json:"files"`
 }
 
 func (d *Deps) handleSend(ctx context.Context, call *mcp.Call) (*mcp.ToolResult, error) {
@@ -97,6 +127,15 @@ func (d *Deps) handleSend(ctx context.Context, call *mcp.Call) (*mcp.ToolResult,
 		return errResult("bad_arguments", err.Error(), nil), nil
 	}
 	p := d.principal(ctx)
+
+	// Checked before anything is spent on routing or opening files: the shape is
+	// the model's doing, and a typo here would otherwise surface as a Discord 400
+	// that says less than this does.
+	if a.ReplyTo != "" && !validMessageID(a.ReplyTo) {
+		return errResult("bad_arguments",
+			fmt.Sprintf("reply_to must be a message id (digits, about 18 of them), got %q: copy it from the id of a message in poll, history or get",
+				a.ReplyTo), nil), nil
+	}
 
 	if d.DC == nil {
 		return errResult(discord.CodeNotConnected,
@@ -203,6 +242,9 @@ func (d *Deps) handleSend(ctx context.Context, call *mcp.Call) (*mcp.ToolResult,
 		"kind":       ru.Kind,
 		"channel_id": chanID,
 	}
+	if a.ReplyTo != "" {
+		extra["reply_to"] = a.ReplyTo
+	}
 
 	ids := make([]string, 0, len(parts))
 	var lastRes *discord.SendResult
@@ -218,6 +260,12 @@ func (d *Deps) handleSend(ctx context.Context, call *mcp.Call) (*mcp.ToolResult,
 			}
 		}
 		req := discord.SendRequest{ChannelID: chanID, Text: part}
+		if i == 0 {
+			// The quote belongs on the first part only: a body split in three is one
+			// statement, and repeating the quoted message above every part would make
+			// it look like three separate answers.
+			req.ReplyTo = a.ReplyTo
+		}
 		if i == len(parts)-1 {
 			req.Files = opened // attachments ride on the last part only
 		}

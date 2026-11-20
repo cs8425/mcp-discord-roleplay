@@ -132,6 +132,19 @@ type Event struct {
 	// Truncated means Text is not the whole original message.
 	Truncated bool `json:"truncated,omitempty"`
 
+	// Reply is set when this message quotes another one: a Discord reply. It is
+	// nil for a plain message and for a forward (which references a message in
+	// another place, not one it is answering).
+	Reply *Reply `json:"reply,omitempty"`
+
+	// Forwarded marks a message whose words came from somewhere else. Discord
+	// hands a forward an empty content and puts the quoted text (and its
+	// attachments, embeds and stickers) into message_snapshots; normalize lets
+	// that snapshot fill the holes the forwarding message left empty. A snapshot
+	// carries no author, so a forward names the person who forwarded it and never
+	// the person who originally wrote it.
+	Forwarded bool `json:"forwarded,omitempty"`
+
 	MentionsSelf bool         `json:"mentions_self,omitempty"`
 	Attachments  []Attachment `json:"attachments,omitempty"`
 	Embeds       []Embed      `json:"embeds,omitempty"`
@@ -139,6 +152,30 @@ type Event struct {
 	// Extra holds kind-specific fields (e.g. peer) so future event types do
 	// not need to change this struct.
 	Extra map[string]string `json:"extra,omitempty"`
+}
+
+// Reply is the message a message answers, as Discord sends it: an id
+// (message_reference) plus, when the backend fetched it, the quoted message
+// object (referenced_message). The two can disagree, and discordgo flattens
+// that: it types referenced_message as *Message, so "Discord did not go look"
+// and "the quoted message was deleted" both arrive as nil. We therefore never
+// claim which of the two it was -- an empty Author and Text simply means all we
+// hold is the id, and the id is enough: the quoted message lives in the same
+// channel, so the read tools can be asked for it.
+type Reply struct {
+	// ID is the quoted message's Discord id: the handle dc_get takes.
+	ID string `json:"id,omitempty"`
+
+	// AuthorID names the quoted author for the state cache; Author is the label
+	// that reaches the model (guild nickname when we know one, else the name
+	// Discord put on the quoted message).
+	AuthorID string `json:"-"`
+	Author   string `json:"author,omitempty"`
+
+	// Text is the quoted message's content as Discord handed it over, NOT yet
+	// shortened for the wire: how much of it a caller sees is the read tool's
+	// decision (--reply-max-bytes), taken per call like every other budget here.
+	Text string `json:"text,omitempty"`
 }
 
 // Stats is a snapshot of one Queue.

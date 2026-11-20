@@ -55,6 +55,10 @@ var rowKeys = map[string]bool{
 	"id": true, "author": true, "author_id": true, "bot": true, "dm": true,
 	"ts": true, "age_s": true, "text": true, "text_truncated": true,
 	"mentions_self": true, "attachments": true, "embeds": true, "target": true,
+	// Voted 2026-11-20, for reply_to: a message that answers another one is not the
+	// same sentence without that. `reply_to` is who and a head of what they said
+	// (--reply-max-bytes), `forwarded` says the words are not this person's.
+	"reply_to": true, "forwarded": true,
 }
 
 func assertRowKeys(t *testing.T, row map[string]any, banned ...string) {

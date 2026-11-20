@@ -172,6 +172,12 @@ type pollMessage struct {
 
 	MentionsSelf bool `json:"mentions_self,omitempty"`
 
+	// Reply is the message this one quotes, with its snippet already cut to
+	// --reply-max-bytes (nil: this row answers nobody). Forwarded marks words that
+	// came from elsewhere — see bus.Event.
+	Reply     *bus.Reply `json:"reply,omitempty"`
+	Forwarded bool       `json:"forwarded,omitempty"`
+
 	Attachments []pollAttachment `json:"attachments,omitempty"`
 	Embeds      []bus.Embed      `json:"embeds,omitempty"`
 }
@@ -918,6 +924,8 @@ func (d *Deps) buildMessage(p router.Principal, e *bus.Event) pollMessage {
 		Text:          e.Text,
 		TextTruncated: e.Truncated,
 		MentionsSelf:  e.MentionsSelf,
+		Reply:         e.Reply,
+		Forwarded:     e.Forwarded,
 		Attachments:   make([]pollAttachment, 0, len(e.Attachments)),
 		Embeds:        e.Embeds,
 	}
@@ -928,6 +936,13 @@ func (d *Deps) buildMessage(p router.Principal, e *bus.Event) pollMessage {
 	}
 	if !e.Ts.IsZero() {
 		m.AgeS = round1(time.Since(e.Ts).Seconds())
+	}
+	if m.Reply != nil {
+		// The event is shared and must stay whole; the cut happens on this call's
+		// copy, exactly like a trimmed text does.
+		copied := *m.Reply
+		copied.Text = cutRunes(copied.Text, d.Cfg.ReplyMaxBytes)
+		m.Reply = &copied
 	}
 	for _, a := range e.Attachments {
 		m.Attachments = append(m.Attachments, pollAttachment{
@@ -940,19 +955,59 @@ func (d *Deps) buildMessage(p router.Principal, e *bus.Event) pollMessage {
 }
 
 // messageCost is what one message contributes to --poll-max-bytes: the bytes of
-// its `text`, nothing else. The flag is a fuse against a single oversized
-// message, not a size meter for the reply: JSON overhead, attachment entries and
-// base64 content blocks are priced elsewhere (--inline-max-count and friends).
-// Counting them here is what used to force a fresh Marshal per trimming step.
-func messageCost(m pollMessage) int { return len(m.Text) }
+// its `text` plus the quoted line it carries, nothing else. The flag is a fuse
+// against a single oversized message, not a size meter for the reply: JSON
+// overhead, attachment entries and base64 content blocks are priced elsewhere
+// (--inline-max-count and friends). Counting them here is what used to force a
+// fresh Marshal per trimming step. A quote is text in everything but name, so it
+// pays its way in or the fuse stops meaning what it says.
+func messageCost(m pollMessage) int {
+	cost := len(m.Text)
+	if m.Reply != nil {
+		cost += len(m.Reply.Text)
+	}
+	return cost
+}
+
+// cutRunes keeps the head of s within max BYTES, never splitting a rune: max < 0
+// means no cap, 0 means "drop it", which is how --reply-max-bytes=0 turns the
+// quoted text off while keeping the id and the name.
+func cutRunes(s string, max int) string {
+	if max < 0 || len(s) <= max {
+		return s
+	}
+	if max == 0 {
+		return ""
+	}
+	cut := 0
+	for cut < len(s) {
+		_, size := utf8.DecodeRuneInString(s[cut:])
+		if cut+size > max {
+			break
+		}
+		cut += size
+	}
+	return s[:cut]
+}
 
 // fitMessage cuts m.Text down to room bytes, keeping its head, and notes how
 // big the text really was. Only the first message of a drain can reach here (the
-// drain stops before every later one), and only the text is negotiable: dropping
-// attachments or embeds to save bytes was what let a message ship as an empty
-// shell. The cut lands on a rune boundary, so the reply never carries half a
-// UTF-8 character.
+// drain stops before every later one), and only the words are negotiable — the
+// quote is negotiable before the text is, because it summarises a message the
+// caller can still go and read in full. Dropping attachments or embeds to save
+// bytes was what let a message ship as an empty shell. The cut lands on a rune
+// boundary, so the reply never carries half a UTF-8 character.
 func fitMessage(m *pollMessage, room int, st *drainState) {
+	if messageCost(*m) <= room {
+		return
+	}
+	if m.Reply != nil && m.Reply.Text != "" {
+		// The quote is the first thing to go: it is a courtesy summary of a message
+		// the caller can fetch in full, while this row's own text is what it came
+		// to read. The id and the name survive — only the words cost too much.
+		m.Reply.Text = ""
+		st.notes = append(st.notes, "the quoted message's text was dropped to keep this message inside --poll-max-bytes")
+	}
 	if len(m.Text) <= room {
 		return
 	}
@@ -1019,8 +1074,21 @@ type msgWire struct {
 	Text         string      `json:"text,omitempty"`
 	TextCut      bool        `json:"text_truncated,omitempty"`
 	MentionsSelf bool        `json:"mentions_self,omitempty"`
+	Reply        *replyWire  `json:"reply_to,omitempty"`
+	Forwarded    bool        `json:"forwarded,omitempty"`
 	Attachments  []attWire   `json:"attachments,omitempty"`
 	Embeds       []embedWire `json:"embeds,omitempty"`
+}
+
+// replyWire is the quoted message as one row can afford to show it: who it was
+// said to and a head of what they said. An entry carrying only an id means
+// Discord did not hand us the quoted message — it may simply not have gone to
+// look, or it may be gone; we report the id and let the caller decide, because
+// dc_get takes it either way.
+type replyWire struct {
+	ID     string `json:"id"`
+	Author string `json:"author,omitempty"`
+	Text   string `json:"text,omitempty"`
 }
 
 // wire projects the working form onto what the model receives.
@@ -1037,6 +1105,10 @@ func (m pollMessage) wire() msgWire {
 		Text:         m.Text,
 		TextCut:      m.TextTruncated,
 		MentionsSelf: m.MentionsSelf,
+		Forwarded:    m.Forwarded,
+	}
+	if m.Reply != nil {
+		out.Reply = &replyWire{ID: m.Reply.ID, Author: m.Reply.Author, Text: m.Reply.Text}
 	}
 	if out.Author == "" {
 		// An unattributed line is worse than an ugly one: fall back to whatever

@@ -37,6 +37,13 @@ const (
 	// the text budget is used and the rest wait for the next poll (in order).
 	DefaultPollMaxBytes = 16384
 
+	// DefaultReplyMaxBytes caps the quoted line a reply row shows: the head of the
+	// message being answered, in bytes. Deliberately small — the whole quoted
+	// message is one dc_get away, same channel, same id — because in a channel
+	// where everyone answers everyone, a quote made of nothing but other people's
+	// words would eat --poll-max-bytes before our own messages got a turn.
+	DefaultReplyMaxBytes = 80
+
 	// DefaultMediaSaveMaxBytes caps a single saved attachment. Discord lets a
 	// file reach ~200 MB and people throw 30-50 MB videos around without
 	// thinking; writing those to disk for an agent that may never read them is
@@ -121,6 +128,11 @@ type Config struct {
 	BusCapacity  int
 	PollMaxBytes int // text-byte budget for one discord_poll call; -1 = unlimited (0 is a rejected typo)
 	TextMaxRunes int
+
+	// ReplyMaxBytes is how much of the quoted message a reply row carries, in
+	// bytes: 0 keeps who-and-which-id and drops the words, -1 ships the whole
+	// quoted text. See DefaultReplyMaxBytes.
+	ReplyMaxBytes int
 
 	// ReadTimeout bounds ONE REST read (history / get / channels), per call. It is
 	// ours, not discordgo's: its own default is 20s (discord.go, New()), which no
@@ -255,6 +267,7 @@ func Load(args []string) (*Config, error) {
 	fs.IntVar(&c.BusCapacity, "bus-capacity", 2000, "per-agent in-memory queue size (messages); the oldest is dropped when full")
 	fs.IntVar(&c.PollMaxBytes, "poll-max-bytes", DefaultPollMaxBytes, "budget for one poll, counted in the bytes of message text only (not JSON); -1 removes the cap")
 	fs.IntVar(&c.TextMaxRunes, "text-max-runes", 4000, "truncate stored message text beyond this many runes")
+	fs.IntVar(&c.ReplyMaxBytes, "reply-max-bytes", DefaultReplyMaxBytes, "bytes of the quoted message shown on a reply row; 0 keeps only the author and the id, -1 is uncapped")
 
 	fs.DurationVar(&c.ReadTimeout, "read-timeout", 10*time.Second, "deadline for one REST read (history/get/channels); discordgo's own default is 20s and its 429 retry sleep is disabled on this path")
 	fs.IntVar(&c.HistoryMaxBytes, "history-max-bytes", 4000, "budget for one history answer (-1 = no cap); messages are dropped from the OLDEST end and the answer says it did")
@@ -536,6 +549,14 @@ func (c *Config) finalize() error {
 	}
 	if c.TextMaxRunes < 200 {
 		return fmt.Errorf("--text-max-runes must be >= 200, got %d", c.TextMaxRunes)
+	}
+	if c.ReplyMaxBytes < -1 {
+		return fmt.Errorf("--reply-max-bytes must be >= 0 (0 quotes nobody's words) or -1 for uncapped, got %d", c.ReplyMaxBytes)
+	}
+	if c.ReplyMaxBytes > 1000 {
+		// A longer quote is a transcript, and a transcript is what history and get
+		// are for; a row is not the place to renegotiate that.
+		return fmt.Errorf("--reply-max-bytes must be <= 1000, got %d", c.ReplyMaxBytes)
 	}
 	if c.MaxSendsPerMin < 1 {
 		return fmt.Errorf("--max-sends-per-min must be >= 1, got %d", c.MaxSendsPerMin)
@@ -819,9 +840,10 @@ func (c *Config) Audit() map[string]any {
 			"min_wait_s": c.PollMinWait, "max_wait_s": c.PollMaxWait,
 			"default_wait_s": c.PollDefaultWait, "jitter_pct": c.PollJitterPct,
 		},
-		"bus_capacity":   c.BusCapacity,
-		"poll_max_bytes": c.PollMaxBytes,
-		"text_max_runes": c.TextMaxRunes,
+		"bus_capacity":    c.BusCapacity,
+		"poll_max_bytes":  c.PollMaxBytes,
+		"text_max_runes":  c.TextMaxRunes,
+		"reply_max_bytes": c.ReplyMaxBytes,
 		"media": map[string]any{
 			"image": c.MediaFor(KindImage), "audio": c.MediaFor(KindAudio),
 			"video": c.MediaFor(KindVideo), "other": c.MediaFor(KindOther),

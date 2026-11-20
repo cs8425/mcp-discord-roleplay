@@ -105,6 +105,11 @@ type SendRequest struct {
 	ChannelID string
 	Text      string
 	Files     []*files.Opened
+
+	// ReplyTo is the id of the message this one answers; empty sends a plain
+	// message. See buildMessageSend for what a reference costs when the id is not
+	// there any more.
+	ReplyTo string
 }
 
 // SendResult describes the message that landed.
@@ -235,6 +240,19 @@ func buildMessageSend(req SendRequest) *discordgo.MessageSend {
 		AllowedMentions: &discordgo.MessageAllowedMentions{
 			Parse: []discordgo.AllowedMentionType{},
 		},
+	}
+	if req.ReplyTo != "" {
+		// Quoting does not ping: the allowed-mentions above already sends
+		// replied_user=false, which is what an in-character reply wants — answering
+		// someone in their channel a dozen times a day should not notify them every
+		// time. The reference is soft (fail_if_not_exists=false), because an id that
+		// is too old to quote, or one Discord cannot see from here, should cost us
+		// the quote and not the message: the words are already written.
+		soft := false
+		data.Reference = &discordgo.MessageReference{
+			MessageID:       req.ReplyTo,
+			FailIfNotExists: &soft,
+		}
 	}
 	if len(req.Files) > 0 {
 		data.Files = make([]*discordgo.File, 0, len(req.Files))

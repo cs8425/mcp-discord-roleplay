@@ -457,6 +457,15 @@ func (c *Client) rememberMember(s *discordgo.Session, m *discordgo.Message) {
 func (c *Client) normalize(s *discordgo.Session, m *discordgo.Message) *bus.Event {
 	selfID := c.SelfID()
 
+	// A forward says nothing of its own: Discord delivers it as an empty message
+	// whose words (and whose attachments, embeds and stickers) sit in
+	// message_snapshots[0] — a photo of the original taken at forwarding time and
+	// never updated after. Rather than teach every reader about snapshots, the
+	// snapshot is allowed to fill only the holes the forwarding message left
+	// empty, and the event is marked so nobody reads forwarded words as the
+	// forwarder's own.
+	src, forwarded := forwardFill(m)
+
 	ev := &bus.Event{
 		Kind:      bus.KindMessage,
 		Ts:        messageTime(m),
@@ -464,7 +473,8 @@ func (c *Client) normalize(s *discordgo.Session, m *discordgo.Message) *bus.Even
 		ChannelID: m.ChannelID,
 		GuildID:   m.GuildID,
 		DM:        m.GuildID == "",
-		Text:      m.Content,
+		Forwarded: forwarded,
+		Text:      src.Content,
 		// Canonical, agent-independent label: aliases differ per agent, so the
 		// shared event carries only the id form and poll resolves the alias for
 		// whoever is asking. A DM is overridden to "dm:<peer>" a few lines below,
@@ -497,8 +507,15 @@ func (c *Client) normalize(s *discordgo.Session, m *discordgo.Message) *bus.Even
 		ev.Author = bus.Author{ID: "?", Name: "?"}
 	}
 
-	// channel name and the DM peer come from the state cache
+	// channel name and the DM peer come from the state cache. The channel also
+	// settles which guild a row read over REST belongs to: GET /channels/:id/messages
+	// answers with no guild_id, and a reply's quoted author is looked up in that
+	// guild.
+	guild := m.GuildID
 	if ch := c.lookupChannel(s, m.ChannelID); ch != nil {
+		if guild == "" {
+			guild = ch.GuildID
+		}
 		ev.ChannelName = ch.Name
 		if ev.DM {
 			if peer := dmPeer(ch, selfID); peer != nil {
@@ -543,11 +560,11 @@ func (c *Client) normalize(s *discordgo.Session, m *discordgo.Message) *bus.Even
 			break
 		}
 	}
-	if !ev.MentionsSelf && selfID != "" && strings.Contains(m.Content, "<@"+selfID+">") {
+	if !ev.MentionsSelf && selfID != "" && strings.Contains(src.Content, "<@"+selfID+">") {
 		ev.MentionsSelf = true
 	}
 
-	for _, a := range m.Attachments {
+	for _, a := range src.Attachments {
 		if a == nil {
 			continue
 		}
@@ -567,17 +584,91 @@ func (c *Client) normalize(s *discordgo.Session, m *discordgo.Message) *bus.Even
 	// This runs after the truncation above on purpose: a handle like [sticker:gaze]
 	// or the img@N an emoji code turns into is worth more than the last few runes of
 	// a long message, and it must not be cut off from the attachment it names.
-	addStickers(ev, m.StickerItems)
+	addStickers(ev, src.StickerItems)
 	addEmoji(ev, c.cfg.MediaEmoji)
 
-	for _, e := range m.Embeds {
+	for _, e := range src.Embeds {
 		if e == nil {
 			continue
 		}
 		ev.Embeds = append(ev.Embeds, bus.Embed{Type: string(e.Type), Title: e.Title, Description: e.Description, URL: e.URL})
 	}
 
+	// A reply is the one piece of conversation structure Discord keeps somewhere
+	// other than content. Only the id is guaranteed: referenced_message is a
+	// *Message, so both "Discord did not go look" and "the quoted message was
+	// deleted" arrive as nil, and the id alone is what we report instead of
+	// guessing which happened. The label follows the same rule as the row's own
+	// author — guild nickname when we know one — so a person is spelled one way
+	// everywhere; the state cache is the only source here on purpose, because a
+	// quoted author has nearly always spoken in this channel already and this
+	// costs no request on either path.
+	if ref := m.MessageReference; ref != nil &&
+		ref.Type != discordgo.MessageReferenceTypeForward && ref.MessageID != "" {
+		r := &bus.Reply{ID: ref.MessageID}
+		if q := m.ReferencedMessage; q != nil {
+			r.Text = q.Content
+			if q.Author != nil {
+				r.AuthorID = q.Author.ID
+				r.Author = q.Author.DisplayName()
+				if q.Member != nil && q.Member.Nick != "" {
+					r.Author = q.Member.Nick
+				} else if nick := c.stateNick(s, guild, q.Author.ID); nick != "" {
+					r.Author = nick
+				}
+			}
+		}
+		ev.Reply = r
+	}
+
 	return ev
+}
+
+// forwardFill returns the message whose words this event should carry, and
+// whether the event is a forward. The forwarding message wins wherever it spoke
+// for itself; the snapshot only fills what it left empty. A snapshot whose inner
+// message is nil counts as no snapshot: payloads older than discordgo's
+// MessageSnapshot{Message *Message} kept those fields un-nested, and a shape we
+// cannot read must cost us the quoted text, not the message.
+func forwardFill(m *discordgo.Message) (*discordgo.Message, bool) {
+	if m.MessageReference == nil || m.MessageReference.Type != discordgo.MessageReferenceTypeForward {
+		return m, false
+	}
+	var snap *discordgo.Message
+	if len(m.MessageSnapshots) > 0 {
+		snap = m.MessageSnapshots[0].Message
+	}
+	if snap == nil {
+		return m, true
+	}
+	filled := *m
+	if filled.Content == "" {
+		filled.Content = snap.Content
+	}
+	if len(filled.Attachments) == 0 {
+		filled.Attachments = snap.Attachments
+	}
+	if len(filled.Embeds) == 0 {
+		filled.Embeds = snap.Embeds
+	}
+	if len(filled.StickerItems) == 0 {
+		filled.StickerItems = snap.StickerItems
+	}
+	return &filled, true
+}
+
+// stateNick is the guild nickname the state cache holds for a user, or "" when
+// there is none to know: no guild, no cache, an uncached member, or a member
+// living without a nickname. It never goes to the network.
+func (c *Client) stateNick(s *discordgo.Session, guildID, userID string) string {
+	if s == nil || s.State == nil || guildID == "" || userID == "" {
+		return ""
+	}
+	mem, err := s.State.Member(guildID, userID)
+	if err != nil || mem == nil {
+		return ""
+	}
+	return mem.Nick
 }
 
 func (c *Client) lookupChannel(s *discordgo.Session, id string) *discordgo.Channel {

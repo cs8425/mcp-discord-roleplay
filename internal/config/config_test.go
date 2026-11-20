@@ -287,6 +287,46 @@ func TestPollMaxBytes(t *testing.T) {
 	}
 }
 
+// --reply-max-bytes is the only cap in this file whose 0 means something: it is
+// the operator saying "quote nobody's words, only say who and which id". A range
+// check written as >= 0 would have refused the useful value.
+func TestReplyMaxBytes(t *testing.T) {
+	cfg, err := Load([]string{"-selftest"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ReplyMaxBytes != DefaultReplyMaxBytes {
+		t.Fatalf("default quote cap moved: %d", cfg.ReplyMaxBytes)
+	}
+	if DefaultReplyMaxBytes > cfg.PollMaxBytes {
+		t.Fatalf("a single quote may not cost more than a whole poll: %d > %d", DefaultReplyMaxBytes, cfg.PollMaxBytes)
+	}
+	cfg, err = Load([]string{"-selftest", "-reply-max-bytes=0"})
+	if err != nil {
+		t.Fatalf("0 is a decision and must load: %v", err)
+	}
+	if cfg.ReplyMaxBytes != 0 {
+		t.Fatalf("0 lost: %d", cfg.ReplyMaxBytes)
+	}
+	if _, err := Load([]string{"-selftest", "-reply-max-bytes=-1"}); err != nil {
+		t.Fatalf("-1 must mean uncapped and load: %v", err)
+	}
+	if _, err := Load([]string{"-selftest", "-reply-max-bytes=-2"}); err == nil {
+		t.Fatal("-2 is neither uncapped nor a cap: refuse it")
+	}
+	if _, err := Load([]string{"-selftest", "-reply-max-bytes=4000"}); err == nil {
+		t.Fatal("a quote longer than a whole history budget must be refused, not silently truncated")
+	}
+	t.Setenv("MCPDR_REPLY_MAX_BYTES", "120")
+	cfg, err = Load([]string{"-selftest", "-env-file=/nonexistent"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ReplyMaxBytes != 120 {
+		t.Fatalf("MCPDR_REPLY_MAX_BYTES ignored: %d", cfg.ReplyMaxBytes)
+	}
+}
+
 // Regression: the repeatable ACL flags are collected in flag.Value structs, and
 // an earlier build never copied them into Config — so --allow-channels /
 // --deny-channels / --allow-guilds silently did nothing. Both the command line
