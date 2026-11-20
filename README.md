@@ -108,7 +108,8 @@ go build -o mcp-discord-roleplay .
 | `--no-message-content` | false | 見上一節：只管 IDENTIFY，不管 content 有無 |
 | `--nick-lookup` | `cache` | `cache`＝讀取側補作者暱稱（先查 state，miss 才補打一次並寫回）；`off`＝退回全域名、零 request |
 | `--poll-min-wait`／`--poll-max-wait`／`--poll-default-wait` | 5／600／45 | `poll` 的 `max_wait` 合法區間與預設；只加**往後**的抖動（`--poll-jitter-pct=15`），不會縮到 client timeout 以下 |
-| `--poll-max-bytes` | `16384` | 一次 poll 的預算，**只算 `text` 欄位的 byte**（保險絲不是計費器）；`-1` 不設限 |
+| `--poll-max-bytes` | `16384` | 一次 poll 的預算，**只算 `text` 與引用的 byte**（保險絲不是計費器）；`-1` 不設限 |
+| `--reply-max-bytes` | `80` | 一則回覆裡「對方講的那句」開頭幾個 byte 上線；`0`＝只給作者與 id，`-1`＝不裁（見 DESIGN §4.6）|
 | `--bus-capacity` | `2000` | per-agent 佇列；滿了丢最舊的，`status` 的 `dropped` 會漲 |
 | `--history-max-bytes`／`--channels-max-bytes` | `4000`／`4000` | 整個 response 的額度；超過從**最舊**那端丢＋註記。LLM 不能自己調 |
 | `--read-timeout` | `10s` | 讀取側單次 REST 截止；讀取路徑**關掉** discordgo 的 429 自動重睡 |

@@ -16,7 +16,7 @@
 | 項目 | 決定 |
 |---|---|
 | poll 語義 | **等 max_wait 秒；期間一有新訊息立刻 return**（不累積、不等安靜期）。`0` 不合法，有**下限**（提議 5s），超範圍 → `isError` + 回報合法區間 |
-| 砍掉 | `debounce_ms`、`min_count`（與「有訊即回」衝突；同瞬間的多則自然會一次帶回）、`reply_to`、`thread_id`、`silent`、`tts`、`mentions` |
+| 砍掉 | `debounce_ms`、`min_count`（與「有訊即回」衝突；同瞬間的多則自然會一次帶回）、`reply_to`（⚠ **2026-11-20 復活**，但含義換了：只是「引用某一則」，不是當年的 thread／回覆佇列那套，見 §4.6）、`thread_id`、`silent`、`tts`、`mentions` |
 | mentions | **硬編碼 AllowedMentions = none**（不開放設定；@everyone/@role/@user 一律不推送，`<@id>` 只顯文字）。要 @ 人 → 以後再說 |
 | Group DM | **放棄**（查證：bot 無法加入 Group DM type 3、收不到事件）。多人小圈圈不支援 |
 | Room 抽象 | 因「放棄」而**降級**：不再有 Room 型別，改為 routing rule 上的 `alias`（agent 看到的是 alias，底下就是 channel ID） |
@@ -148,20 +148,21 @@ envelope（`omitempty` 的欄位只在有意義時出現；下面把常見的都
 ```json
 {"reason":"messages",
  "messages":[{"target":"boss","author":"阿明","author_id":"222333444555666777","ts":"2026-11-16T19:20:31+08:00","age_s":12,
-   "text":"晚安","mentions_self":true,
+   "text":"晚安","mentions_self":true,"reply_to":{"id":"1572567398089883688","author":"小美","text":"要睡了嗎"},
    "attachments":[{"name":"night.png","kind":"image","url":"https://cdn.discordapp.com/...",
       "media":"base64","content_index":1}],
    "embeds":[{"title":"..."}]}],
  "remaining":7,"dropped":1,"notes":["..."]}
 ```
 - **有滯留就要講，key 的數目就是區別**：真正沒人說話 ⇒ 恰好 1 個 key `{"reason":"timeout"}`（quiet server 是常態，而每一個 byte 都會進模型的 context；成敗是 tool result 自己的 `isError`，不再有個欄位複述它）；有東西留著 ⇒ 只要 `remaining` 出現，`waiting`／`oldest_s` 就**同行**，**不管這一次有沒有也拿到訊息**（F-4；空手是 `{"reason":"timeout","remaining":3,"waiting":"3 channel, 2 bot","oldest_s":184.6}`，非空手是 `{"reason":"messages","messages":[…],"remaining":2,"waiting":"2 target","oldest_s":4}`）。`waiting` 是**依數量排序的拒收類別**（`bot`／`mentions`／`target`／`channel`／`from`，同數則比名字），講的是「這一問的 filter 不收這些」，而且**只統計這一輪真的掃過的那些** ⇒ 可以小於 `remaining`（差額是掃完才到的，或是乾脆被額度切斷的——後者 `waiting` 整個不出現，改由 `notes` 講）。`oldest_s` 是最老那則等了幾秒（與 send 的 `oldest_s` 同一個算法），**不區分是被誰擋的** ⇒ 與 `waiting` 的計數不必對齊。差別在於模型要不要換個 filter 再呼，而不是白重呼一次
-- **預算只算 `text` 欄位的 byte 數**（`messageCost(m) = len(m.Text)`）：它是**保險絲不是計費器**，目的只有一個：防止一次 tool result 把沒有裁切機制的 harness 的 context 直接灌爆、整個 session 掛掉。JSON 骨架（key、author、url、notes）刻意不計：實測一則訊息骨架 144 B、一個附件 entry 159 B，把它們折進預算就必須每裁一步重 `json.Marshal` 一次（舊版 `fitMessage` 主迴圈每圈 2 次、外加 `messageCost` 各一次），白瞎了 `encoding/json` v2 的底層設計。inline 的 base64 在 content block 裡、本來就不在這段 JSON 裡；模型是按 token 收錢（一張圖 ~1000 token），不是按 JSON byte ⇒ 也不佔預算（舊版那個 `result_bytes` 固定點迴圈就是為了湊一個實際上沒人在用的數字，已整段拿掉）
+- **預算只算 `text` 欄位的 byte 數**（`messageCost(m) = len(m.Text) + len(m.Reply.Text)`；引用的那句也是話，見 §4.6）：它是**保險絲不是計費器**，目的只有一個：防止一次 tool result 把沒有裁切機制的 harness 的 context 直接灌爆、整個 session 掛掉。JSON 骨架（key、author、url、notes）刻意不計：實測一則訊息骨架 144 B、一個附件 entry 159 B，把它們折進預算就必須每裁一步重 `json.Marshal` 一次（舊版 `fitMessage` 主迴圈每圈 2 次、外加 `messageCost` 各一次），白瞎了 `encoding/json` v2 的底層設計。inline 的 base64 在 content block 裡、本來就不在這段 JSON 裡；模型是按 token 收錢（一張圖 ~1000 token），不是按 JSON byte ⇒ 也不佔預算（舊版那個 `result_bytes` 固定點迴圈就是為了湊一個實際上沒人在用的數字，已整段拿掉）
 - `reason` ∈ `messages|timeout|disconnected|cancelled|shutdown`；**timeout 不是錯誤**（tool result 的 `isError` 為偽，舊版的 `ok:true` 講的就是這件事，現在不再多一個欄位複述）。沒有訊息且 gateway 不在聽時，`timeout` 會被改寫成 `disconnected`（對一條死線路說「沒人說話」是誤導）；`cancelled`/`shutdown` 保留自己的字，它們講的是「這一問其實沒送到你手上」
 - **超額的處理**：裝不下的整則留 queue（下次 poll 照原序先拿到，`notes` 講一聲）。單則 text 就超過整個預算 → 按 **rune 邊界**把 `text` 裁到整整預算（不預留骨架、不預留 note 空間），標 `text_truncated:true`，`notes` 寫「this message's text was too long (originally N bytes) and was cut to M bytes, keeping the start」，該則**照樣送出**（反死鎖：queue 頭那一則若不裁就永遠卡住）。裁斷的那一則不會下一輪再出現（已被 Take 走），這是預期行為。附件與 embeds **永不因預算被丟** ⇒ 不會再出現只有 id 沒有內文的空殼訊息
 - `remaining`（**只在 >0 時出現**）＝ 佇列裡還留著幾則（**包含被這次 filter 拒掉的那些**，它就是 `Drain` 傳回的尾數） ⇒ 只有被截斷（`notes` 會講一聲）或被 filter 拒掉（`waiting` 講是哪幾類，**拿到訊息時也照給**）才值得立刻再呼一次。（舊版那個 `partial:true` 布林已退場，只進 log）
 - `dropped` 只在 >0 時出現：那是「沒人 poll 把 queue 擠爆、被覆蓋掉的舊訊息」，要直接告訴模型
 - `target` 標的是**這個 agent 認得的 alias**（`router.AliasForTarget` 在組裝時現算）；沒有 rule 收養它就留座標——DM 標 `dm:<peer>`（能直接回話的形式），其餘 `channel:<id>`。wildcard rule 的 alias（`dm:*` 的 `dms`）**不是地址**，所以也不拿去當前綴。同一個 Event 在兩條 queue 裡可以標不同名字，所以這個欄位只能長在 `pollMessage` 上
 - 作者壓成一條字串 `author:"阿明"`，名字取的是 **Discord 自己會顯示的那個**：`Message.Member.Nick`（群內暱稱）優先，沒有才退回 `User.DisplayName()`（`global_name` → `username`）——只讀 `DisplayName()` 的話，操作者改了群內暱稱而 agent 永遠叫錯人。`bus.Author` 的 `tag`（舊式 discriminator）對回話沒有增量 ⇒ 進 log；空名字才退回 `tag`，不給匿名台詞。唯一的 ID 例外是 `author_id`（見下方判定三閘）：它過第②閘，因為 `discord_send` 的 `to` 吃 `dm:<ID>` ⇒ 沒有它，agent 無法回 DM 給「剛講話那個人」，只能用 routing 檔裡的 alias；`buildEvent` 的佔位 `"?` 不上線（回 `to:"dm:?"` 是個陷阱）。
+- **`reply_to`：A 回 B 時，row 要說得出「他是在回 B」**（2026-11-20，詳 §4.6）：`{"id","author","text"}`，`text` 只有頭 `--reply-max-bytes` 個 byte（預設 80、rune 邊界切）。只有 id（無 author、無 text）的含義是「我們手上就只有 id」：`referenced_message` 在 discordgo 是 `*Message`，「Discord 沒去抓」與「那則被刪了」壓成同一個 nil ⇒ **不猜**。`forwarded:true` 則是那句話**不是這個人在講**
 - 舊版會「先裁 text、再從尾丟附件、最後丟 embeds」，並用 `attachments_total`／`attachments_omitted` 兩個欄位交代；現在只有 text 是變數，那兩個欄位與三條估價常數（圖 1000／其他 300／embed 200）一起退場。別跟 `dropped` 混：那是**整則訊息**被 queue 擠爆覆蓋掉
 - **附件在輸出裡只有三種形態**（`policy` 不上線，只告訴模型你**拿到**了什麼）：`media:"base64"` + `content_index`（≥1：`content[0]` 是這段 JSON，圖 block 接在後面）／`media:"file"` + `local_path`（可直接餵 `discord_send` 的 `files[].path`）／`media:"url"` + `reason`（見 §5 詞表）。附件在線上只有 `name`（原 `filename`）、`kind`、`url`、`media`，加條件欄位 `duration_secs`（僅音訊／視訊，那是唯一的內容描述）／`reason`／`local_path`／`content_index`；`id`、`mime`、`size`、像素邊長、實際交付位元組數全進 log
 - **文字裡的佔位就是 content block 的索引**（詳 §5.1）：貼圖在 `text` 尾加 `[sticker:gaze]`；自訂 emoji 碼原地改寫成 `<:gaze:img@1>`（每則最多 8 種、依 id 去重；`a:` 前綴照 Discord 保留），**`img@N` 的 `N` 就是那一筆附件的 `content_index`**（一份答案只有一個編號）。block 地址要等 poll 組裝時才算得出來 ⇒ ingress 寫的只是暫存號，`relabelPlaceholders` 在 `applyMedia` 之後改定。**沒拿到 bytes 的 emoji 不佔號**，退回原始碼；佔位號也因此跟批次走。同一顆 emoji 出現兩次只下載一次、兩個佔位指同一個 N（重複本身也是資訊）。佔位在 `--text-max-runes` 截斷**之後**才追加，不會被切一半
@@ -244,6 +245,32 @@ user 裁示：「直接回 429 rate limit 跟時間讓 LLM 知道，然後 mcp s
 - `--dry-run`：不佔額度、不碰 REST、不建 DM；仍走完路由/沙箱/切段並在結果標 `dry_run:true`。
 
 
+### 4.6 引用（`reply_to`）與轉發（`forwarded`）（2026-11-20）
+
+**動機**：頻道裡 A 回覆 B，模型過去只看得到 A 講的話——不是 Discord 沒給，是 `normalize` 自己沒抄 `message_reference`。漏斗只有四處（`normalize` → `buildMessage` → `wire` → `messageCost`/`fitMessage`），而 **poll／history／get 共用同一份 row** ⇒ 一處收斂、三處都有。
+
+**讀（線上的形狀）**：`"reply_to":{"id":"…","author":"小美","text":"要睡了嗎"}`
+- `text` 是原話的**頭 `--reply-max-bytes` 個 byte**（預設 80，`cutRunes` 在 byte 上限內走 rune 邊界）。裁發生在 `buildMessage` 的**副本**上：一份 event 同時躺在多條 agent queue 裡，改它就等於替下一個人預先決定預算。
+- 只有 id ⇒ 「我們手上就只有 id」：不猜是沒抓還是被刪（discordgo 型別使然）。id 可以直餵 `discord_get`——**get 沒有 byte 預算**，唯一會切字的是 `--text-max-runes=4000`，比 Discord 單則 2000 字還寬 ⇒ 拿得到就一字不 cut。
+- 引用對象的 `author_id` 不過 §3 判定三閘 ⇒ `bus.Reply.AuthorID` 的 json tag 是 `-`（只進 log）。名字優先序與 row 自己的作者同一套：引文自帶的 `member.nick` → state cache 的暱稱（**絕不為它碰網路**）→ `DisplayName()`。
+- **quote 計價、而且先走**：`messageCost = len(text) + len(reply.text)`；`fitMessage` 裝不下時**先丟 quote 的 words**（id 與名字留著）、再裁 text，並在 `notes` 講一聲。理由：row 自己的內文才是呼叫者要讀的東西，quote 是可取回的摘要。
+- `rowKeys`（`read_test.go`）是投票制，這次收下 `reply_to`／`forwarded` 兩個 key。
+
+**轉發（`message_reference.type == 1`）**：
+- 本體的 `content` 是空的，話在 **`message_snapshots[0].message`**（型別表裡沒有 forward 這個 message type，轉發就是 type 0 ＋ `reference.type == 1`）；snapshot 是轉發當下拍的照、之後**不再更新**，巢狀限一層。查證：`_tmp/dc_docs_message.html`（官方文件快照）＋ discordgo v0.29.0 與 master 的 `message.go` 位元組相同 ⇒ upstream 沒有可撿的修正。
+- `forwardFill` 的規矩是**只填洞**：outer 的 `content`／`attachments`／`embeds`／`sticker_items` 為空才取 snapshot 的——轉發完自己加一句話的人，那句話不能被原文蓋掉。snapshot 的內層 `message` 為 nil（舊形狀是攤平的）⇒ 當沒有 snapshot：**丟掉引文而不是丟掉訊息**。
+- 標 `forwarded` 的意義：那句話**不是這個人在講**；不標就會被讀成台詞。沒標之前的更糟情況：轉發本體 content 空、`msgWire.Text` 帶 `omitempty`、admission 又不丟空 text 的 row ⇒ 一條「只有作者、連 `text` 欄都不存在」的鬼訊息。
+- 轉發**不當成 reply**：原文在別的頻道（可跨 guild），我們給的 id 在這裡查不到；「原本誰講的」API 也不給（snapshot 的欄位子集**排除 `author`**，也沒有 id／channel_id）⇒ 使用者裁示「有當時訊息就行，不用現在的樣子」，故不做 `forward_from`。
+- mentions_self 讀的是填補後的 `src.Content` ⇒ 原文裡對 bot 的提及不會漏；附件、embeds、貼圖一樣都從 `src` 取，所以只在 snapshot 裡的圖也看得到。
+
+**送（`discord_send`）**：`{"to":"boss","text":"…","reply_to":"<message id>"}`
+- → `MessageSend.Reference = &MessageReference{MessageID:…, FailIfNotExists:&false}`：**soft reference**——但「soft」只講了一半，2026-11-20 live 實測（引用 `100000000000000000`：形狀合法、該頻道不存在）：① 訊息**照常送出**（沒 400，這是 soft 的那一半）② 客戶端**仍然画出引用列**，只是解析不到目標（顯示成「找不到在回誰」）——**不是「沒有引用」**。⇒ Discord 不會替你把幽靈引用消掉，所以 id 要從 poll／history／get 拄來，不是憑記憶打一個。
+- **不 ping**：既有的 `AllowedMentions{Parse:[]}` 一併送出 `replied_user:false`（discordgo 該欄**沒有** `omitempty` ⇒ false 真的會上線）。一天回某人十二次不會 notify 他十二次；也沒有 flag 可開（§4.5 那條硬編碼的理由照舊）。
+- 切段時**只掛第一段**：三段是一句話，每段都掛引用會變成三次回答。
+- 形狀先驗：`reply_to` 不是 **15–19 位純數字** ⇒ `bad_arguments`，擋在路由與開檔之前——模型拿到的是這裡的這句話，不是一個比較難懂的 400。19 不是猜的：snowflake 就是 int64，**20 位是打錯了**（多打一個數字是最常見的型），而 15 那一側故意寬——舊 id 不值得為它冒險，真拿了一個老 id 也不過是 soft reference 落空。
+
+**live 已驗（2026-11-20，`main` 頻道，一發收清）**：① gateway **有帶** `referenced_message`（一則回覆的 row 就拿到 `reply_to` 的 id＋作者＋全文，未觸發裁切）。② gateway **有帶** `message_snapshots`：轉發一張圖的 row 是 `"forwarded":true` ＋ `text` 為 snapshot 原文 ＋ 附件成功 inline 成 base64 ⇒ 「只填洞」那條路在真 payload 上走得通（轉發本體沒 content、沒附件也照樣有話有圖）。③ REST 那側同形：`history` 的同一批 row 也有 `reply_to`／`forwarded`（附件照 `media:"url"`＋`reason:"policy"`）。④ `dc_send` 的 `reply_to`：不 ping、soft 不 400（見上）、切段驗得出來（`parts_sent:2`）。⚠ 從 wire **分辨不出來**的一條：轉發的附件是否**同時**出現在外層 `attachments`（我們的 `forwardFill` 只在外層空時才填，兩種情形到逕同一個結果）——要分清得看 raw payload，而它不影響任何行為，不打算再查。另外 `--reply-max-bytes` 對 history 的真實成本不是截字而是**同預算裝的列數變少**（每列 +40~140 byte），使用者裁示 `--history-max-bytes` 先不動。
+
 ---
 
 ## 5. 附件處理三段式（v2 新增，config 驅動）
@@ -257,7 +284,7 @@ user 裁示：「直接回 429 rate limit 跟時間讓 LLM 知道，然後 mcp s
 
 **預設（定案）**：`image=inline`、`audio=skip`、`video=skip`、`other=skip`。（音訊依 C3 決定 skip，需要 STT 時你自己改 mode 即可）
 **超過上限怎麼辦（M2a 定案：不降級）**：`inline` 碰到任一上限 → 直接 `skip`，由 `reason` 講清楚是哪一條。不自動退 `save`：降級鏈會讓同一張圖在不同輪的形態飄移，模型無從判斷，而 save 也是要 I/O 的。
-**上限共通規則**：`--inline-max-*` 與 `--media-save-max-bytes` 一律 **`-1`＝不設限、`0`＝該模式停用**，其他值＝上限。`--poll-max-bytes` 只有 `-1`＝不設限這半邊，**`0` 直接報錯**（reply 預算沒有「停用」這狀態；舊版讓 0 也等於不設限，是同義字造成兩個 sentinel，已收斂）。
+**上限共通規則**：`--inline-max-*` 與 `--media-save-max-bytes` 一律 **`-1`＝不設限、`0`＝該模式停用**，其他值＝上限。`--poll-max-bytes` 只有 `-1`＝不設限這半邊，**`0` 直接報錯**（reply 預算沒有「停用」這狀態；舊版讓 0 也等於不設限，是同義字造成兩個 sentinel，已收斂）。`--reply-max-bytes` 三邊都有意義：`-1` 不設限、`0`＝引用不給字（只留誰與 id）、正數＝byte 上限，範圍外的值啟動就報錯。
 **能力上限（不是降級）**：MCP 的 content block 只有 `text`/`image`/`audio`/`resource_link`（見 `mcptransport/content.go` 的 encoder），**沒有 video block** ⇒ `--media-video=inline` 得到 `media:"url"`＋`reason:"unsupported"`。
 **`reason` 詞表**（只在 `media:"url"` 出現）：`policy`（設定就是 skip）、`unsupported`（該 kind 沒有 content block）、`too_big`（超過單檔 bytes／save 上限）、`side`（邊長超過 `--inline-max-side`，我們不縮放）、`no_budget`（超過每包 `--inline-max-count`／`--inline-max-total-bytes`）、`save_off`（設定要 save 但 save 已被 `--media-save-max-bytes=0` 停用，或目錄開不起來）、`error`（抓檔／寫盤失敗；細節在 log，不上線）。
 `save` 的清理：開機跑一次 `media.Cleanup`（先 `--media-keep` 天數、再 `--media-max-mb` LRU by mtime），只碰 regular file，子目錄一律跳過。
@@ -403,6 +430,7 @@ type statusWire struct {
 | `--poll-min-wait / --poll-max-wait / --poll-default-wait / --poll-jitter-pct` | 5 / 600 / 45 / 15 |
 | `--bus-capacity` | 2000（**每個 agent 各一條**）|
 | `--poll-max-bytes` | `16384`（16 KiB；**只算各則 `text` 欄位的 byte 總和，不是 JSON 大小**，見 §3；`-1`＝不設上限，**`0` 報錯**；數字不做範圍管制，太小是自己找的）|
+| `--reply-max-bytes` | `80`。一則回覆裡那句「對方講的」最多幾個 byte 上線（見 §4.6）；`0`＝只留作者與 id、不給字，`-1`＝不裁；`< -1` 或 `> 1000` 啟動報錯（引用不該比整頁 history 還長）|
 | `--read-timeout` | `10s`。**讀取側**（`history`／`get`／`channels`）單次 REST 的截止時間；跟 `--media-*` 的 15s 下載預算互不相干。超時回 `cancelled`＋「timed out after …」，不是掛死 |
 | `--history-max-bytes` | `4000`。`history` **整個 response** 的額度（不是單條 text，那是 `--text-max-runes`）；超過從最舊一側整則丟＋註記；`-1`＝不設限，`0` 在 tools 層當作「用預設」（與 `--poll-max-bytes` 的 `0` 報錯不同，尚未統一）|
 | `--channels-max-bytes` | `4000`。`channels` 整個 response 的額度；超過從尾端丟頻道＋註記；語意同上 |
