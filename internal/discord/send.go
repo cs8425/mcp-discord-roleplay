@@ -246,8 +246,10 @@ func buildMessageSend(req SendRequest) *discordgo.MessageSend {
 		// replied_user=false, which is what an in-character reply wants — answering
 		// someone in their channel a dozen times a day should not notify them every
 		// time. The reference is soft (fail_if_not_exists=false), because an id that
-		// is too old to quote, or one Discord cannot see from here, should cost us
-		// the quote and not the message: the words are already written.
+		// is too old to quote, or one Discord cannot see from here, must not fail the
+		// send: the words are already written. Soft is not silent, though — live
+		// 2026-11-20: Discord still renders the quote line, it just resolves to
+		// nothing. So an id comes from a row we handed over, never from memory.
 		soft := false
 		data.Reference = &discordgo.MessageReference{
 			MessageID:       req.ReplyTo,

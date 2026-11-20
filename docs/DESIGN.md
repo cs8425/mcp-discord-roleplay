@@ -264,12 +264,12 @@ user 裁示：「直接回 429 rate limit 跟時間讓 LLM 知道，然後 mcp s
 - mentions_self 讀的是填補後的 `src.Content` ⇒ 原文裡對 bot 的提及不會漏；附件、embeds、貼圖一樣都從 `src` 取，所以只在 snapshot 裡的圖也看得到。
 
 **送（`discord_send`）**：`{"to":"boss","text":"…","reply_to":"<message id>"}`
-- → `MessageSend.Reference = &MessageReference{MessageID:…, FailIfNotExists:&false}`：**soft reference**——但「soft」只講了一半，2026-11-20 live 實測（引用 `100000000000000000`：形狀合法、該頻道不存在）：① 訊息**照常送出**（沒 400，這是 soft 的那一半）② 客戶端**仍然画出引用列**，只是解析不到目標（顯示成「找不到在回誰」）——**不是「沒有引用」**。⇒ Discord 不會替你把幽靈引用消掉，所以 id 要從 poll／history／get 拄來，不是憑記憶打一個。
+- → `MessageSend.Reference = &MessageReference{MessageID:…, FailIfNotExists:&false}`：**soft reference**——但「soft」只講了一半，2026-11-20 live 實測（引用 `100000000000000000`：形狀合法、該頻道不存在）：① 訊息**照常送出**（沒 400，這是 soft 的那一半）② 客戶端**仍然畫出引用列**，只是解析不到目標（顯示成「找不到在回誰」）——**不是「沒有引用」**。⇒ Discord 不會替你把幽靈引用消掉，所以 id 要從 poll／history／get 抓來，不是憑記憶打一個。
 - **不 ping**：既有的 `AllowedMentions{Parse:[]}` 一併送出 `replied_user:false`（discordgo 該欄**沒有** `omitempty` ⇒ false 真的會上線）。一天回某人十二次不會 notify 他十二次；也沒有 flag 可開（§4.5 那條硬編碼的理由照舊）。
 - 切段時**只掛第一段**：三段是一句話，每段都掛引用會變成三次回答。
 - 形狀先驗：`reply_to` 不是 **15–19 位純數字** ⇒ `bad_arguments`，擋在路由與開檔之前——模型拿到的是這裡的這句話，不是一個比較難懂的 400。19 不是猜的：snowflake 就是 int64，**20 位是打錯了**（多打一個數字是最常見的型），而 15 那一側故意寬——舊 id 不值得為它冒險，真拿了一個老 id 也不過是 soft reference 落空。
 
-**live 已驗（2026-11-20，`main` 頻道，一發收清）**：① gateway **有帶** `referenced_message`（一則回覆的 row 就拿到 `reply_to` 的 id＋作者＋全文，未觸發裁切）。② gateway **有帶** `message_snapshots`：轉發一張圖的 row 是 `"forwarded":true` ＋ `text` 為 snapshot 原文 ＋ 附件成功 inline 成 base64 ⇒ 「只填洞」那條路在真 payload 上走得通（轉發本體沒 content、沒附件也照樣有話有圖）。③ REST 那側同形：`history` 的同一批 row 也有 `reply_to`／`forwarded`（附件照 `media:"url"`＋`reason:"policy"`）。④ `dc_send` 的 `reply_to`：不 ping、soft 不 400（見上）、切段驗得出來（`parts_sent:2`）。⚠ 從 wire **分辨不出來**的一條：轉發的附件是否**同時**出現在外層 `attachments`（我們的 `forwardFill` 只在外層空時才填，兩種情形到逕同一個結果）——要分清得看 raw payload，而它不影響任何行為，不打算再查。另外 `--reply-max-bytes` 對 history 的真實成本不是截字而是**同預算裝的列數變少**（每列 +40~140 byte），使用者裁示 `--history-max-bytes` 先不動。
+**live 已驗（2026-11-20，`main` 頻道，一發收清）**：① gateway **有帶** `referenced_message`（一則回覆的 row 就拿到 `reply_to` 的 id＋作者＋全文，未觸發裁切）。② gateway **有帶** `message_snapshots`：轉發一張圖的 row 是 `"forwarded":true` ＋ `text` 為 snapshot 原文 ＋ 附件成功 inline 成 base64 ⇒ 「只填洞」那條路在真 payload 上走得通（轉發本體沒 content、沒附件也照樣有話有圖）。③ REST 那側同形：`history` 的同一批 row 也有 `reply_to`／`forwarded`（附件照 `media:"url"`＋`reason:"policy"`）。④ `dc_send` 的 `reply_to`：不 ping、soft 不 400（見上）、切段驗得出來（`parts_sent:2`）。⚠ 從 wire **分辨不出來**的一條：轉發的附件是否**同時**出現在外層 `attachments`（我們的 `forwardFill` 只在外層空時才填，兩種情形到達同一個結果）——要分清得看 raw payload，而它不影響任何行為，不打算再查。另外 `--reply-max-bytes` 對 history 的真實成本不是截字而是**同預算裝的列數變少**（每列 +40~140 byte），使用者裁示 `--history-max-bytes` 先不動。
 
 ---
 

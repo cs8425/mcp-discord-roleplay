@@ -48,7 +48,8 @@ func sendTool(prefix string) *mcp.Tool {
 			"'me' (a DM to the bot itself), or 'last' (the target this agent spoke to most recently). " +
 			"A body longer than 2000 characters is split into several messages sent in order. " +
 			"reply_to quotes one of this channel's messages above ours, without pinging its author; " +
-			"pass an id we handed you — one Discord cannot see simply sends the message unquoted. " +
+			"pass an id we handed you — an id Discord cannot see does not fail the send; " +
+			"it just leaves a quote line that resolves to nothing. " +
 			"files[].path is read on the server from the --file-root directories and uploaded as a real attachment: " +
 			"give it relative to that root and never base64. files[].url is NOT downloaded - the link is pasted " +
 			"into the message and Discord renders it. @everyone, role and user pings are stripped by the server " +

@@ -217,8 +217,9 @@ func TestNormalizeMentionsSelfFromTheSnapshot(t *testing.T) {
 }
 
 // The reference is soft and the ping is off, and both are decisions the model must
-// not get to make for itself: an id Discord cannot see should cost us the quote and
-// not the message, and answering someone a dozen times a day should not notify them
+// not get to make for itself: an id Discord cannot see must not fail the send
+// (the quote line still goes out and resolves to nothing, live 2026-11-20),
+// and answering someone a dozen times a day should not notify them
 // a dozen times.
 func TestBuildMessageSendReplyReference(t *testing.T) {
 	if data := buildMessageSend(SendRequest{ChannelID: "c", Text: "hi"}); data.Reference != nil {
@@ -232,7 +233,7 @@ func TestBuildMessageSendReplyReference(t *testing.T) {
 		t.Errorf("the reference must carry the id we were given: %q", data.Reference.MessageID)
 	}
 	if data.Reference.FailIfNotExists == nil || *data.Reference.FailIfNotExists {
-		t.Error("the reference must be soft: fail_if_not_exists=false, so an id that is gone sends the message unquoted")
+		t.Error("the reference must be soft: fail_if_not_exists=false, so an id that is gone sends anyway, with a quote pointing at nothing")
 	}
 	if data.AllowedMentions == nil || data.AllowedMentions.RepliedUser {
 		t.Error("a reply quotes without pinging: replied_user has to go out as false")
