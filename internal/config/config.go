@@ -260,7 +260,7 @@ func Load(args []string) (*Config, error) {
 	fs.BoolVar(&c.NoMessageContent, "no-message-content", false, "do not request the privileged Message Content intent at IDENTIFY; whether Discord sends 'text' at all is decided by the app's Message Content setting in the Developer Portal (observed both ways -- see docs/DESIGN.md §7)")
 
 	fs.IntVar(&c.PollMinWait, "poll-min-wait", 5, "smallest max_wait (seconds) a poll may request")
-	fs.IntVar(&c.PollMaxWait, "poll-max-wait", 600, "largest max_wait (seconds) a poll may request")
+	fs.IntVar(&c.PollMaxWait, "poll-max-wait", 1200, "largest max_wait (seconds) a poll may request")
 	fs.IntVar(&c.PollDefaultWait, "poll-default-wait", 45, "max_wait used when the caller omits it")
 	fs.IntVar(&c.PollJitterPct, "poll-jitter-pct", 15, "percent jitter added to the poll deadline only")
 
