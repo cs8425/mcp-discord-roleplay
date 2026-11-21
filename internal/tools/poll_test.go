@@ -491,15 +491,17 @@ func TestPollWireKeysAreExactlyThese(t *testing.T) {
 	push(t, d, "default", e)
 
 	out := pollOK(t, d, `{"max_wait":1}`)
-	if got := keySet(out); got != "messages,reason" {
-		t.Errorf("envelope keys = %s, want exactly the two that change what the agent does", got)
+	// `target` joined the envelope when a batch became one conversation: it is the
+	// fact every row used to pay for, said once instead of five times.
+	if got := keySet(out); got != "messages,reason,target" {
+		t.Errorf("envelope keys = %s, want exactly the three that change what the agent does", got)
 	}
 
 	m := firstMsg(t, out)
 	// `id` joined the message layer with M3: without it a poll row is a dead end
 	// -- `get` needs an id to fetch one message's attachment bytes, and "url only"
 	// is exactly what poll hands out. ~20 B per row buys the way back in.
-	want := "age_s,attachments,author,author_id,embeds,id,target,text,ts"
+	want := "age_s,attachments,author,author_id,embeds,id,text,ts"
 	if got := keySet(m); got != want {
 		t.Errorf("message keys =\n  %s\nwant\n  %s", got, want)
 	}
@@ -582,29 +584,34 @@ func TestPollFilters(t *testing.T) {
 		why  string
 		args string
 		want []string // message ids, in order
+		// rest is what a SECOND poll with the very same arguments has to deliver.
+		// A batch is one conversation now (2026-11-22), so a case whose want spans
+		// two of them is really two answers -- and `two targets` only means
+		// something if both of them arrive eventually.
+		rest []string
 	}{
-		{"no filter", `{}`, []string{"m1", "m2", "d1"}},
-		{"by target", `{"targets":["ami"]}`, []string{"d1"}},
-		{"by canonical target", `{"targets":["channel:111222333444555666"]}`, []string{"m1", "m2"}},
-		{"two targets", `{"targets":["boss","ami"]}`, []string{"m1", "m2", "d1"}},
-		{"by channel name", `{"channels":["#rp-main"]}`, []string{"m1", "m2"}},
-		{"by channel id", `{"channels":["999000111222333444"]}`, []string{"d1"}},
+		{"no filter", `{}`, []string{"m1", "m2"}, []string{"d1"}},
+		{"by target", `{"targets":["ami"]}`, []string{"d1"}, nil},
+		{"by canonical target", `{"targets":["channel:111222333444555666"]}`, []string{"m1", "m2"}, nil},
+		{"two targets", `{"targets":["boss","ami"]}`, []string{"m1", "m2"}, []string{"d1"}},
+		{"by channel name", `{"channels":["#rp-main"]}`, []string{"m1", "m2"}, nil},
+		{"by channel id", `{"channels":["999000111222333444"]}`, []string{"d1"}, nil},
 		// An alias is the name every other tool takes, so a filter has to take it
 		// too -- and this is the shape of the live trap: the guild channel's Discord
 		// name is not its alias, so before this the alias matched nothing and the
 		// answer came back "turned away by channel", which reads like silence.
-		{"by routing alias", `{"channels":["boss"]}`, []string{"m1", "m2"}},
-		{"canonical spelling in channels", `{"channels":["channel:111222333444555666"]}`, []string{"m1", "m2"}},
+		{"by routing alias", `{"channels":["boss"]}`, []string{"m1", "m2"}, nil},
+		{"canonical spelling in channels", `{"channels":["channel:111222333444555666"]}`, []string{"m1", "m2"}, nil},
 		// A DM's alias resolves to dm:<peer>, and no channel id equals that -- it
 		// matches on the target the router gave the event instead.
-		{"by dm alias", `{"channels":["ami"]}`, []string{"d1"}},
-		{"alias is case-insensitive", `{"channels":["BOSS", "#Rp-Main"]}`, []string{"m1", "m2"}},
-		{"by author name", `{"from":["boss"]}`, []string{"d1"}},
-		{"by author id", `{"from":["u1"]}`, []string{"m1", "m2"}},
-		{"mentions only", `{"mentions_only":true}`, []string{"m2"}},
-		{"bots skipped by default", `{"limit":10}`, []string{"m1", "m2", "d1"}},
-		{"bots allowed", `{"ignore_bots":false,"limit":10}`, []string{"m1", "m2", "m3", "m4", "d1"}},
-		{"nothing matches", `{"channels":["nope"]}`, nil},
+		{"by dm alias", `{"channels":["ami"]}`, []string{"d1"}, nil},
+		{"alias is case-insensitive", `{"channels":["BOSS", "#Rp-Main"]}`, []string{"m1", "m2"}, nil},
+		{"by author name", `{"from":["boss"]}`, []string{"d1"}, nil},
+		{"by author id", `{"from":["u1"]}`, []string{"m1", "m2"}, nil},
+		{"mentions only", `{"mentions_only":true}`, []string{"m2"}, nil},
+		{"bots skipped by default", `{"limit":10}`, []string{"m1", "m2"}, []string{"d1"}},
+		{"bots allowed", `{"ignore_bots":false,"limit":10}`, []string{"m1", "m2", "m3", "m4"}, []string{"d1"}},
+		{"nothing matches", `{"channels":["nope"]}`, nil, nil},
 	}
 
 	for _, c := range cases {
@@ -635,6 +642,21 @@ func TestPollFilters(t *testing.T) {
 			for i, id := range c.want {
 				if got := wireText(t, out, i); got != textOf[id] {
 					t.Errorf("messages[%d] = %q, want the one called %s", i, got, id)
+				}
+			}
+			if len(c.rest) == 0 {
+				return
+			}
+			// The rest arrives in the next answer with the same arguments: that is what
+			// one-conversation-per-batch costs a caller watching several channels.
+			out = pollOK(t, d, withWait(c.args))
+			list = msgs(t, out)
+			if len(list) != len(c.rest) {
+				t.Fatalf("second poll got %d messages, want %d: %v", len(list), len(c.rest), list)
+			}
+			for i, id := range c.rest {
+				if got := wireText(t, out, i); got != textOf[id] {
+					t.Errorf("second poll messages[%d] = %q, want the one called %s", i, got, id)
 				}
 			}
 		})
@@ -693,6 +715,10 @@ func TestPollQueuesAreIsolated(t *testing.T) {
 // snowflake, and an alias belonging to another agent must never leak: the same
 // event pointer sits in both queues, which is exactly why the label is computed
 // per call into pollMessage and never written back onto bus.Event.
+//
+// One conversation per answer means a queue holding two of them takes two polls
+// to drain, and each answer names itself at the top level -- no more reading a
+// batch and working out which channel each row belonged to.
 func TestPollLabelsTargetWithCallerAlias(t *testing.T) {
 	cfg := pollRoutingCfg(t, `{
 	  "agents": [
@@ -716,27 +742,34 @@ func TestPollLabelsTargetWithCallerAlias(t *testing.T) {
 	push(t, d, "default", mine, theirs)
 	push(t, d, "solo", mine, theirs)
 
-	targetsOf := func(out map[string]any) string {
-		list := msgs(t, out)
-		got := make([]string, 0, len(list))
-		for _, m := range list {
-			mm, _ := m.(map[string]any)
-			s, _ := mm["target"].(string)
+	// Drain this agent's queue the way the batching means it has to be drained: one
+	// answer per conversation. Returns the envelope targets in the order they came,
+	// and checks on the way that no row repeats the name it was given.
+	labelsOf := func(ctx context.Context) string {
+		var got []string
+		for i := 0; i < 2; i++ {
+			out, err := pollTry(d, ctx, `{"max_wait":1}`)
+			if err != nil {
+				t.Fatalf("poll %d: %v", i+1, err)
+			}
+			s, _ := out["target"].(string)
+			for _, m := range msgs(t, out) {
+				mm, _ := m.(map[string]any)
+				if _, bad := mm["target"]; bad {
+					t.Errorf("messages[%d] still carries its own target: %v", i, mm)
+				}
+			}
 			got = append(got, s)
 		}
 		return strings.Join(got, ",")
 	}
 
-	if got := targetsOf(pollOK(t, d, `{"max_wait":1}`)); got != "boss,channel:999888777666555444" {
-		t.Errorf("default sees its own alias and a bare id for the foreign channel: %q", got)
+	if got := labelsOf(context.Background()); got != "boss,channel:999888777666555444" {
+		t.Errorf("default sees its own alias then a bare id for the foreign channel: %q", got)
 	}
 
 	solo := router.WithPrincipal(context.Background(), router.Principal{AgentID: "solo"})
-	out, err := pollTry(d, solo, `{"max_wait":1}`)
-	if err != nil {
-		t.Fatalf("solo poll: %v", err)
-	}
-	if got := targetsOf(out); got != "channel:111222333444555666,side" {
+	if got := labelsOf(solo); got != "channel:111222333444555666,side" {
 		t.Errorf("solo sees the mirror image, must not learn 'boss': %q", got)
 	}
 }
@@ -888,7 +921,7 @@ func TestPollWaitingRidesAlongWithMessages(t *testing.T) {
 	}
 	wantNum(t, out, "remaining", 2)
 	wantStr(t, out, "waiting", "2 target")
-	if got := keySet(out); got != "messages,oldest_s,reason,remaining,waiting" {
+	if got := keySet(out); got != "messages,oldest_s,reason,remaining,target,waiting" {
 		t.Errorf("keys = %s, want the batch plus what is still queued", got)
 	}
 	// oldest_s is the front of the queue, not the front of what this caller cares
@@ -933,7 +966,7 @@ func TestPollCaughtUpAnswerCarriesNoWaiting(t *testing.T) {
 
 	out := pollOK(t, d, `{"max_wait":1}`)
 	wantStr(t, out, "reason", "messages")
-	if got := keySet(out); got != "messages,reason" {
+	if got := keySet(out); got != "messages,reason,target" {
 		t.Errorf("an answer that drained the queue must not grow hints, got %s", got)
 	}
 }

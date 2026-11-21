@@ -10,7 +10,7 @@
 
 | 工具 | 做什麼 | 消耗佇列？ |
 | --- | --- | --- |
-| `poll` | 等並取走這個 agent 佇列裡的新訊息；空手會自報原因 | ✅ 取走就沒了（被 filter 擋下的留著） |
+| `poll` | 等並取走這個 agent 佇列裡的新訊息（**一次只答一個頻道**）；空手會自報原因 | ✅ 取走就沒了（被 filter 擋下的、以及別的頻道的留著） |
 | `send` | 發一則（可帶附件）；超 2000 字自動分段 | — |
 | `status` | 六個 key 的狀態表（gateway / queue / dropped / last_error / targets / read_only） | — |
 | `history` | 讀一個頻道的舊訊息（REST）：上線前的那段、以及被我們 ACL／filter 擋掉的 | ❌ 完全不消耗 |
@@ -130,7 +130,8 @@ go build -o mcp-discord-roleplay .
 - **bot 的線上狀態不判健康**。Discord 顯示「線上」不等於我們的 gateway 活著（反之亦然）；要健康就看 `status`，或看 log。
 - **上傳檔的 URL 會過期**（帶 `?ex=&is=&hm=` 簽名，約 24 小時），而 sticker／emoji 的 CDN URL 是永久的。⇒ `history` 只列 url；**圖要留，就趕快 `get`**（或把 `--media-image` 設 `save`）。
 - **作者的顯示名字**：群裡用暱稱（`tapris`）、DM 用全域名（Discord 本來就這麼給），兩側都帶 `author_id`——那才是唯一可靠的同一人身分。讀取側的暱稱是快取＋按需補打（`--nick-lookup`），所以大 guild 的第一頁可能慢一點（`api_ms` 會把這段算進去），而且**改過暱稱的人在下一次發訊息之前我們不會知道**（我們不訂閱 `GUILD_MEMBER_UPDATE`）。
-- **`poll` 空手回來有兩種**：真的閒置 ⇒ 只有 `reason`；有東西被擋 ⇒ 帶 `remaining` ＋ `waiting`（按閘門計數：`bot`／`mentions`／`target`／`channel`／`from`）＋ `oldest_s`。`waiting` 只計這一次掃過的，所以可能小於 `remaining`——那是範圍，不是遺失。
+- **`poll` 空手回來有兩種**：真的閒置 ⇒ 只有 `reason`；有東西被擋 ⇒ 帶 `remaining` ＋ `waiting`（按閘門計數：`bot`／`mentions`／`target`／`channel`／`from`／`other_channel`）＋ `oldest_s`。`waiting` 只計這一次掃過的，所以可能小於 `remaining`——那是範圍，不是遺失。
+- **`poll` 一次只答一個頻道**（2026-11-22）：從佇列最老那則開始，把**同一頻道**的全收齊（照舊受 `limit`／`--poll-max-bytes` 節制），別的頻道的留給之後幾輪。答案頂層的 `target` 講的是這批訊息出自哪個對話（row 不再逐則帶 `target`／`dm`），而且可以直接餵回 `send`；沒有訊息的答案不帶 `target`。被留下的那些計進 `waiting` 的 `other_channel`，不丢不亂序。想自己選頻道就用現成的 `targets`，所以**沒有新旗標**。
 - **`channels` 過濾器吃 alias**（`poll` 的 `channels` 參數）：ID、Discord 實名、我們的 alias 都認（大小寫不拘，`#` 與 `channel:` 前綴兩邊都剝）。這條是 2026-11-19 的 live 教訓——頻道的 Discord 實名跟我們的 alias 不同名時，舊實作會**無聲擋掉全部**，看起來像沒人說話。
 - **自訂 emoji 的佔位碼**：`<:name:img@N>`，`N` 就是這個 response 裡附件的 `content_index` ⇒ 句子裡的碼和圖不會變成兩個對不上的地址。佔位是**附加**不是覆蓋，所以有 content 時它與真文字共存。
 - **自家的訊息永不進 queue**（`send` 已經把答案交給呼叫者了），所以 `poll` 不會自我回音；要看自己講過的要 `history` ＋ `include_bots:true`。

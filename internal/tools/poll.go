@@ -78,11 +78,12 @@ func pollTool(prefix string) *mcp.Tool {
 			"This queue holds only what happened while you were away: messages this bot sent are never queued, because " +
 			"the send call already handed them to you. " +
 			"There is no cursor and no acknowledge step: what a poll hands you is yours, and what you do not take stays. " +
+			"One poll answers one conversation: it takes the oldest queued message plus every other message from THAT channel, and leaves messages from other channels for the following polls. The top-level target names the conversation every message in this answer belongs to (rows do not repeat it), and discord_send takes that name back unchanged; to pick the channel yourself, pass targets. " +
 			"reason=messages means you got something; reason=timeout is NOT a failure (the tool result's isError is false), it means nothing arrived within max_wait — call again; " +
 			"reason=disconnected means the gateway was not listening during that wait, so nothing could have arrived; " +
 			"reason=cancelled/shutdown means this answer was not delivered. " +
 			"If remaining is present, that many messages are still queued — poll again right away. " +
-			"Whenever waiting is present it names, by count, the filters that turned messages away in this pass (bot|mentions|target|channel|from), and oldest_s says how long the oldest queued message has been waiting; they ride along with remaining, so an answer that took some messages still says why the rest stayed behind. waiting only counts what this pass scanned, so it can be smaller than remaining -- that is scope, not loss. " +
+			"Whenever waiting is present it names, by count, the filters that turned messages away in this pass (bot|mentions|target|channel|from|other_channel), and oldest_s says how long the oldest queued message has been waiting; they ride along with remaining, so an answer that took some messages still says why the rest stayed behind. waiting only counts what this pass scanned, so it can be smaller than remaining -- that is scope, not loss. " +
 			"If dropped is present, messages were overwritten while nobody polled; poll more often. " +
 			"A long message text may be cut to fit the server's byte budget, and a note then says how big it really was; only text is ever cut, attachments are always listed. " +
 			"author_id is the speaker's Discord id: quote it as to:\"dm:<id>\" to answer that person in DMs even when they have no alias. " +
@@ -374,6 +375,7 @@ func (d *Deps) handlePoll(ctx context.Context, call *mcp.Call) (*mcp.ToolResult,
 	}
 	res := jsonResult(d.pollEnvelope(pollMeta{
 		reason: "messages", agent: p.AgentID, waitedMS: durMS(time.Since(start)),
+		channel: st.chanLabel, dm: st.chanDM,
 		maxWait: waitS, connected: connected, self: self,
 		count: len(msgs), remaining: remaining, partial: st.stopped,
 		bytes: used, notes: notes, messages: msgs,
@@ -784,6 +786,18 @@ type drainState struct {
 	// something when the pass scanned the whole queue: a pass that ended on Stop
 	// never reached the tail, so it reports nothing.
 	held map[string]int
+
+	// chanKey latches the conversation of the first message this pass accepts, and
+	// every later event from a different one is held back: one poll answers one
+	// channel, because a batch that interleaves two conversations is the shape a
+	// model most reliably replies to the wrong half of. It is per attempt, so a
+	// limit/budget cut in the middle of a channel just means the next poll
+	// continues that same channel rather than switching. chanLabel is what the
+	// envelope says out loud -- the caller's own alias for it -- and chanDM whether
+	// that conversation is a DM.
+	chanKey   string
+	chanLabel string
+	chanDM    bool
 }
 
 // want is the verdict function handed to Queue.Drain: it decides, strictly in
@@ -798,6 +812,16 @@ func (st *drainState) want(d *Deps, p router.Principal, f *pollFilter) func(*bus
 		}
 		if why := f.reject(e); why != "" {
 			st.hold(why)
+			return bus.Skip
+		}
+		// One channel per answer: the first accepted message pins the conversation,
+		// and anything from elsewhere is Skipped -- left in the queue, in order,
+		// where a later poll reaches it. Not Stop: Stop would also strand the
+		// messages behind it that might well belong to this channel.
+		if key := pollChannelKey(e); st.chanKey == "" {
+			st.chanKey = key
+		} else if key != st.chanKey {
+			st.hold("other_channel")
 			return bus.Skip
 		}
 		if st.count >= st.limit {
@@ -818,12 +842,40 @@ func (st *drainState) want(d *Deps, p router.Principal, f *pollFilter) func(*bus
 			fitMessage(&m, st.budget, st)
 			cost = messageCost(m)
 		}
+		// The conversation is named once for the whole batch, on the envelope, so no
+		// row pays for a fact that cannot change inside this answer.
+		if st.chanLabel == "" {
+			st.chanLabel, st.chanDM = m.Target, m.DM
+		}
+		m.Target, m.DM = "", false
 		st.msgsOut = append(st.msgsOut, m)
 		st.kept = append(st.kept, e)
 		st.used += cost
 		st.count++
 		return bus.Take
 	}
+}
+
+// pollChannelKey is the identity a poll batches by. It uses the canonical target
+// (channel:<id> / dm:<peer>, normalised on the way into the queue) rather than
+// the label a row carries, because that label is per-principal: two agents may
+// call the same channel by different names, and one conversation must not split
+// into two batches because of it. When an event has no canonical target the
+// channel id is the next best thing, and an event with neither gets "", which
+// groups those strays together -- as good a guess as any.
+func pollChannelKey(e *bus.Event) string {
+	if t := strings.ToLower(e.Target); t != "" {
+		return t
+	}
+	if e.DM {
+		if peer := strings.ToLower(e.Extra["peer"]); peer != "" {
+			return "dm:" + peer
+		}
+	}
+	if id := strings.ToLower(e.ChannelID); id != "" {
+		return "channel:" + id
+	}
+	return ""
 }
 
 // noteBudgetFull records, at most once per attempt, that the drain stopped
@@ -1172,6 +1224,12 @@ type pollMeta struct {
 	// over. Both stay zero when the queue is empty.
 	waiting string
 	oldestS float64
+
+	// channel and dm name the conversation the messages in this answer came from.
+	// They are only ever set on an answer that has messages: a batch is one
+	// conversation now, so it is an envelope fact, not a per-row one.
+	channel string
+	dm      bool
 }
 
 // pollWire is the envelope, and it is the whole budget: a quiet poll costs one
@@ -1180,7 +1238,13 @@ type pollMeta struct {
 // a call that failed never reaches this struct, it goes out as an errResult
 // with isError set.
 type pollWire struct {
-	Reason    string    `json:"reason"`
+	Reason string `json:"reason"`
+	// Target is the conversation every message in this answer belongs to, named the
+	// way this caller addresses it (an alias when it has one, otherwise a target id
+	// discord_send still accepts). Rows do not repeat it. Absent when there are no
+	// messages, because there is no batch to name.
+	Target    string    `json:"target,omitempty"`
+	DM        bool      `json:"dm,omitempty"`
 	Messages  []msgWire `json:"messages,omitempty"`
 	Remaining int       `json:"remaining,omitempty"` // absent means caught up
 	Dropped   uint64    `json:"dropped,omitempty"`
@@ -1216,6 +1280,7 @@ func (d *Deps) pollEnvelope(m pollMeta) pollWire {
 	// them the two cases -- nobody spoke, or nobody you asked about spoke -- are told
 	// apart by whether the leftovers block below fires at all.
 	if m.count > 0 {
+		w.Target, w.DM = m.channel, m.dm
 		w.Messages = wireMessages(m.messages)
 		w.Remaining = m.remaining
 		w.Dropped = m.dropped
@@ -1286,8 +1351,8 @@ func (d *Deps) logPoll(m pollMeta) {
 	if !lg.Enabled(context.Background(), slog.LevelDebug) {
 		return
 	}
-	fields := []any{"agent", m.agent, "reason", m.reason, "waited_ms", m.waitedMS,
-		"max_wait", m.maxWait, "connected", m.connected, "self", m.self,
+	fields := []any{"agent", m.agent, "reason", m.reason, "target", m.channel, "dm", m.dm,
+		"waited_ms", m.waitedMS, "max_wait", m.maxWait, "connected", m.connected, "self", m.self,
 		"count", m.count, "remaining", m.remaining, "partial", m.partial,
 		"bytes", m.bytes, "dropped", m.dropped, "notes", len(m.notes)}
 	if m.count > 0 {

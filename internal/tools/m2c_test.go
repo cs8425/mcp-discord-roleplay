@@ -56,8 +56,9 @@ func TestPollWildcardMatchesByKind(t *testing.T) {
 		t.Fatalf("wrong message survived the filter: %v", m)
 	}
 	// The alias of a wildcard rule is not an address, so the label has to be the
-	// concrete dm:<peer> the caller can send back without guessing.
-	wantStr(t, m, "target", "dm:555444333222111000")
+	// concrete dm:<peer> the caller can send back without guessing -- and since
+	// 2026-11-22 the envelope says it once, not every row.
+	wantStr(t, out, "target", "dm:555444333222111000")
 }
 
 // The other half of the same rule: "dms" is a policy, so discord_send refuses it
