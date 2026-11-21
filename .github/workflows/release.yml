@@ -47,7 +47,7 @@ jobs:
           # byte-reproducible.
           stamp=""
           case "$GITHUB_REF" in
-            refs/tags/v*) stamp="-X main.serverVersion=${GITHUB_REF_NAME#v}" ;;
+            refs/tags/v*) stamp="-X main.version=${GITHUB_REF_NAME#v}" ;;
           esac
           #   goos:goarch:exe-suffix
           # To add a target, append one string (e.g. "darwin:arm64:").
